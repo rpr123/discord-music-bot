@@ -114,6 +114,7 @@ MUSIC_FEEDBACK_DELETE_SECONDS = parse_positive_int_env("MUSIC_FEEDBACK_DELETE_SE
 DEFAULT_AUTO_TRACKS = parse_positive_int_env("DEFAULT_AUTO_TRACKS", 8)
 MAX_AUTO_TRACKS = parse_positive_int_env("MAX_AUTO_TRACKS", 25)
 BOT_VOLUME = parse_volume_env("BOT_VOLUME", 0.3)
+DISCORD_EMBED_FIELD_LIMIT = 1024
 
 YTDL_BASE_OPTIONS = {
     "format": "bestaudio/best",
@@ -295,7 +296,7 @@ def requester_label(track: Track) -> str:
 
 
 def make_track_embed(track: Track, title: str) -> discord.Embed:
-    embed = discord.Embed(title=title, description=f"[{track.title}]({track.webpage_url})")
+    embed = discord.Embed(title=title, description=make_track_link(track, 4096))
     embed.add_field(name="Length", value=format_duration(track.duration), inline=True)
     embed.add_field(name="Requested by", value=track.requester, inline=True)
     if track.thumbnail_url:
@@ -313,7 +314,7 @@ def make_player_embed(track: Track, state: GuildMusicState) -> discord.Embed:
     )
     embed.add_field(
         name="YouTube Music",
-        value=f"[{track.title}]({track.webpage_url})",
+        value=make_track_link(track, DISCORD_EMBED_FIELD_LIMIT),
         inline=False,
     )
     embed.add_field(name="길이", value=format_duration(track.duration), inline=True)
@@ -322,8 +323,7 @@ def make_player_embed(track: Track, state: GuildMusicState) -> discord.Embed:
     if state.queue:
         preview = []
         for index, queued in enumerate(list(state.queue)[:5], start=1):
-            title = queued.title if len(queued.title) <= 80 else queued.title[:79] + "…"
-            preview.append(f"{index}. [{title}]({queued.webpage_url})")
+            preview.append(make_queue_line(index, queued))
         if len(state.queue) > 5:
             preview.append(f"...and {len(state.queue) - 5} more")
         embed.add_field(name="다음 곡", value="\n".join(preview), inline=False)
@@ -348,19 +348,42 @@ def make_bulk_embed(tracks: list[Track], title: str) -> discord.Embed:
     return embed
 
 
+def single_line(value: str) -> str:
+    return " ".join(value.split())
+
+
+def truncate_text(value: str, limit: int) -> str:
+    value = single_line(value)
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
+
+
+def make_track_link(track: Track, limit: int = DISCORD_EMBED_FIELD_LIMIT) -> str:
+    title = truncate_text(track.title, 120)
+    value = f"[{title}]({track.webpage_url})"
+    if len(value) <= limit:
+        return value
+    return truncate_text(track.title, limit)
+
+
+def make_queue_line(index: int, track: Track) -> str:
+    return f"{index}. {truncate_text(track.title, 72)} - {format_duration(track.duration)}"
+
+
 def make_queue_embed(state: GuildMusicState) -> discord.Embed:
     embed = discord.Embed(title="📋 대기열", color=discord.Color.blurple())
 
     if state.current:
         embed.add_field(
             name="지금 재생 중",
-            value=f"[{state.current.title}]({state.current.webpage_url})",
+            value=make_track_link(state.current, DISCORD_EMBED_FIELD_LIMIT),
             inline=False,
         )
 
     if state.queue:
         lines = [
-            f"{index}. [{track.title}]({track.webpage_url}) - {format_duration(track.duration)}"
+            make_queue_line(index, track)
             for index, track in enumerate(list(state.queue)[:10], start=1)
         ]
         if len(state.queue) > 10:
@@ -373,9 +396,7 @@ def make_queue_embed(state: GuildMusicState) -> discord.Embed:
 
 
 def truncate_option_text(value: str, limit: int = 100) -> str:
-    if len(value) <= limit:
-        return value
-    return value[: limit - 1] + "…"
+    return truncate_text(value, limit)
 
 
 def remove_queued_track(state: GuildMusicState, index: int) -> Track | None:
@@ -949,23 +970,28 @@ async def enqueue_tracks(
             return initial_response
 
         if interaction:
+            send_kwargs = {
+                "content": content,
+                "embed": embed,
+                "ephemeral": private,
+                "silent": is_silent_music_channel(interaction.channel),
+                "wait": True,
+            }
+            if view is not None:
+                send_kwargs["view"] = view
+
             try:
-                return await interaction.followup.send(
-                    content=content,
-                    embed=embed,
-                    view=view,
-                    ephemeral=private,
-                    silent=is_silent_music_channel(interaction.channel),
-                    wait=True,
-                )
+                return await interaction.followup.send(**send_kwargs)
             except discord.Forbidden:
-                return await interaction.followup.send(
-                    content=content,
-                    embed=embed,
-                    view=view,
-                    ephemeral=True,
-                    wait=True,
-                )
+                fallback_kwargs = {
+                    "content": content,
+                    "embed": embed,
+                    "ephemeral": True,
+                    "wait": True,
+                }
+                if view is not None:
+                    fallback_kwargs["view"] = view
+                return await interaction.followup.send(**fallback_kwargs)
 
         message = await text_channel.send(
             content=content,
