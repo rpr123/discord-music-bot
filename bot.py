@@ -588,14 +588,6 @@ async def extract_info_with_fallback(
     raise ValueError(f"No playable search results were found for '{query}'.")
 
 
-def get_entry_url(info: dict, fallback_url: str) -> str:
-    entry_url = info.get("webpage_url") or info.get("url") or fallback_url
-    parsed = urllib.parse.urlparse(entry_url)
-    if not parsed.scheme and info.get("id"):
-        return f"https://music.youtube.com/watch?v={info['id']}"
-    return entry_url
-
-
 def get_resolved_stream_url(info: dict) -> str | None:
     if info.get("_type") in {"url", "url_transparent"}:
         return None
@@ -615,6 +607,48 @@ def get_thumbnail_url(info: dict) -> str | None:
         return thumbnails[-1].get("url")
 
     return None
+
+
+def get_video_id(info: dict, url: str | None = None) -> str | None:
+    video_id = info.get("id")
+    if video_id and re.fullmatch(r"[\w-]{11}", video_id):
+        return video_id
+
+    if not url:
+        return None
+
+    parsed = urllib.parse.urlparse(url)
+    params = urllib.parse.parse_qs(parsed.query)
+    values = params.get("v")
+    if values:
+        return values[0]
+
+    return None
+
+
+def get_entry_url(info: dict, fallback_url: str) -> str:
+    raw_url = info.get("webpage_url") or info.get("url") or fallback_url
+    video_id = get_video_id(info, raw_url)
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
+
+    parsed = urllib.parse.urlparse(raw_url)
+    if not parsed.scheme and raw_url:
+        return f"https://www.youtube.com/watch?v={raw_url}"
+
+    return raw_url
+
+
+def normalize_track_key(track: Track) -> str:
+    parsed = urllib.parse.urlparse(track.webpage_url)
+    params = urllib.parse.parse_qs(parsed.query)
+    video_id = params.get("v", [None])[0]
+    if video_id:
+        return video_id
+
+    title = re.sub(r"\s+", " ", track.title).strip().lower()
+    title = re.sub(r"\s*[\(\[].*?(official|mv|music video|lyrics?|audio|live).*?[\)\]]", "", title)
+    return title
 
 
 def make_track_from_info(
@@ -780,23 +814,71 @@ async def extract_auto_tracks(
 ) -> list[Track]:
     loop = asyncio.get_running_loop()
     auto_count = clamp_auto_count(count)
-    search_query = f"ytsearch{auto_count}:{query} music"
-    info = await loop.run_in_executor(None, lambda: ytdl.extract_info(search_query, download=False))
-    entries = [entry for entry in info.get("entries", []) if entry]
+
+    seed_query = resolve_query(query, "songs")
+    seed_info = await extract_info_with_fallback(query, seed_query, allow_fallback=True)
+    seed_track = make_track_from_info(seed_info, requester, seed_query, requester_id)
+    seed_id = get_video_id(seed_info, seed_track.webpage_url)
+
+    entries: list[dict] = []
+    fallback_url = seed_query
+    if seed_id:
+        radio_url = f"https://www.youtube.com/watch?v={seed_id}&list=RD{seed_id}"
+        fallback_url = radio_url
+        try:
+            radio_info = await loop.run_in_executor(
+                None,
+                lambda: ytdl_playlist.extract_info(radio_url, download=False),
+            )
+            entries = [entry for entry in radio_info.get("entries", []) if entry]
+        except Exception:
+            logger.exception("Failed to extract YouTube radio mix for %s", seed_id)
+
+    if not entries:
+        search_query = f"ytsearch{auto_count * 3}:{seed_track.title} radio mix"
+        fallback_url = search_query
+        info = await loop.run_in_executor(None, lambda: ytdl.extract_info(search_query, download=False))
+        entries = [entry for entry in info.get("entries", []) if entry]
 
     tracks: list[Track] = []
-    seen_urls: set[str] = set()
-    for entry in entries:
-        track = make_track_from_info(entry, requester, search_query, requester_id)
-        if track.webpage_url in seen_urls:
-            continue
-        seen_urls.add(track.webpage_url)
+    seen_keys: set[str] = set()
+
+    for track in [seed_track]:
+        key = normalize_track_key(track)
+        seen_keys.add(key)
         tracks.append(track)
+        if len(tracks) >= auto_count:
+            return tracks
+
+    for entry in entries:
+        track = make_track_from_info(entry, requester, fallback_url, requester_id)
+        if not get_video_id(entry, track.webpage_url):
+            continue
+        key = normalize_track_key(track)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        tracks.append(track)
+        if len(tracks) >= auto_count:
+            break
+
+    if len(tracks) < auto_count and fallback_url.startswith("https://www.youtube.com/watch"):
+        search_query = f"ytsearch{auto_count * 3}:{seed_track.title} radio mix"
+        info = await loop.run_in_executor(None, lambda: ytdl.extract_info(search_query, download=False))
+        for entry in [entry for entry in info.get("entries", []) if entry]:
+            track = make_track_from_info(entry, requester, search_query, requester_id)
+            key = normalize_track_key(track)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            tracks.append(track)
+            if len(tracks) >= auto_count:
+                break
 
     if not tracks:
         raise ValueError(f"관련 곡을 찾지 못했어요: {query}")
 
-    return tracks[:auto_count]
+    return tracks
 
 
 async def ensure_voice(interaction: discord.Interaction, state: GuildMusicState) -> bool:
