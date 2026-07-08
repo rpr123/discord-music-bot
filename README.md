@@ -87,6 +87,7 @@ MUSIC_FEEDBACK_DELETE_SECONDS=10
 YOUTUBE_MUSIC_ONLY=true
 YOUTUBE_SEARCH_FALLBACK=true
 YOUTUBE_MUSIC_SECTION=songs
+# YOUTUBE_COOKIES_FILE=./cookies.txt
 MAX_BULK_TRACKS=50
 DEFAULT_AUTO_TRACKS=8
 MAX_AUTO_TRACKS=25
@@ -102,6 +103,8 @@ BOT_VOLUME=0.2
 `YOUTUBE_SEARCH_FALLBACK=true`이면 YouTube Music 곡 검색이 빈 결과를 줄 때 일반 YouTube 검색을 한 번 더 시도합니다. 앨범/재생목록 검색은 YouTube Music 섹션 검색을 유지합니다.
 
 `YOUTUBE_MUSIC_SECTION`은 `songs`, `videos`, `albums`, `artists`, `community playlists`, `featured playlists` 중에서 선택할 수 있습니다. 일반적인 음악 봇이면 `songs`가 가장 안정적입니다.
+
+GCP 같은 클라우드 서버에서 YouTube가 `Sign in to confirm you're not a bot` 오류를 내면, 로그인된 브라우저에서 YouTube 쿠키를 Netscape `cookies.txt` 형식으로 내보낸 뒤 서버의 프로젝트 폴더에 `cookies.txt`로 저장하고 `.env`에 `YOUTUBE_COOKIES_FILE=./cookies.txt`를 추가하세요. 쿠키 파일은 계정 인증 정보라 GitHub에 올리면 안 됩니다.
 
 `MAX_BULK_TRACKS`는 앨범이나 재생목록을 한 번에 추가할 때 최대 몇 곡까지 대기열에 넣을지 정합니다.
 
@@ -140,5 +143,6 @@ https://music.youtube.com/playlist?list=...
 
 - 음악 재생은 `yt-dlp`와 `FFmpeg`를 사용합니다.
 - YouTube Music 검색은 `yt-dlp`의 `music.youtube.com/search` 처리 기능을 먼저 사용하고, 곡명 검색이 비어 있으면 `ytsearch` fallback을 사용할 수 있습니다.
+- 클라우드 서버 IP가 YouTube 자동화 확인에 걸리면 `YOUTUBE_COOKIES_FILE`로 쿠키 파일을 지정해야 할 수 있습니다.
 - YouTube 쪽 변경으로 재생이 갑자기 실패하면 `python -m pip install --upgrade yt-dlp`로 업데이트해 보세요.
 - 봇 토큰은 절대 GitHub나 채팅에 올리지 마세요.

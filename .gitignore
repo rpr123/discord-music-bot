@@ -1,4 +1,6 @@
 .env
+cookies.txt
+*.cookies.txt
 music_channels.json
 .venv/
 __pycache__/

@@ -85,6 +85,7 @@ YOUTUBE_MUSIC_SECTIONS = {
     "songs",
     "videos",
 }
+YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE")
 
 
 def parse_positive_int_env(name: str, default: int) -> int:
@@ -124,6 +125,9 @@ YTDL_BASE_OPTIONS = {
     "no_warnings": True,
     "source_address": "0.0.0.0",
 }
+
+if YOUTUBE_COOKIES_FILE:
+    YTDL_BASE_OPTIONS["cookiefile"] = str(Path(YOUTUBE_COOKIES_FILE).expanduser())
 
 YTDL_OPTIONS = {
     **YTDL_BASE_OPTIONS,
