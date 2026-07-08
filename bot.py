@@ -115,6 +115,7 @@ DEFAULT_AUTO_TRACKS = parse_positive_int_env("DEFAULT_AUTO_TRACKS", 8)
 MAX_AUTO_TRACKS = parse_positive_int_env("MAX_AUTO_TRACKS", 25)
 BOT_VOLUME = parse_volume_env("BOT_VOLUME", 0.3)
 DISCORD_EMBED_FIELD_LIMIT = 1024
+YTDL_EXTRACT_TIMEOUT_SECONDS = parse_positive_int_env("YTDL_EXTRACT_TIMEOUT_SECONDS", 45)
 
 YTDL_BASE_OPTIONS = {
     "format": "bestaudio/best",
@@ -144,6 +145,34 @@ FFMPEG_OPTIONS = {
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 ytdl_playlist = yt_dlp.YoutubeDL(YTDL_PLAYLIST_OPTIONS)
+
+
+async def extract_ytdl_info(
+    downloader: yt_dlp.YoutubeDL,
+    query: str,
+    label: str,
+) -> dict:
+    logger.info("yt-dlp start: %s", label)
+    logger.debug("yt-dlp query for %s: %s", label, query)
+    loop = asyncio.get_running_loop()
+    try:
+        info = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: downloader.extract_info(query, download=False),
+            ),
+            timeout=YTDL_EXTRACT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "yt-dlp timed out after %s seconds: %s",
+            YTDL_EXTRACT_TIMEOUT_SECONDS,
+            label,
+        )
+        raise
+
+    logger.info("yt-dlp done: %s", label)
+    return info
 
 
 def ffmpeg_is_available() -> bool:
@@ -585,8 +614,15 @@ async def extract_info_with_fallback(
     *,
     allow_fallback: bool,
 ) -> dict:
-    loop = asyncio.get_running_loop()
-    info = await loop.run_in_executor(None, lambda: ytdl.extract_info(resolved_query, download=False))
+    try:
+        info = await extract_ytdl_info(ytdl, resolved_query, "YouTube Music search")
+    except asyncio.TimeoutError:
+        if not (allow_fallback and YOUTUBE_SEARCH_FALLBACK and not is_url(query)):
+            raise ValueError(f"Timed out while searching for '{query}'.")
+
+        fallback_query = build_youtube_search_fallback(query)
+        logger.info("YouTube Music search timed out. Falling back to %s", fallback_query)
+        return await extract_ytdl_info(ytdl, fallback_query, "YouTube fallback search")
 
     if "entries" not in info:
         return info
@@ -598,10 +634,7 @@ async def extract_info_with_fallback(
     if allow_fallback and YOUTUBE_SEARCH_FALLBACK and not is_url(query):
         fallback_query = build_youtube_search_fallback(query)
         logger.info("YouTube Music search returned no results. Falling back to %s", fallback_query)
-        fallback_info = await loop.run_in_executor(
-            None,
-            lambda: ytdl.extract_info(fallback_query, download=False),
-        )
+        fallback_info = await extract_ytdl_info(ytdl, fallback_query, "YouTube fallback search")
         fallback_entries = [entry for entry in fallback_info.get("entries", []) if entry]
         if fallback_entries:
             return fallback_entries[0]
@@ -755,8 +788,7 @@ async def resolve_track_stream(track: Track) -> None:
     if track.stream_url:
         return
 
-    loop = asyncio.get_running_loop()
-    info = await loop.run_in_executor(None, lambda: ytdl.extract_info(track.source_url, download=False))
+    info = await extract_ytdl_info(ytdl, track.source_url, "audio stream resolve")
 
     if "entries" in info:
         entries = [entry for entry in info["entries"] if entry]
@@ -799,12 +831,8 @@ async def extract_tracks(
     section: str | None = None,
     requester_id: int | None = None,
 ) -> list[Track]:
-    loop = asyncio.get_running_loop()
     resolved_query = resolve_query(query, section)
-    info = await loop.run_in_executor(
-        None,
-        lambda: ytdl_playlist.extract_info(resolved_query, download=False),
-    )
+    info = await extract_ytdl_info(ytdl_playlist, resolved_query, "playlist or album search")
 
     if is_search_url(resolved_query):
         search_entries = [entry for entry in info.get("entries", []) if entry]
@@ -812,10 +840,7 @@ async def extract_tracks(
             raise ValueError("No matching album or playlist was found.")
 
         first_result_url = get_entry_url(search_entries[0], resolved_query)
-        info = await loop.run_in_executor(
-            None,
-            lambda: ytdl_playlist.extract_info(first_result_url, download=False),
-        )
+        info = await extract_ytdl_info(ytdl_playlist, first_result_url, "playlist or album resolve")
 
     entries = [entry for entry in info.get("entries", []) if entry]
     if not entries:
@@ -833,7 +858,6 @@ async def extract_auto_tracks(
     count: int,
     requester_id: int | None = None,
 ) -> list[Track]:
-    loop = asyncio.get_running_loop()
     auto_count = clamp_auto_count(count)
 
     seed_query = resolve_query(query, "songs")
@@ -847,10 +871,7 @@ async def extract_auto_tracks(
         radio_url = f"https://www.youtube.com/watch?v={seed_id}&list=RD{seed_id}"
         fallback_url = radio_url
         try:
-            radio_info = await loop.run_in_executor(
-                None,
-                lambda: ytdl_playlist.extract_info(radio_url, download=False),
-            )
+            radio_info = await extract_ytdl_info(ytdl_playlist, radio_url, "YouTube radio mix")
             entries = [entry for entry in radio_info.get("entries", []) if entry]
         except Exception:
             logger.exception("Failed to extract YouTube radio mix for %s", seed_id)
@@ -858,7 +879,7 @@ async def extract_auto_tracks(
     if not entries:
         search_query = f"ytsearch{auto_count * 3}:{seed_track.title} radio mix"
         fallback_url = search_query
-        info = await loop.run_in_executor(None, lambda: ytdl.extract_info(search_query, download=False))
+        info = await extract_ytdl_info(ytdl, search_query, "auto fallback search")
         entries = [entry for entry in info.get("entries", []) if entry]
 
     tracks: list[Track] = []
@@ -885,7 +906,7 @@ async def extract_auto_tracks(
 
     if len(tracks) < auto_count and fallback_url.startswith("https://www.youtube.com/watch"):
         search_query = f"ytsearch{auto_count * 3}:{seed_track.title} radio mix"
-        info = await loop.run_in_executor(None, lambda: ytdl.extract_info(search_query, download=False))
+        info = await extract_ytdl_info(ytdl, search_query, "auto supplemental search")
         for entry in [entry for entry in info.get("entries", []) if entry]:
             track = make_track_from_info(entry, requester, search_query, requester_id)
             key = normalize_track_key(track)
