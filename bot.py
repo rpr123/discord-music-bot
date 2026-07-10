@@ -7,7 +7,9 @@ import os
 import random
 import re
 import shutil
+import time
 import urllib.parse
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,15 +21,10 @@ from discord import app_commands
 from discord.ext import commands
 
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-logger = logging.getLogger("music-bot")
+PROJECT_DIR = Path(__file__).resolve().parent
 
 
-def load_env_file(path: str = ".env") -> None:
+def load_env_file(path: Path | str = PROJECT_DIR / ".env") -> None:
     env_path = Path(path)
     if not env_path.exists():
         return
@@ -46,12 +43,27 @@ def load_env_file(path: str = ".env") -> None:
 load_env_file()
 
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("music-bot")
+
+
+def resolve_project_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT_DIR / path
+
+
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DEV_GUILD_ID = os.getenv("DEV_GUILD_ID")
 FFMPEG_EXECUTABLE = os.getenv("FFMPEG_PATH") or shutil.which("ffmpeg") or "ffmpeg"
 MUSIC_CHANNEL_ID = os.getenv("MUSIC_CHANNEL_ID")
 MUSIC_CHANNEL_NAME = os.getenv("MUSIC_CHANNEL_NAME", "music")
-MUSIC_CHANNELS_FILE = Path(os.getenv("MUSIC_CHANNELS_FILE", "music_channels.json"))
+MUSIC_CHANNELS_FILE = resolve_project_path(
+    os.getenv("MUSIC_CHANNELS_FILE", "music_channels.json")
+)
 MUSIC_CHANNEL_SILENT = os.getenv("MUSIC_CHANNEL_SILENT", "true").lower() not in {
     "0",
     "false",
@@ -114,9 +126,13 @@ MAX_BULK_TRACKS = parse_positive_int_env("MAX_BULK_TRACKS", 50)
 MUSIC_FEEDBACK_DELETE_SECONDS = parse_positive_int_env("MUSIC_FEEDBACK_DELETE_SECONDS", 10)
 DEFAULT_AUTO_TRACKS = parse_positive_int_env("DEFAULT_AUTO_TRACKS", 8)
 MAX_AUTO_TRACKS = parse_positive_int_env("MAX_AUTO_TRACKS", 25)
-BOT_VOLUME = parse_volume_env("BOT_VOLUME", 0.3)
+BOT_VOLUME = parse_volume_env("BOT_VOLUME", 0.2)
 DISCORD_EMBED_FIELD_LIMIT = 1024
 YTDL_EXTRACT_TIMEOUT_SECONDS = parse_positive_int_env("YTDL_EXTRACT_TIMEOUT_SECONDS", 45)
+YTDL_MAX_CONCURRENT_EXTRACTIONS = parse_positive_int_env(
+    "YTDL_MAX_CONCURRENT_EXTRACTIONS", 2
+)
+STREAM_URL_MAX_AGE_SECONDS = parse_positive_int_env("STREAM_URL_MAX_AGE_SECONDS", 900)
 
 YTDL_BASE_OPTIONS = {
     "format": "bestaudio/best",
@@ -127,7 +143,7 @@ YTDL_BASE_OPTIONS = {
 }
 
 if YOUTUBE_COOKIES_FILE:
-    YTDL_BASE_OPTIONS["cookiefile"] = str(Path(YOUTUBE_COOKIES_FILE).expanduser())
+    YTDL_BASE_OPTIONS["cookiefile"] = str(resolve_project_path(YOUTUBE_COOKIES_FILE))
 
 YTDL_OPTIONS = {
     **YTDL_BASE_OPTIONS,
@@ -147,25 +163,49 @@ FFMPEG_OPTIONS = {
     "options": "-vn",
 }
 
-ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
-ytdl_playlist = yt_dlp.YoutubeDL(YTDL_PLAYLIST_OPTIONS)
+ytdl_semaphore = asyncio.Semaphore(YTDL_MAX_CONCURRENT_EXTRACTIONS)
 
 
 async def extract_ytdl_info(
-    downloader: yt_dlp.YoutubeDL,
+    options: dict,
     query: str,
     label: str,
 ) -> dict:
     logger.info("yt-dlp start: %s", label)
     logger.debug("yt-dlp query for %s: %s", label, query)
+
+    def extract() -> dict:
+        with yt_dlp.YoutubeDL(dict(options)) as downloader:
+            return downloader.extract_info(query, download=False)
+
     loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    try:
+        await asyncio.wait_for(
+            ytdl_semaphore.acquire(),
+            timeout=YTDL_EXTRACT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("yt-dlp queue timed out: %s", label)
+        raise
+
+    worker = asyncio.create_task(asyncio.to_thread(extract))
+
+    def extraction_finished(task: asyncio.Task[dict]) -> None:
+        ytdl_semaphore.release()
+        if task.cancelled():
+            return
+        task.exception()
+
+    worker.add_done_callback(extraction_finished)
+    remaining_timeout = max(
+        0.1,
+        YTDL_EXTRACT_TIMEOUT_SECONDS - (loop.time() - started_at),
+    )
     try:
         info = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: downloader.extract_info(query, download=False),
-            ),
-            timeout=YTDL_EXTRACT_TIMEOUT_SECONDS,
+            asyncio.shield(worker),
+            timeout=remaining_timeout,
         )
     except asyncio.TimeoutError:
         logger.warning(
@@ -201,7 +241,10 @@ async def delete_music_request_message(message: discord.Message) -> None:
     if not MUSIC_CHANNEL_DELETE_REQUESTS:
         return
 
-    await message.delete()
+    try:
+        await message.delete()
+    except discord.NotFound:
+        pass
 
 
 async def delete_message_later(message: discord.Message, delay_seconds: int) -> None:
@@ -237,6 +280,8 @@ class Track:
     duration: int | None = None
     stream_url: str | None = None
     thumbnail_url: str | None = None
+    stream_resolved_at: float | None = None
+    track_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 @dataclass
@@ -250,6 +295,8 @@ class GuildMusicState:
     skip_requested: bool = False
     stop_requested: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    advance_task: asyncio.Task[None] | None = None
+    playback_generation: int = 0
 
 
 intents = discord.Intents.default()
@@ -259,6 +306,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 music_states: dict[int, GuildMusicState] = {}
 configured_music_channels: dict[int, int] = {}
+commands_synced = False
 
 
 def get_state(guild_id: int) -> GuildMusicState:
@@ -442,6 +490,13 @@ def remove_queued_track(state: GuildMusicState, index: int) -> Track | None:
     return removed
 
 
+def remove_queued_track_by_id(state: GuildMusicState, track_id: str) -> Track | None:
+    for index, track in enumerate(state.queue):
+        if track.track_id == track_id:
+            return remove_queued_track(state, index)
+    return None
+
+
 class QueueRemoveSelect(discord.ui.Select):
     def __init__(self, guild_id: int):
         self.guild_id = guild_id
@@ -450,7 +505,7 @@ class QueueRemoveSelect(discord.ui.Select):
             discord.SelectOption(
                 label=truncate_option_text(f"{index}. {track.title}"),
                 description=truncate_option_text(f"신청자: {track.requester}", 100),
-                value=str(index - 1),
+                value=track.track_id,
             )
             for index, track in enumerate(list(state.queue)[:25], start=1)
         ]
@@ -463,7 +518,7 @@ class QueueRemoveSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         state = get_state(self.guild_id)
-        removed = remove_queued_track(state, int(self.values[0]))
+        removed = remove_queued_track_by_id(state, self.values[0])
         if removed is None:
             await interaction.response.edit_message(
                 content="이미 삭제되었거나 찾을 수 없는 곡이에요.",
@@ -485,8 +540,12 @@ class QueueRemoveSelect(discord.ui.Select):
 class QueueManageView(discord.ui.View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=180)
+        self.guild_id = guild_id
         if get_state(guild_id).queue:
             self.add_item(QueueRemoveSelect(guild_id))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await ensure_same_voice_channel(interaction, get_state(self.guild_id))
 
 
 class MusicControlView(discord.ui.View):
@@ -496,6 +555,9 @@ class MusicControlView(discord.ui.View):
 
     def get_state(self) -> GuildMusicState:
         return get_state(self.guild_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await ensure_same_voice_channel(interaction, self.get_state())
 
     async def edit_panel(self, interaction: discord.Interaction) -> None:
         state = self.get_state()
@@ -539,13 +601,7 @@ class MusicControlView(discord.ui.View):
     @discord.ui.button(label="정지", emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
     async def stop(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
-        state.stop_requested = True
-        state.queue.clear()
-        state.current = None
-
-        if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
-            state.voice.stop()
-
+        stop_playback(state)
         await interaction.response.defer()
         await delete_player_panel(state)
 
@@ -619,14 +675,14 @@ async def extract_info_with_fallback(
     allow_fallback: bool,
 ) -> dict:
     try:
-        info = await extract_ytdl_info(ytdl, resolved_query, "YouTube Music search")
+        info = await extract_ytdl_info(YTDL_OPTIONS, resolved_query, "YouTube Music search")
     except asyncio.TimeoutError:
         if not (allow_fallback and YOUTUBE_SEARCH_FALLBACK and not is_url(query)):
             raise ValueError(f"Timed out while searching for '{query}'.")
 
         fallback_query = build_youtube_search_fallback(query)
         logger.info("YouTube Music search timed out. Falling back to %s", fallback_query)
-        return await extract_ytdl_info(ytdl, fallback_query, "YouTube fallback search")
+        return await extract_ytdl_info(YTDL_OPTIONS, fallback_query, "YouTube fallback search")
 
     if "entries" not in info:
         return info
@@ -638,7 +694,9 @@ async def extract_info_with_fallback(
     if allow_fallback and YOUTUBE_SEARCH_FALLBACK and not is_url(query):
         fallback_query = build_youtube_search_fallback(query)
         logger.info("YouTube Music search returned no results. Falling back to %s", fallback_query)
-        fallback_info = await extract_ytdl_info(ytdl, fallback_query, "YouTube fallback search")
+        fallback_info = await extract_ytdl_info(
+            YTDL_OPTIONS, fallback_query, "YouTube fallback search"
+        )
         fallback_entries = [entry for entry in fallback_info.get("entries", []) if entry]
         if fallback_entries:
             return fallback_entries[0]
@@ -716,6 +774,7 @@ def make_track_from_info(
     requester_id: int | None = None,
 ) -> Track:
     source_url = get_entry_url(info, fallback_url)
+    stream_url = get_resolved_stream_url(info)
     return Track(
         title=info.get("title") or "Untitled track",
         webpage_url=info.get("webpage_url") or source_url,
@@ -723,8 +782,9 @@ def make_track_from_info(
         source_url=source_url,
         requester_id=requester_id,
         duration=info.get("duration"),
-        stream_url=get_resolved_stream_url(info),
+        stream_url=stream_url,
         thumbnail_url=get_thumbnail_url(info),
+        stream_resolved_at=time.monotonic() if stream_url else None,
     )
 
 
@@ -789,10 +849,17 @@ def parse_auto_request(query: str) -> tuple[str, int] | None:
 
 
 async def resolve_track_stream(track: Track) -> None:
-    if track.stream_url:
+    stream_age = (
+        time.monotonic() - track.stream_resolved_at
+        if track.stream_resolved_at is not None
+        else STREAM_URL_MAX_AGE_SECONDS
+    )
+    if track.stream_url and stream_age < STREAM_URL_MAX_AGE_SECONDS:
         return
 
-    info = await extract_ytdl_info(ytdl, track.source_url, "audio stream resolve")
+    track.stream_url = None
+    track.stream_resolved_at = None
+    info = await extract_ytdl_info(YTDL_OPTIONS, track.source_url, "audio stream resolve")
 
     if "entries" in info:
         entries = [entry for entry in info["entries"] if entry]
@@ -808,6 +875,7 @@ async def resolve_track_stream(track: Track) -> None:
     track.webpage_url = info.get("webpage_url") or track.webpage_url
     track.duration = info.get("duration") or track.duration
     track.stream_url = stream_url
+    track.stream_resolved_at = time.monotonic()
     track.thumbnail_url = get_thumbnail_url(info) or track.thumbnail_url
 
 
@@ -836,7 +904,9 @@ async def extract_tracks(
     requester_id: int | None = None,
 ) -> list[Track]:
     resolved_query = resolve_query(query, section)
-    info = await extract_ytdl_info(ytdl_playlist, resolved_query, "playlist or album search")
+    info = await extract_ytdl_info(
+        YTDL_PLAYLIST_OPTIONS, resolved_query, "playlist or album search"
+    )
 
     if is_search_url(resolved_query):
         search_entries = [entry for entry in info.get("entries", []) if entry]
@@ -844,7 +914,9 @@ async def extract_tracks(
             raise ValueError("No matching album or playlist was found.")
 
         first_result_url = get_entry_url(search_entries[0], resolved_query)
-        info = await extract_ytdl_info(ytdl_playlist, first_result_url, "playlist or album resolve")
+        info = await extract_ytdl_info(
+            YTDL_PLAYLIST_OPTIONS, first_result_url, "playlist or album resolve"
+        )
 
     entries = [entry for entry in info.get("entries", []) if entry]
     if not entries:
@@ -875,7 +947,9 @@ async def extract_auto_tracks(
         radio_url = f"https://www.youtube.com/watch?v={seed_id}&list=RD{seed_id}"
         fallback_url = radio_url
         try:
-            radio_info = await extract_ytdl_info(ytdl_playlist, radio_url, "YouTube radio mix")
+            radio_info = await extract_ytdl_info(
+                YTDL_PLAYLIST_OPTIONS, radio_url, "YouTube radio mix"
+            )
             entries = [entry for entry in radio_info.get("entries", []) if entry]
         except Exception:
             logger.exception("Failed to extract YouTube radio mix for %s", seed_id)
@@ -883,7 +957,7 @@ async def extract_auto_tracks(
     if not entries:
         search_query = f"ytsearch{auto_count * 3}:{seed_track.title} radio mix"
         fallback_url = search_query
-        info = await extract_ytdl_info(ytdl, search_query, "auto fallback search")
+        info = await extract_ytdl_info(YTDL_OPTIONS, search_query, "auto fallback search")
         entries = [entry for entry in info.get("entries", []) if entry]
 
     tracks: list[Track] = []
@@ -910,7 +984,9 @@ async def extract_auto_tracks(
 
     if len(tracks) < auto_count and fallback_url.startswith("https://www.youtube.com/watch"):
         search_query = f"ytsearch{auto_count * 3}:{seed_track.title} radio mix"
-        info = await extract_ytdl_info(ytdl, search_query, "auto supplemental search")
+        info = await extract_ytdl_info(
+            YTDL_OPTIONS, search_query, "auto supplemental search"
+        )
         for entry in [entry for entry in info.get("entries", []) if entry]:
             track = make_track_from_info(entry, requester, search_query, requester_id)
             key = normalize_track_key(track)
@@ -936,8 +1012,19 @@ async def ensure_voice(interaction: discord.Interaction, state: GuildMusicState)
         await interaction.followup.send("먼저 음성 채널에 들어가 주세요.", ephemeral=True)
         return False
 
+    if state.voice and not state.voice.is_connected():
+        stop_playback(state)
+        state.voice = None
+
     if state.voice and state.voice.is_connected():
         if state.voice.channel != channel:
+            if state.current or state.queue or state.voice.is_playing() or state.voice.is_paused():
+                await interaction.followup.send(
+                    f"봇이 이미 {state.voice.channel.mention}에서 재생 중이에요. "
+                    "같은 음성 채널에 들어와 주세요.",
+                    ephemeral=True,
+                )
+                return False
             await state.voice.move_to(channel)
         return True
 
@@ -955,13 +1042,68 @@ async def ensure_voice_for_member(
     if channel is None:
         return False, "먼저 음성 채널에 들어가 주세요."
 
+    if state.voice and not state.voice.is_connected():
+        stop_playback(state)
+        state.voice = None
+
     if state.voice and state.voice.is_connected():
         if state.voice.channel != channel:
+            if state.current or state.queue or state.voice.is_playing() or state.voice.is_paused():
+                return (
+                    False,
+                    f"봇이 이미 {state.voice.channel.mention}에서 재생 중이에요. "
+                    "같은 음성 채널에 들어와 주세요.",
+                )
             await state.voice.move_to(channel)
         return True, None
 
     state.voice = await channel.connect()
     return True, None
+
+
+async def ensure_same_voice_channel(
+    interaction: discord.Interaction,
+    state: GuildMusicState,
+) -> bool:
+    voice = state.voice
+    member_channel = getattr(getattr(interaction.user, "voice", None), "channel", None)
+    if voice and voice.is_connected() and member_channel == voice.channel:
+        return True
+
+    message = "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+    return False
+
+
+def stop_playback(state: GuildMusicState) -> None:
+    state.playback_generation += 1
+    state.stop_requested = True
+    state.queue.clear()
+    state.current = None
+
+    if state.advance_task and not state.advance_task.done():
+        state.advance_task.cancel()
+    state.advance_task = None
+
+    if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
+        state.voice.stop()
+
+
+def schedule_play_next(
+    guild_id: int,
+    *,
+    announce: bool = True,
+) -> tuple[asyncio.Task[None], bool]:
+    state = get_state(guild_id)
+    if state.advance_task and not state.advance_task.done():
+        return state.advance_task, False
+
+    task = asyncio.create_task(play_next(guild_id, announce=announce))
+    state.advance_task = task
+    return task, True
 
 
 async def enqueue_tracks(
@@ -1057,11 +1199,20 @@ async def enqueue_tracks(
         await send_feedback(content="추가할 곡을 찾지 못했어요.")
         return False
 
-    was_idle = bool(state.voice) and not state.voice.is_playing() and not state.voice.is_paused()
     state.queue.extend(tracks)
+    should_start = (
+        bool(state.voice)
+        and state.current is None
+        and not state.voice.is_playing()
+        and not state.voice.is_paused()
+    )
+    playback_task: asyncio.Task[None] | None = None
+    started_playback = False
+    if should_start:
+        playback_task, started_playback = schedule_play_next(guild_id, announce=False)
 
-    if was_idle:
-        await play_next(guild_id, announce=False)
+    if started_playback and playback_task:
+        await playback_task
         if state.current:
             message = await send_feedback(
                 embed=make_player_embed(state.current, state),
@@ -1124,71 +1275,119 @@ async def delete_player_panel(state: GuildMusicState) -> None:
 
 async def play_next(guild_id: int, announce: bool = True) -> None:
     state = get_state(guild_id)
-    should_retry = False
-    track: Track | None = None
+    current_task = asyncio.current_task()
+    generation = state.playback_generation
 
-    if not ffmpeg_is_available():
-        state.current = None
-        state.queue.clear()
-        await delete_player_panel(state)
-        await notify_playback_error(
-            state,
-            "FFmpeg를 찾지 못해서 재생할 수 없어요. "
-            "FFmpeg를 설치하거나 `.env`에 `FFMPEG_PATH`를 설정해 주세요.",
-        )
-        logger.error("FFmpeg executable was not found: %s", FFMPEG_EXECUTABLE)
-        return
-
-    async with state.lock:
-        voice = state.voice
-        if voice is None or not voice.is_connected():
+    try:
+        if not ffmpeg_is_available():
             state.current = None
+            state.queue.clear()
             await delete_player_panel(state)
-            return
-
-        if not state.queue:
-            state.current = None
-            await delete_player_panel(state)
-            return
-
-        track = state.queue.popleft()
-        state.current = track
-        state.skip_requested = False
-        state.stop_requested = False
-
-        try:
-            await resolve_track_stream(track)
-            ffmpeg_source = discord.FFmpegPCMAudio(
-                track.stream_url,
-                executable=FFMPEG_EXECUTABLE,
-                **FFMPEG_OPTIONS,
+            await notify_playback_error(
+                state,
+                "FFmpeg를 찾지 못해서 재생할 수 없어요. "
+                "FFmpeg를 설치하거나 `.env`에 `FFMPEG_PATH`를 설정해 주세요.",
             )
-            source = discord.PCMVolumeTransformer(ffmpeg_source, volume=BOT_VOLUME)
-        except Exception:
-            logger.exception("Failed to create FFmpeg source")
-            state.current = None
-            should_retry = True
-        else:
-            def after_playback(error: Exception | None) -> None:
-                if error:
-                    logger.warning("Playback error: %s", error)
+            logger.error("FFmpeg executable was not found: %s", FFMPEG_EXECUTABLE)
+            return
 
-                def advance() -> None:
-                    if state.current and state.repeat_one and not state.skip_requested and not state.stop_requested:
-                        state.current.stream_url = None
-                        state.queue.appendleft(state.current)
-                    asyncio.create_task(play_next(guild_id))
+        while generation == state.playback_generation:
+            async with state.lock:
+                if generation != state.playback_generation:
+                    return
+                voice = state.voice
+                if voice is None or not voice.is_connected():
+                    state.current = None
+                    should_delete_panel = True
+                    track = None
+                elif voice.is_playing() or voice.is_paused():
+                    return
+                elif not state.queue:
+                    state.current = None
+                    should_delete_panel = True
+                    track = None
+                else:
+                    track = state.queue.popleft()
+                    state.current = track
+                    state.skip_requested = False
+                    state.stop_requested = False
+                    should_delete_panel = False
 
-                bot.loop.call_soon_threadsafe(advance)
+            if should_delete_panel:
+                await delete_player_panel(state)
+                return
+            assert track is not None
 
-            voice.play(source, after=after_playback)
+            try:
+                await resolve_track_stream(track)
+                ffmpeg_source = discord.FFmpegPCMAudio(
+                    track.stream_url,
+                    executable=FFMPEG_EXECUTABLE,
+                    **FFMPEG_OPTIONS,
+                )
+                source = discord.PCMVolumeTransformer(ffmpeg_source, volume=BOT_VOLUME)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Failed to create FFmpeg source for %s", track.title)
+                if state.current is track and generation == state.playback_generation:
+                    state.current = None
+                continue
 
-    if should_retry:
-        await play_next(guild_id, announce=announce)
-        return
+            try:
+                async with state.lock:
+                    voice = state.voice
+                    can_start = (
+                        generation == state.playback_generation
+                        and state.current is track
+                        and voice is not None
+                        and voice.is_connected()
+                        and not voice.is_playing()
+                        and not voice.is_paused()
+                    )
+                    if not can_start:
+                        source.cleanup()
+                        return
 
-    if announce and track:
-        await send_player_panel(guild_id, state, track)
+                    def after_playback(error: Exception | None) -> None:
+                        if error:
+                            logger.warning("Playback error: %s", error)
+
+                        def advance() -> None:
+                            if (
+                                generation != state.playback_generation
+                                or state.current is not track
+                            ):
+                                return
+
+                            if state.repeat_one and not state.skip_requested and not state.stop_requested:
+                                track.stream_url = None
+                                track.stream_resolved_at = None
+                                state.queue.appendleft(track)
+                            state.current = None
+                            schedule_play_next(guild_id)
+
+                        bot.loop.call_soon_threadsafe(advance)
+
+                    try:
+                        voice.play(source, after=after_playback)
+                    except Exception:
+                        source.cleanup()
+                        logger.exception("Failed to start playback for %s", track.title)
+                        if state.current is track:
+                            state.current = None
+                        continue
+            except asyncio.CancelledError:
+                if not voice.is_playing():
+                    source.cleanup()
+                raise
+
+            if announce and state.current is track:
+                await send_player_panel(guild_id, state, track)
+            return
+    finally:
+        if state.advance_task is current_task:
+            state.advance_task = None
 
 
 def guild_only_error() -> str:
@@ -1197,6 +1396,7 @@ def guild_only_error() -> str:
 
 @bot.event
 async def on_ready() -> None:
+    global commands_synced
     load_music_channel_config()
     logger.info("Logged in as %s", bot.user)
     if ffmpeg_is_available():
@@ -1206,6 +1406,9 @@ async def on_ready() -> None:
             "FFmpeg executable was not found. Set FFMPEG_PATH in .env or add ffmpeg to PATH."
         )
 
+    if commands_synced:
+        return
+
     if DEV_GUILD_ID:
         guild = discord.Object(id=int(DEV_GUILD_ID))
         bot.tree.copy_global_to(guild=guild)
@@ -1214,6 +1417,7 @@ async def on_ready() -> None:
     else:
         synced = await bot.tree.sync()
         logger.info("Synced %s global command(s)", len(synced))
+    commands_synced = True
 
 
 @bot.event
@@ -1241,6 +1445,7 @@ async def on_message(message: discord.Message) -> None:
             silent=is_silent_music_channel(message.channel),
         )
         asyncio.create_task(delete_message_later(error_message, MUSIC_FEEDBACK_DELETE_SECONDS))
+        await delete_music_request_message(message)
         return
 
     async with message.channel.typing():
@@ -1249,7 +1454,7 @@ async def on_message(message: discord.Message) -> None:
             mention_author=False,
             silent=is_silent_music_channel(message.channel),
         )
-        queued = await enqueue_tracks(
+        await enqueue_tracks(
             message.guild.id,
             message.channel,
             message.author,
@@ -1440,6 +1645,8 @@ async def pause(interaction: discord.Interaction) -> None:
         return
 
     state = get_state(interaction.guild_id)
+    if not await ensure_same_voice_channel(interaction, state):
+        return
     if state.voice and state.voice.is_playing():
         state.voice.pause()
         await interaction.response.send_message("일시정지했어요.", ephemeral=True)
@@ -1456,6 +1663,8 @@ async def resume(interaction: discord.Interaction) -> None:
         return
 
     state = get_state(interaction.guild_id)
+    if not await ensure_same_voice_channel(interaction, state):
+        return
     if state.voice and state.voice.is_paused():
         state.voice.resume()
         await interaction.response.send_message("다시 재생할게요.", ephemeral=True)
@@ -1472,6 +1681,8 @@ async def skip(interaction: discord.Interaction) -> None:
         return
 
     state = get_state(interaction.guild_id)
+    if not await ensure_same_voice_channel(interaction, state):
+        return
     if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
         state.skip_requested = True
         state.voice.stop()
@@ -1489,12 +1700,9 @@ async def stop(interaction: discord.Interaction) -> None:
         return
 
     state = get_state(interaction.guild_id)
-    state.stop_requested = True
-    state.queue.clear()
-    state.current = None
-
-    if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
-        state.voice.stop()
+    if not await ensure_same_voice_channel(interaction, state):
+        return
+    stop_playback(state)
 
     await delete_player_panel(state)
     await interaction.response.send_message("재생을 멈추고 대기열을 비웠어요.")
@@ -1524,6 +1732,8 @@ async def remove_from_queue(interaction: discord.Interaction, position: int) -> 
         return
 
     state = get_state(interaction.guild_id)
+    if not await ensure_same_voice_channel(interaction, state):
+        return
     removed = remove_queued_track(state, position - 1)
     if removed is None:
         await interaction.response.send_message("그 번호의 대기열 곡을 찾지 못했어요.", ephemeral=True)
@@ -1564,9 +1774,9 @@ async def leave(interaction: discord.Interaction) -> None:
         return
 
     state = get_state(interaction.guild_id)
-    state.stop_requested = True
-    state.queue.clear()
-    state.current = None
+    if not await ensure_same_voice_channel(interaction, state):
+        return
+    stop_playback(state)
 
     if state.voice and state.voice.is_connected():
         await delete_player_panel(state)

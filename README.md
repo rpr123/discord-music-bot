@@ -88,6 +88,9 @@ YOUTUBE_MUSIC_ONLY=true
 YOUTUBE_SEARCH_FALLBACK=true
 YOUTUBE_MUSIC_SECTION=songs
 # YOUTUBE_COOKIES_FILE=./cookies.txt
+YTDL_EXTRACT_TIMEOUT_SECONDS=45
+YTDL_MAX_CONCURRENT_EXTRACTIONS=2
+STREAM_URL_MAX_AGE_SECONDS=900
 MAX_BULK_TRACKS=50
 DEFAULT_AUTO_TRACKS=8
 MAX_AUTO_TRACKS=25
@@ -96,7 +99,7 @@ BOT_VOLUME=0.2
 
 `MUSIC_CHANNEL_SILENT=true`이면 음악 신청 전용 채널에서 봇이 보내는 검색/대기열/Now playing 메시지를 조용한 메시지로 보냅니다. 사용자가 직접 보낸 곡 신청 메시지의 알림이나 각자의 채널 음소거 상태는 디스코드 클라이언트 설정 영역이라 봇이 강제로 바꿀 수 없습니다.
 
-`MUSIC_CHANNEL_DELETE_REQUESTS=true`이면 전용 채널에서 사용자가 보낸 곡 신청 메시지를 재생/대기열 추가 성공 후 삭제합니다.
+`MUSIC_CHANNEL_DELETE_REQUESTS=true`이면 전용 채널에서 사용자가 보낸 곡 신청 메시지를 처리 후 삭제합니다. 검색 실패나 음성 채널 미입장처럼 재생을 시작하지 못한 경우에도 요청 메시지는 정리됩니다.
 
 `MUSIC_FEEDBACK_DELETE_SECONDS=10`이면 메시지로 곡을 신청했을 때 나오는 임시 추가 확인 메시지를 10초 뒤 삭제합니다. 슬래시 명령어 응답은 기존처럼 신청자에게만 보입니다.
 
@@ -105,6 +108,8 @@ BOT_VOLUME=0.2
 `YOUTUBE_MUSIC_SECTION`은 `songs`, `videos`, `albums`, `artists`, `community playlists`, `featured playlists` 중에서 선택할 수 있습니다. 일반적인 음악 봇이면 `songs`가 가장 안정적입니다.
 
 GCP 같은 클라우드 서버에서 YouTube가 `Sign in to confirm you're not a bot` 오류를 내면, 로그인된 브라우저에서 YouTube 쿠키를 Netscape `cookies.txt` 형식으로 내보낸 뒤 서버의 프로젝트 폴더에 `cookies.txt`로 저장하고 `.env`에 `YOUTUBE_COOKIES_FILE=./cookies.txt`를 추가하세요. 쿠키 파일은 계정 인증 정보라 GitHub에 올리면 안 됩니다.
+
+`YTDL_EXTRACT_TIMEOUT_SECONDS`는 검색 한 번을 기다리는 최대 시간입니다. `YTDL_MAX_CONCURRENT_EXTRACTIONS`는 동시에 실행할 검색 수를 제한해 느린 요청이 누적되는 것을 막습니다. 오래 대기한 곡은 `STREAM_URL_MAX_AGE_SECONDS`가 지나면 재생 직전에 스트림 주소를 새로 받습니다.
 
 `MAX_BULK_TRACKS`는 앨범이나 재생목록을 한 번에 추가할 때 최대 몇 곡까지 대기열에 넣을지 정합니다.
 
@@ -136,6 +141,8 @@ https://music.youtube.com/playlist?list=...
 ```
 
 곡이 시작되면 전용 채널에 “지금 재생 중” 카드가 표시됩니다. 카드에는 다음 곡이 함께 표시되고, 버튼으로 바로 재생/일시정지, 스킵, 정지, 반복, 셔플, 대기열 확인을 할 수 있습니다. 대기열 버튼을 누르면 삭제할 곡을 선택할 수 있고, `/remove 2`처럼 번호로도 삭제할 수 있습니다. 메시지 신청의 곡 추가 확인은 10초 뒤 자동 삭제되고, 모든 곡이 끝나거나 정지하면 이 카드는 자동으로 삭제됩니다.
+
+재생 중인 봇을 조작하거나 새 곡을 신청하려면 봇과 같은 음성 채널에 있어야 합니다. 봇이 재생 중일 때 다른 음성 채널의 요청으로 이동하지 않습니다.
 
 전용 채널 설정은 `music_channels.json`에 서버별로 저장됩니다. 이 파일은 로컬 설정이라 Git에는 올리지 않도록 `.gitignore`에 넣어 두었습니다.
 
