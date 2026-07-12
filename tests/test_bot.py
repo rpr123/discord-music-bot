@@ -68,6 +68,43 @@ class SearchRoutingTests(unittest.TestCase):
         )
 
 
+class AutoRequestParsingTests(unittest.TestCase):
+    def test_auto_without_count_uses_default(self) -> None:
+        self.assertEqual(
+            bot.parse_auto_request("auto: back number"),
+            ("back number", bot.DEFAULT_AUTO_TRACKS),
+        )
+
+    def test_count_is_written_between_auto_and_colon(self) -> None:
+        self.assertEqual(
+            bot.parse_auto_request("auto5: back number"),
+            ("back number", 5),
+        )
+        self.assertEqual(
+            bot.parse_auto_request("AUTO12 : lofi chill"),
+            ("lofi chill", 12),
+        )
+
+    def test_count_is_clamped_to_configured_limit(self) -> None:
+        self.assertEqual(
+            bot.parse_auto_request("auto999: lofi chill"),
+            ("lofi chill", bot.MAX_AUTO_TRACKS),
+        )
+
+    def test_query_is_required(self) -> None:
+        with self.assertRaisesRegex(ValueError, "곡명이나 아티스트"):
+            bot.parse_auto_request("auto:")
+        with self.assertRaisesRegex(ValueError, "곡명이나 아티스트"):
+            bot.parse_auto_request("auto5:")
+
+    def test_old_count_syntax_explains_the_new_format(self) -> None:
+        with self.assertRaisesRegex(ValueError, "auto5: 곡명"):
+            bot.parse_auto_request("auto:5 back number")
+
+    def test_unrelated_query_is_not_an_auto_request(self) -> None:
+        self.assertIsNone(bot.parse_auto_request("automatic playlist"))
+
+
 class TrackIdentityTests(unittest.TestCase):
     def make_identity_track(
         self,
