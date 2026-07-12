@@ -459,6 +459,9 @@ class GuildMusicState:
     recent_track_keys: Deque[str] = field(
         default_factory=lambda: deque(maxlen=AUTOPLAY_HISTORY_SIZE)
     )
+    recent_video_ids: Deque[str] = field(
+        default_factory=lambda: deque(maxlen=AUTOPLAY_HISTORY_SIZE)
+    )
     skip_requested: bool = False
     stop_requested: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -1143,6 +1146,22 @@ def normalize_track_key(track: Track) -> str:
     return f"video:{video_id}" if video_id else track.webpage_url.casefold()
 
 
+def get_track_video_id(track: Track) -> str | None:
+    for url in (track.webpage_url, track.source_url):
+        video_id = get_video_id({}, url)
+        if video_id:
+            return video_id
+    return None
+
+
+def get_track_identity_keys(track: Track) -> set[str]:
+    keys = {normalize_track_key(track)}
+    video_id = get_track_video_id(track)
+    if video_id:
+        keys.add(f"video:{video_id}")
+    return keys
+
+
 def make_track_from_info(
     info: dict,
     requester: str,
@@ -1448,8 +1467,7 @@ async def extract_auto_tracks(
     seen_keys: set[str] = set()
 
     for track in [seed_track]:
-        key = normalize_track_key(track)
-        seen_keys.add(key)
+        seen_keys.update(get_track_identity_keys(track))
         tracks.append(track)
         if len(tracks) >= auto_count:
             return tracks
@@ -1458,10 +1476,10 @@ async def extract_auto_tracks(
         track = make_track_from_info(entry, requester, fallback_url, requester_id)
         if not get_video_id(entry, track.webpage_url):
             continue
-        key = normalize_track_key(track)
-        if key in seen_keys:
+        identity_keys = get_track_identity_keys(track)
+        if not seen_keys.isdisjoint(identity_keys):
             continue
-        seen_keys.add(key)
+        seen_keys.update(identity_keys)
         tracks.append(track)
         if len(tracks) >= auto_count:
             break
@@ -1473,10 +1491,10 @@ async def extract_auto_tracks(
         )
         for entry in [entry for entry in info.get("entries", []) if entry]:
             track = make_track_from_info(entry, requester, search_query, requester_id)
-            key = normalize_track_key(track)
-            if key in seen_keys:
+            identity_keys = get_track_identity_keys(track)
+            if not seen_keys.isdisjoint(identity_keys):
                 continue
-            seen_keys.add(key)
+            seen_keys.update(identity_keys)
             tracks.append(track)
             if len(tracks) >= auto_count:
                 break
@@ -1487,13 +1505,19 @@ async def extract_auto_tracks(
     return tracks
 
 
-def remember_autoplay_track(state: GuildMusicState, track: Track) -> None:
-    key = normalize_track_key(track)
+def remember_recent_value(values: Deque[str], value: str) -> None:
     try:
-        state.recent_track_keys.remove(key)
+        values.remove(value)
     except ValueError:
         pass
-    state.recent_track_keys.append(key)
+    values.append(value)
+
+
+def remember_autoplay_track(state: GuildMusicState, track: Track) -> None:
+    remember_recent_value(state.recent_track_keys, normalize_track_key(track))
+    video_id = get_track_video_id(track)
+    if video_id:
+        remember_recent_value(state.recent_video_ids, video_id)
 
 
 def get_autoplay_seed(state: GuildMusicState) -> Track | None:
@@ -1504,9 +1528,11 @@ def get_autoplay_seed(state: GuildMusicState) -> Track | None:
 
 def get_autoplay_excluded_keys(state: GuildMusicState) -> set[str]:
     keys = set(state.recent_track_keys)
+    keys.update(f"video:{video_id}" for video_id in state.recent_video_ids)
     if state.current is not None:
-        keys.add(normalize_track_key(state.current))
-    keys.update(normalize_track_key(track) for track in state.queue)
+        keys.update(get_track_identity_keys(state.current))
+    for track in state.queue:
+        keys.update(get_track_identity_keys(track))
     return keys
 
 
@@ -1519,7 +1545,7 @@ def select_autoplay_candidate(
     if extra_excluded_keys:
         excluded_keys.update(extra_excluded_keys)
     for candidate in candidates:
-        if normalize_track_key(candidate) not in excluded_keys:
+        if get_track_identity_keys(candidate).isdisjoint(excluded_keys):
             return candidate
     return None
 
@@ -1580,7 +1606,7 @@ async def refill_autoplay_queue(
     state = get_state(guild_id)
     current_task = asyncio.current_task()
     starting_track_id = state.current.track_id if state.current else None
-    initial_seed_key = normalize_track_key(fallback_seed)
+    initial_seed_keys = get_track_identity_keys(fallback_seed)
     added_track = False
     failure_count = 0
     candidate_count = clamp_auto_count(max(DEFAULT_AUTO_TRACKS, 5))
@@ -1617,10 +1643,7 @@ async def refill_autoplay_queue(
             candidate = select_autoplay_candidate(
                 state,
                 candidates,
-                {
-                    initial_seed_key,
-                    normalize_track_key(seed),
-                },
+                initial_seed_keys | get_track_identity_keys(seed),
             )
             if candidate is None:
                 retry_delay = get_autoplay_retry_delay(failure_count)
@@ -1637,7 +1660,9 @@ async def refill_autoplay_queue(
             async with state.lock:
                 if not autoplay_can_refill(state, generation):
                     return
-                if normalize_track_key(candidate) in get_autoplay_excluded_keys(state):
+                if not get_track_identity_keys(candidate).isdisjoint(
+                    get_autoplay_excluded_keys(state)
+                ):
                     continue
 
                 state.queue.append(candidate)

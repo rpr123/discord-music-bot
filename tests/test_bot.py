@@ -260,6 +260,53 @@ class TrackIdentityTests(unittest.TestCase):
             fresh,
         )
 
+    def test_autoplay_skips_recent_videos_when_metadata_changes(self) -> None:
+        played_first = self.make_identity_track(
+            "First Artist - First Song",
+            "aaaaaaaaaaa",
+            artist="First Artist",
+            song_name="First Song",
+        )
+        played_second = self.make_identity_track(
+            "Second Artist - Second Song",
+            "bbbbbbbbbbb",
+            artist="Second Artist",
+            song_name="Second Song",
+        )
+        rediscovered_first = self.make_identity_track(
+            "First Song (Official Audio)",
+            "aaaaaaaaaaa",
+            uploader="Archive Channel",
+        )
+        rediscovered_second = self.make_identity_track(
+            "Second Song (Official Audio)",
+            "bbbbbbbbbbb",
+            uploader="Another Channel",
+        )
+        fresh = self.make_identity_track(
+            "Third Artist - Third Song",
+            "ccccccccccc",
+        )
+        state = bot.GuildMusicState()
+        bot.remember_autoplay_track(state, played_first)
+        bot.remember_autoplay_track(state, played_second)
+
+        self.assertNotEqual(
+            bot.normalize_track_key(played_first),
+            bot.normalize_track_key(rediscovered_first),
+        )
+        self.assertNotEqual(
+            bot.normalize_track_key(played_second),
+            bot.normalize_track_key(rediscovered_second),
+        )
+        self.assertIs(
+            bot.select_autoplay_candidate(
+                state,
+                [rediscovered_first, rediscovered_second, fresh],
+            ),
+            fresh,
+        )
+
 
 class CommandSurfaceTests(unittest.TestCase):
     def test_search_commands_are_message_only(self) -> None:
