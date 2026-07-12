@@ -143,6 +143,10 @@ EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS = 3
 AUTOPLAY_RETRY_DELAYS_SECONDS = (60, 120, 300, 900, 1800)
 AUTOPLAY_HISTORY_SIZE = 50
 AUTOPLAY_BUTTON_CUSTOM_ID = "music:autoplay"
+CONTROL_PANEL_HISTORY_LIMIT = 100
+PLAYING_PANEL_TITLE = "💿 지금 재생 중"
+IDLE_PANEL_TITLE = "🎵 재생 대기 중"
+CONTROL_PANEL_TITLES = frozenset({PLAYING_PANEL_TITLE, IDLE_PANEL_TITLE})
 
 YTDL_BASE_OPTIONS = {
     "format": "bestaudio/best",
@@ -644,7 +648,7 @@ def make_player_embed(track: Track, state: GuildMusicState) -> discord.Embed:
     repeat_text = "켜짐" if state.repeat_one else "꺼짐"
     autoplay_text = "켜짐" if state.autoplay_enabled else "꺼짐"
     embed = discord.Embed(
-        title="💿 지금 재생 중",
+        title=PLAYING_PANEL_TITLE,
         description=f"🎧 {requester_label(track)}님이 신청한 곡이에요!",
         color=discord.Color.gold(),
     )
@@ -672,7 +676,7 @@ def make_player_embed(track: Track, state: GuildMusicState) -> discord.Embed:
 
 def make_idle_player_embed() -> discord.Embed:
     return discord.Embed(
-        title="🎵 재생 대기 중",
+        title=IDLE_PANEL_TITLE,
         description=(
             "음성 채널에 들어간 뒤 아래 형식으로 메시지를 보내 주세요.\n\n"
             "`곡명` 또는 `YouTube URL`\n"
@@ -1965,14 +1969,146 @@ def resolve_control_panel_channel(
     return state.announcement_channel
 
 
+def message_has_component_custom_id(
+    message: discord.Message,
+    custom_id: str,
+) -> bool:
+    for row in getattr(message, "components", ()):
+        for component in getattr(row, "children", ()):
+            if getattr(component, "custom_id", None) == custom_id:
+                return True
+    return False
+
+
+def is_music_control_panel_message(
+    message: discord.Message,
+    bot_user_id: int | None = None,
+) -> bool:
+    if bot_user_id is None:
+        bot_user_id = getattr(bot.user, "id", None)
+    if bot_user_id is None or getattr(message.author, "id", None) != bot_user_id:
+        return False
+
+    has_panel_title = any(
+        getattr(embed, "title", None) in CONTROL_PANEL_TITLES
+        for embed in getattr(message, "embeds", ())
+    )
+    return has_panel_title and message_has_component_custom_id(
+        message,
+        AUTOPLAY_BUTTON_CUSTOM_ID,
+    )
+
+
+async def reconcile_control_panel_messages(
+    guild_id: int,
+    control_channel: discord.abc.Messageable,
+    known_message: discord.Message | None,
+    *,
+    delete_non_panel_messages: bool = False,
+) -> discord.Message | None:
+    history = getattr(control_channel, "history", None)
+    if history is None:
+        return known_message
+
+    candidates: dict[int, discord.Message] = {}
+    if known_message is not None:
+        candidates[known_message.id] = known_message
+
+    bot_user_id = getattr(bot.user, "id", None)
+    deleted_message_count = 0
+    try:
+        history_limit = None if delete_non_panel_messages else CONTROL_PANEL_HISTORY_LIMIT
+        async for message in history(limit=history_limit):
+            if (
+                message.id in candidates
+                or is_music_control_panel_message(message, bot_user_id)
+            ):
+                candidates[message.id] = message
+            elif delete_non_panel_messages and await delete_music_channel_message(
+                guild_id,
+                message,
+            ):
+                deleted_message_count += 1
+    except discord.Forbidden:
+        logger.warning(
+            "Missing permission to read music channel history in guild %s",
+            guild_id,
+        )
+        return known_message
+    except discord.HTTPException:
+        logger.exception(
+            "Failed to read music channel history in guild %s",
+            guild_id,
+        )
+        return known_message
+
+    if not candidates:
+        if deleted_message_count:
+            logger.info(
+                "Cleaned %s message(s) from the music channel in guild %s",
+                deleted_message_count,
+                guild_id,
+            )
+        return None
+
+    newest_message = max(candidates.values(), key=lambda message: message.id)
+    removed_panel_count = 0
+    for message in candidates.values():
+        if message.id == newest_message.id:
+            continue
+        if await delete_music_channel_message(guild_id, message):
+            removed_panel_count += 1
+
+    if deleted_message_count or removed_panel_count:
+        logger.info(
+            "Kept control panel %s and removed %s other message(s) and "
+            "%s duplicate panel(s) in guild %s",
+            newest_message.id,
+            deleted_message_count,
+            removed_panel_count,
+            guild_id,
+        )
+    return newest_message
+
+
+async def delete_music_channel_message(
+    guild_id: int,
+    message: discord.Message,
+) -> bool:
+    try:
+        await message.delete()
+        return True
+    except discord.NotFound:
+        return False
+    except discord.Forbidden:
+        logger.warning(
+            "Missing permission to delete message %s from the music channel in guild %s",
+            message.id,
+            guild_id,
+        )
+    except discord.HTTPException:
+        logger.exception(
+            "Failed to delete message %s from the music channel in guild %s",
+            message.id,
+            guild_id,
+        )
+    return False
+
+
 async def update_control_panel(
     guild_id: int,
     state: GuildMusicState,
     *,
     channel: discord.abc.Messageable | None = None,
+    clean_channel: bool = False,
 ) -> discord.Message | None:
     async with state.control_panel_lock:
-        return await _update_control_panel(guild_id, state, channel=channel)
+        return await _update_control_panel(
+            guild_id,
+            state,
+            channel=channel,
+            clean_channel=clean_channel,
+        )
 
 
 async def _update_control_panel(
@@ -1980,6 +2116,7 @@ async def _update_control_panel(
     state: GuildMusicState,
     *,
     channel: discord.abc.Messageable | None = None,
+    clean_channel: bool = False,
 ) -> discord.Message | None:
     control_channel = channel or resolve_control_panel_channel(guild_id, state)
     if control_channel is None:
@@ -2000,12 +2137,14 @@ async def _update_control_panel(
         ):
             state.control_message = None
 
-    if state.control_message is None:
-        message_id = get_control_message_id(guild_id)
+    recovering_panel = state.control_message is None
+    reconciling_panel = recovering_panel or clean_channel
+    saved_message_id = get_control_message_id(guild_id) if reconciling_panel else None
+    if recovering_panel:
         fetch_message = getattr(control_channel, "fetch_message", None)
-        if message_id is not None and fetch_message is not None:
+        if saved_message_id is not None and fetch_message is not None:
             try:
-                state.control_message = await fetch_message(message_id)
+                state.control_message = await fetch_message(saved_message_id)
             except discord.NotFound:
                 clear_control_message_id(guild_id)
             except discord.Forbidden:
@@ -2021,6 +2160,14 @@ async def _update_control_panel(
                 )
                 return None
 
+    if reconciling_panel:
+        state.control_message = await reconcile_control_panel_messages(
+            guild_id,
+            control_channel,
+            state.control_message,
+            delete_non_panel_messages=clean_channel,
+        )
+
     if state.current is None:
         embed = make_idle_player_embed()
         view = MusicControlView(guild_id, disabled=True)
@@ -2031,6 +2178,8 @@ async def _update_control_panel(
     if state.control_message is not None:
         try:
             await state.control_message.edit(content=None, embed=embed, view=view)
+            if reconciling_panel and saved_message_id != state.control_message.id:
+                set_control_message_id(guild_id, state.control_message.id)
             return state.control_message
         except discord.NotFound:
             state.control_message = None
@@ -2122,7 +2271,12 @@ async def restore_control_panels() -> None:
 
         state = get_state(guild.id)
         try:
-            await update_control_panel(guild.id, state, channel=channel)
+            await update_control_panel(
+                guild.id,
+                state,
+                channel=channel,
+                clean_channel=True,
+            )
         except Exception:
             logger.exception("Failed to restore music control panel in guild %s", guild.id)
 

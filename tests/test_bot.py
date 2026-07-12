@@ -438,6 +438,165 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         channel.send.assert_not_awaited()
         message.edit.assert_awaited_once()
 
+    def test_panel_history_match_requires_bot_author_title_and_controls(self) -> None:
+        class Value:
+            def __init__(self, **values: object) -> None:
+                self.__dict__.update(values)
+
+        panel = Value(
+            author=Value(id=77),
+            embeds=[Value(title="🎵 재생 대기 중")],
+            components=[
+                Value(children=[Value(custom_id=bot.AUTOPLAY_BUTTON_CUSTOM_ID)])
+            ],
+        )
+
+        self.assertTrue(bot.is_music_control_panel_message(panel, 77))
+        self.assertFalse(bot.is_music_control_panel_message(panel, 88))
+        panel.embeds[0].title = "Added to queue"
+        self.assertFalse(bot.is_music_control_panel_message(panel, 77))
+
+    async def test_startup_keeps_latest_panel_and_cleans_channel(self) -> None:
+        class Guild:
+            id = 777
+
+        class Channel:
+            id = 888
+            guild = Guild()
+
+            def __init__(self) -> None:
+                self.fetch_message = AsyncMock()
+                self.send = AsyncMock()
+                self.messages = []
+                self.history_limit = None
+                self.history_called = False
+
+            def history(self, *, limit: int | None):
+                self.history_called = True
+                self.history_limit = limit
+
+                async def messages():
+                    for message in self.messages:
+                        yield message
+
+                return messages()
+
+        class Message:
+            def __init__(
+                self,
+                message_id: int,
+                channel: Channel,
+                *,
+                is_panel: bool,
+            ) -> None:
+                self.id = message_id
+                self.channel = channel
+                self.is_panel = is_panel
+                self.edit = AsyncMock()
+                self.delete = AsyncMock()
+
+        channel = Channel()
+        older = Message(100, channel, is_panel=True)
+        newest = Message(200, channel, is_panel=True)
+        user_request = Message(300, channel, is_panel=False)
+        temporary_feedback = Message(150, channel, is_panel=False)
+        channel.messages = [user_request, newest, temporary_feedback, older]
+        channel.fetch_message.return_value = older
+        state = bot.GuildMusicState()
+
+        with (
+            patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
+            patch.object(bot, "get_control_message_id", return_value=older.id),
+            patch.object(bot, "set_control_message_id") as save_message_id,
+            patch.object(
+                bot,
+                "is_music_control_panel_message",
+                side_effect=lambda message, _: message.is_panel,
+            ),
+        ):
+            result = await bot.update_control_panel(
+                777,
+                state,
+                channel=channel,
+                clean_channel=True,
+            )
+
+        self.assertIs(result, newest)
+        self.assertIs(state.control_message, newest)
+        self.assertTrue(channel.history_called)
+        self.assertIsNone(channel.history_limit)
+        channel.fetch_message.assert_awaited_once_with(older.id)
+        channel.send.assert_not_awaited()
+        older.delete.assert_awaited_once()
+        user_request.delete.assert_awaited_once()
+        temporary_feedback.delete.assert_awaited_once()
+        newest.delete.assert_not_awaited()
+        newest.edit.assert_awaited_once()
+        save_message_id.assert_called_once_with(777, newest.id)
+
+    async def test_restart_recovers_panel_when_saved_id_is_missing(self) -> None:
+        class Guild:
+            id = 778
+
+        class Channel:
+            id = 889
+            guild = Guild()
+
+            def __init__(self) -> None:
+                self.fetch_message = AsyncMock()
+                self.send = AsyncMock()
+                self.messages = []
+                self.history_limit = None
+
+            def history(self, *, limit: int):
+                self.history_limit = limit
+
+                async def messages():
+                    for message in self.messages:
+                        yield message
+
+                return messages()
+
+        class Message:
+            def __init__(
+                self,
+                message_id: int,
+                channel: Channel,
+                *,
+                is_panel: bool,
+            ) -> None:
+                self.id = message_id
+                self.channel = channel
+                self.is_panel = is_panel
+                self.edit = AsyncMock()
+                self.delete = AsyncMock()
+
+        channel = Channel()
+        message = Message(300, channel, is_panel=True)
+        unrelated = Message(301, channel, is_panel=False)
+        channel.messages = [unrelated, message]
+        state = bot.GuildMusicState()
+
+        with (
+            patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
+            patch.object(bot, "get_control_message_id", return_value=None),
+            patch.object(bot, "set_control_message_id") as save_message_id,
+            patch.object(
+                bot,
+                "is_music_control_panel_message",
+                side_effect=lambda candidate, _: candidate.is_panel,
+            ),
+        ):
+            result = await bot.update_control_panel(778, state, channel=channel)
+
+        self.assertIs(result, message)
+        self.assertEqual(channel.history_limit, bot.CONTROL_PANEL_HISTORY_LIMIT)
+        channel.fetch_message.assert_not_awaited()
+        channel.send.assert_not_awaited()
+        unrelated.delete.assert_not_awaited()
+        message.edit.assert_awaited_once()
+        save_message_id.assert_called_once_with(778, message.id)
+
     async def test_autoplay_button_toggles_state_and_schedules_refill(self) -> None:
         guild_id = 444
         state = bot.get_state(guild_id)
