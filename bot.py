@@ -678,7 +678,7 @@ def make_idle_player_embed() -> discord.Embed:
             "`곡명` 또는 `YouTube URL`\n"
             "`album: 앨범명`\n"
             "`playlist: 플레이리스트명`\n"
-            "`auto: 곡명` 또는 `auto12: 곡명`\n\n"
+            "`auto: 곡명`, `auto12: 곡명` 또는 `auto 12: 곡명`\n\n"
             "자동재생은 아래 버튼으로 켜고 끌 수 있어요."
         ),
         color=discord.Color.blurple(),
@@ -1227,7 +1227,7 @@ def clamp_auto_count(count: int) -> int:
 def parse_auto_request(query: str) -> tuple[str, int] | None:
     query = query.strip()
     counted_match = re.match(
-        r"^auto(\d+)\s*:\s*(.*)$",
+        r"^auto\s*(\d+)\s*:\s*(.*)$",
         query,
         flags=re.IGNORECASE,
     )
@@ -1236,7 +1236,8 @@ def parse_auto_request(query: str) -> tuple[str, int] | None:
         rest = counted_match.group(2).strip()
         if not rest:
             raise ValueError(
-                f"auto{count_text}: 뒤에 곡명이나 아티스트를 입력해 주세요."
+                f"auto{count_text}: 또는 auto {count_text}: 뒤에 "
+                "곡명이나 아티스트를 입력해 주세요."
             )
         return rest, clamp_auto_count(int(count_text))
 
@@ -1252,7 +1253,8 @@ def parse_auto_request(query: str) -> tuple[str, int] | None:
     if old_count_match:
         count_text = old_count_match.group(1)
         raise ValueError(
-            f"곡 개수는 `auto{count_text}: 곡명`처럼 auto와 콜론 사이에 입력해 주세요."
+            f"곡 개수는 `auto{count_text}: 곡명` 또는 `auto {count_text}: 곡명`처럼 "
+            "콜론 앞에 입력해 주세요."
         )
 
     return rest, DEFAULT_AUTO_TRACKS

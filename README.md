@@ -7,7 +7,7 @@ Python 기반 디스코드 음악 봇입니다. 슬래시 명령어로 제어할
 - `/setupmusic` 음악 신청 전용 텍스트 채널 생성 또는 지정
 - 전용 채널에 `아이유 좋은날`, `https://youtube.com/...`처럼 메시지만 보내서 재생
 - 전용 채널에 `album: 앨범명`, `playlist: 플레이리스트명`처럼 보내서 통째로 추가
-- 전용 채널에 `auto: 곡명`, `auto12: 곡명`처럼 보내서 관련 곡 여러 개 추가
+- 전용 채널에 `auto: 곡명`, `auto12: 곡명`, `auto 12: 곡명`처럼 보내서 관련 곡 여러 개 추가
 - 컨트롤 패널에서 자동재생을 켜면 대기열이 1곡 이하일 때 관련 곡을 한 곡씩 계속 보충
 - 곡명과 `auto` 시드는 일반 YouTube 검색을 공통으로 사용
 - YouTube 재생목록 링크를 보내면 여러 곡을 한 번에 대기열에 추가
@@ -162,6 +162,7 @@ album: NewJeans Get Up
 playlist: lofi beats
 auto: back number
 auto12: lofi chill
+auto 12: lofi chill
 https://www.youtube.com/playlist?list=...
 ```
 

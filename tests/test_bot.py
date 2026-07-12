@@ -81,6 +81,10 @@ class AutoRequestParsingTests(unittest.TestCase):
             ("back number", 5),
         )
         self.assertEqual(
+            bot.parse_auto_request("auto 5: back number"),
+            ("back number", 5),
+        )
+        self.assertEqual(
             bot.parse_auto_request("AUTO12 : lofi chill"),
             ("lofi chill", 12),
         )
@@ -96,9 +100,11 @@ class AutoRequestParsingTests(unittest.TestCase):
             bot.parse_auto_request("auto:")
         with self.assertRaisesRegex(ValueError, "곡명이나 아티스트"):
             bot.parse_auto_request("auto5:")
+        with self.assertRaisesRegex(ValueError, "곡명이나 아티스트"):
+            bot.parse_auto_request("auto 5:")
 
     def test_old_count_syntax_explains_the_new_format(self) -> None:
-        with self.assertRaisesRegex(ValueError, "auto5: 곡명"):
+        with self.assertRaisesRegex(ValueError, "auto 5: 곡명"):
             bot.parse_auto_request("auto:5 back number")
 
     def test_unrelated_query_is_not_an_auto_request(self) -> None:
