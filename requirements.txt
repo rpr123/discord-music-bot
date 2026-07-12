@@ -1,2 +1,2 @@
 discord.py[voice]>=2.4,<3
-yt-dlp>=2025.1.1
+yt-dlp[default]>=2025.11.12

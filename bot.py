@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import itertools
 import logging
+import math
 import os
 import random
 import re
 import shutil
 import time
+import unicodedata
 import urllib.parse
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque
@@ -76,28 +80,10 @@ MUSIC_CHANNEL_DELETE_REQUESTS = os.getenv("MUSIC_CHANNEL_DELETE_REQUESTS", "true
     "no",
     "off",
 }
-YOUTUBE_MUSIC_ONLY = os.getenv("YOUTUBE_MUSIC_ONLY", "true").lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
-YOUTUBE_SEARCH_FALLBACK = os.getenv("YOUTUBE_SEARCH_FALLBACK", "true").lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
-YOUTUBE_MUSIC_SECTION = os.getenv("YOUTUBE_MUSIC_SECTION", "songs").strip().lower()
-YOUTUBE_MUSIC_SECTIONS = {
-    "albums",
-    "artists",
-    "community playlists",
-    "featured playlists",
-    "songs",
-    "videos",
-}
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE")
+MUSIC_TEST_AUDIO_FILE = os.getenv("MUSIC_TEST_AUDIO_FILE")
+YOUTUBE_HOSTS = {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
+YOUTUBE_PLAYLIST_SEARCH_FILTER = "EgIQAw%253D%253D"
 
 
 def parse_positive_int_env(name: str, default: int) -> int:
@@ -106,6 +92,19 @@ def parse_positive_int_env(name: str, default: int) -> int:
     except ValueError:
         logger.warning("%s must be a positive integer. Falling back to %s.", name, default)
         return default
+
+
+def parse_nonnegative_float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        logger.warning("%s must be zero or greater. Falling back to %s.", name, default)
+        return default
+
+    if value < 0:
+        logger.warning("%s must be zero or greater. Falling back to %s.", name, default)
+        return default
+    return value
 
 
 def parse_volume_env(name: str, default: float) -> float:
@@ -130,9 +129,20 @@ BOT_VOLUME = parse_volume_env("BOT_VOLUME", 0.2)
 DISCORD_EMBED_FIELD_LIMIT = 1024
 YTDL_EXTRACT_TIMEOUT_SECONDS = parse_positive_int_env("YTDL_EXTRACT_TIMEOUT_SECONDS", 45)
 YTDL_MAX_CONCURRENT_EXTRACTIONS = parse_positive_int_env(
-    "YTDL_MAX_CONCURRENT_EXTRACTIONS", 2
+    "YTDL_MAX_CONCURRENT_EXTRACTIONS", 1
 )
 STREAM_URL_MAX_AGE_SECONDS = parse_positive_int_env("STREAM_URL_MAX_AGE_SECONDS", 900)
+YTDL_MIN_INTERVAL_SECONDS = parse_nonnegative_float_env("YTDL_MIN_INTERVAL_SECONDS", 6.0)
+YTDL_CACHE_TTL_SECONDS = parse_positive_int_env("YTDL_CACHE_TTL_SECONDS", 600)
+YTDL_CACHE_MAX_ENTRIES = parse_positive_int_env("YTDL_CACHE_MAX_ENTRIES", 128)
+YOUTUBE_CIRCUIT_BREAKER_SECONDS = parse_positive_int_env(
+    "YOUTUBE_CIRCUIT_BREAKER_SECONDS", 1800
+)
+MUSIC_TEST_BULK_TRACKS = parse_positive_int_env("MUSIC_TEST_BULK_TRACKS", 3)
+EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS = 3
+AUTOPLAY_RETRY_DELAYS_SECONDS = (60, 120, 300, 900, 1800)
+AUTOPLAY_HISTORY_SIZE = 50
+AUTOPLAY_BUTTON_CUSTOM_ID = "music:autoplay"
 
 YTDL_BASE_OPTIONS = {
     "format": "bestaudio/best",
@@ -162,15 +172,145 @@ FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
+FFMPEG_LOCAL_OPTIONS = {"options": "-vn"}
 
 ytdl_semaphore = asyncio.Semaphore(YTDL_MAX_CONCURRENT_EXTRACTIONS)
+ytdl_rate_lock = asyncio.Lock()
+ytdl_cache_lock = asyncio.Lock()
+ytdl_cache: OrderedDict[tuple[str, str], tuple[float, dict]] = OrderedDict()
+ytdl_last_request_started_at = 0.0
+youtube_circuit_open_until = 0.0
+youtube_circuit_reason: str | None = None
+music_test_track_counter = itertools.count(1)
+
+YOUTUBE_BLOCK_ERROR_MARKERS = (
+    "http error 429",
+    "too many requests",
+    "http error 402",
+    "sign in to confirm",
+    "confirm you're not a bot",
+    "confirm you’re not a bot",
+    "request rate limit",
+    "ip address has been blocked",
+)
+
+
+class YouTubeCircuitOpenError(RuntimeError):
+    def __init__(self, retry_after_seconds: int, reason: str | None = None):
+        self.retry_after_seconds = retry_after_seconds
+        self.reason = reason
+        minutes = max(1, math.ceil(retry_after_seconds / 60))
+        super().__init__(f"YouTube 요청이 제한되어 있어 약 {minutes}분 뒤 다시 시도해 주세요.")
+
+
+def is_youtube_block_error(error: BaseException) -> bool:
+    message = str(error).casefold()
+    return any(marker in message for marker in YOUTUBE_BLOCK_ERROR_MARKERS)
+
+
+def get_youtube_circuit_retry_after() -> int:
+    global youtube_circuit_open_until, youtube_circuit_reason
+    remaining = youtube_circuit_open_until - time.monotonic()
+    if remaining <= 0:
+        youtube_circuit_open_until = 0.0
+        youtube_circuit_reason = None
+        return 0
+    return math.ceil(remaining)
+
+
+def trip_youtube_circuit(error: BaseException) -> bool:
+    global youtube_circuit_open_until, youtube_circuit_reason
+    if not is_youtube_block_error(error):
+        return False
+    if get_youtube_circuit_retry_after() > 0:
+        return True
+
+    youtube_circuit_open_until = time.monotonic() + YOUTUBE_CIRCUIT_BREAKER_SECONDS
+    youtube_circuit_reason = str(error)
+    logger.error(
+        "YouTube circuit opened for %s seconds: %s",
+        YOUTUBE_CIRCUIT_BREAKER_SECONDS,
+        error,
+    )
+    return True
+
+
+def ensure_youtube_circuit_closed() -> None:
+    retry_after = get_youtube_circuit_retry_after()
+    if retry_after > 0:
+        raise YouTubeCircuitOpenError(retry_after, youtube_circuit_reason)
+
+
+def get_ytdl_cache_key(options: dict, query: str) -> tuple[str, str]:
+    mode = "|".join(
+        (
+            str(options.get("extract_flat")),
+            str(options.get("noplaylist")),
+            str(options.get("playlistend")),
+        )
+    )
+    return mode, query
+
+
+def stamp_ytdl_info(info: dict, extracted_at: float) -> None:
+    info["_music_bot_extracted_at"] = extracted_at
+    for entry in info.get("entries") or []:
+        if isinstance(entry, dict):
+            stamp_ytdl_info(entry, extracted_at)
+
+
+async def get_cached_ytdl_info(cache_key: tuple[str, str]) -> dict | None:
+    if YTDL_CACHE_TTL_SECONDS <= 0:
+        return None
+
+    async with ytdl_cache_lock:
+        cached = ytdl_cache.get(cache_key)
+        if cached is None:
+            return None
+        cached_at, info = cached
+        if time.monotonic() - cached_at >= YTDL_CACHE_TTL_SECONDS:
+            ytdl_cache.pop(cache_key, None)
+            return None
+        ytdl_cache.move_to_end(cache_key)
+        return copy.deepcopy(info)
+
+
+async def cache_ytdl_info(cache_key: tuple[str, str], info: dict) -> None:
+    if YTDL_CACHE_TTL_SECONDS <= 0:
+        return
+
+    async with ytdl_cache_lock:
+        ytdl_cache[cache_key] = (time.monotonic(), copy.deepcopy(info))
+        ytdl_cache.move_to_end(cache_key)
+        while len(ytdl_cache) > YTDL_CACHE_MAX_ENTRIES:
+            ytdl_cache.popitem(last=False)
+
+
+async def wait_for_ytdl_interval() -> None:
+    global ytdl_last_request_started_at
+    async with ytdl_rate_lock:
+        elapsed = time.monotonic() - ytdl_last_request_started_at
+        delay = max(0.0, YTDL_MIN_INTERVAL_SECONDS - elapsed)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        ytdl_last_request_started_at = time.monotonic()
 
 
 async def extract_ytdl_info(
     options: dict,
     query: str,
     label: str,
+    *,
+    use_cache: bool = True,
 ) -> dict:
+    cache_key = get_ytdl_cache_key(options, query)
+    if use_cache:
+        cached = await get_cached_ytdl_info(cache_key)
+        if cached is not None:
+            logger.info("yt-dlp cache hit: %s", label)
+            return cached
+
+    ensure_youtube_circuit_closed()
     logger.info("yt-dlp start: %s", label)
     logger.debug("yt-dlp query for %s: %s", label, query)
 
@@ -189,13 +329,22 @@ async def extract_ytdl_info(
         logger.warning("yt-dlp queue timed out: %s", label)
         raise
 
+    try:
+        ensure_youtube_circuit_closed()
+        await wait_for_ytdl_interval()
+    except BaseException:
+        ytdl_semaphore.release()
+        raise
+
     worker = asyncio.create_task(asyncio.to_thread(extract))
 
     def extraction_finished(task: asyncio.Task[dict]) -> None:
         ytdl_semaphore.release()
         if task.cancelled():
             return
-        task.exception()
+        error = task.exception()
+        if error is not None:
+            trip_youtube_circuit(error)
 
     worker.add_done_callback(extraction_finished)
     remaining_timeout = max(
@@ -214,7 +363,13 @@ async def extract_ytdl_info(
             label,
         )
         raise
+    except Exception as error:
+        trip_youtube_circuit(error)
+        raise
 
+    stamp_ytdl_info(info, loop.time())
+    if use_cache:
+        await cache_ytdl_info(cache_key, info)
     logger.info("yt-dlp done: %s", label)
     return info
 
@@ -280,6 +435,10 @@ class Track:
     duration: int | None = None
     stream_url: str | None = None
     thumbnail_url: str | None = None
+    artist: str | None = None
+    song_name: str | None = None
+    uploader: str | None = None
+    is_local: bool = False
     stream_resolved_at: float | None = None
     track_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
@@ -292,10 +451,17 @@ class GuildMusicState:
     announcement_channel: discord.abc.Messageable | None = None
     control_message: discord.Message | None = None
     repeat_one: bool = False
+    autoplay_enabled: bool = False
+    recent_track_keys: Deque[str] = field(
+        default_factory=lambda: deque(maxlen=AUTOPLAY_HISTORY_SIZE)
+    )
     skip_requested: bool = False
     stop_requested: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    control_panel_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     advance_task: asyncio.Task[None] | None = None
+    autoplay_task: asyncio.Task[None] | None = None
+    empty_channel_task: asyncio.Task[None] | None = None
     playback_generation: int = 0
 
 
@@ -306,17 +472,24 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 music_states: dict[int, GuildMusicState] = {}
 configured_music_channels: dict[int, int] = {}
+configured_control_messages: dict[int, int] = {}
+configured_autoplay_enabled: dict[int, bool] = {}
 commands_synced = False
 
 
 def get_state(guild_id: int) -> GuildMusicState:
     if guild_id not in music_states:
-        music_states[guild_id] = GuildMusicState()
+        music_states[guild_id] = GuildMusicState(
+            autoplay_enabled=configured_autoplay_enabled.get(guild_id, False)
+        )
     return music_states[guild_id]
 
 
 def load_music_channel_config() -> None:
     if not MUSIC_CHANNELS_FILE.exists():
+        configured_music_channels.clear()
+        configured_control_messages.clear()
+        configured_autoplay_enabled.clear()
         return
 
     try:
@@ -325,19 +498,60 @@ def load_music_channel_config() -> None:
         logger.warning("Could not read %s", MUSIC_CHANNELS_FILE)
         return
 
+    if not isinstance(raw_config, dict):
+        logger.warning("Ignoring invalid music channel config in %s", MUSIC_CHANNELS_FILE)
+        return
+
     configured_music_channels.clear()
-    for guild_id, channel_id in raw_config.items():
+    configured_control_messages.clear()
+    configured_autoplay_enabled.clear()
+    for guild_id, value in raw_config.items():
+        if isinstance(value, dict):
+            channel_id = value.get("channel_id")
+            control_message_id = value.get("control_message_id")
+            autoplay_enabled = value.get("autoplay_enabled", False)
+        else:
+            channel_id = value
+            control_message_id = None
+            autoplay_enabled = False
+
         try:
-            configured_music_channels[int(guild_id)] = int(channel_id)
+            parsed_guild_id = int(guild_id)
+            configured_music_channels[parsed_guild_id] = int(channel_id)
         except (TypeError, ValueError):
             logger.warning("Ignoring invalid music channel config for guild %s", guild_id)
+            continue
+
+        if control_message_id is not None:
+            try:
+                configured_control_messages[parsed_guild_id] = int(control_message_id)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring invalid control message config for guild %s",
+                    guild_id,
+                )
+
+        if isinstance(autoplay_enabled, bool):
+            if autoplay_enabled:
+                configured_autoplay_enabled[parsed_guild_id] = True
+        else:
+            logger.warning(
+                "Ignoring invalid autoplay config for guild %s",
+                guild_id,
+            )
 
 
 def save_music_channel_config() -> None:
-    raw_config = {
-        str(guild_id): channel_id
-        for guild_id, channel_id in sorted(configured_music_channels.items())
-    }
+    raw_config: dict[str, dict[str, int | bool]] = {}
+    for guild_id, channel_id in sorted(configured_music_channels.items()):
+        entry = {"channel_id": channel_id}
+        control_message_id = configured_control_messages.get(guild_id)
+        if control_message_id is not None:
+            entry["control_message_id"] = control_message_id
+        if configured_autoplay_enabled.get(guild_id, False):
+            entry["autoplay_enabled"] = True
+        raw_config[str(guild_id)] = entry
+
     MUSIC_CHANNELS_FILE.write_text(
         json.dumps(raw_config, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -355,7 +569,47 @@ def get_music_channel_id(guild_id: int) -> int | None:
 
 
 def set_music_channel(guild_id: int, channel_id: int) -> None:
+    if configured_music_channels.get(guild_id) != channel_id:
+        configured_control_messages.pop(guild_id, None)
     configured_music_channels[guild_id] = channel_id
+    save_music_channel_config()
+
+
+def get_control_message_id(guild_id: int) -> int | None:
+    return configured_control_messages.get(guild_id)
+
+
+def set_control_message_id(guild_id: int, message_id: int) -> None:
+    channel_id = get_music_channel_id(guild_id)
+    if channel_id is None:
+        return
+
+    configured_music_channels.setdefault(guild_id, channel_id)
+    if configured_control_messages.get(guild_id) == message_id:
+        return
+
+    configured_control_messages[guild_id] = message_id
+    save_music_channel_config()
+
+
+def clear_control_message_id(guild_id: int) -> None:
+    if configured_control_messages.pop(guild_id, None) is not None:
+        save_music_channel_config()
+
+
+def get_autoplay_enabled(guild_id: int) -> bool:
+    return configured_autoplay_enabled.get(guild_id, False)
+
+
+def set_autoplay_enabled(guild_id: int, enabled: bool) -> None:
+    channel_id = get_music_channel_id(guild_id)
+    if channel_id is not None:
+        configured_music_channels.setdefault(guild_id, channel_id)
+
+    if enabled:
+        configured_autoplay_enabled[guild_id] = True
+    else:
+        configured_autoplay_enabled.pop(guild_id, None)
     save_music_channel_config()
 
 
@@ -388,19 +642,21 @@ def make_track_embed(track: Track, title: str) -> discord.Embed:
 def make_player_embed(track: Track, state: GuildMusicState) -> discord.Embed:
     queue_count = len(state.queue)
     repeat_text = "켜짐" if state.repeat_one else "꺼짐"
+    autoplay_text = "켜짐" if state.autoplay_enabled else "꺼짐"
     embed = discord.Embed(
         title="💿 지금 재생 중",
         description=f"🎧 {requester_label(track)}님이 신청한 곡이에요!",
         color=discord.Color.gold(),
     )
     embed.add_field(
-        name="YouTube Music",
+        name="YouTube",
         value=make_track_link(track, DISCORD_EMBED_FIELD_LIMIT),
         inline=False,
     )
     embed.add_field(name="길이", value=format_duration(track.duration), inline=True)
     embed.add_field(name="대기열", value=f"{queue_count}곡", inline=True)
     embed.add_field(name="반복", value=repeat_text, inline=True)
+    embed.add_field(name="자동재생", value=autoplay_text, inline=True)
     if state.queue:
         preview = []
         for index, queued in enumerate(list(state.queue)[:5], start=1):
@@ -414,10 +670,25 @@ def make_player_embed(track: Track, state: GuildMusicState) -> discord.Embed:
     return embed
 
 
+def make_idle_player_embed() -> discord.Embed:
+    return discord.Embed(
+        title="🎵 재생 대기 중",
+        description=(
+            "음성 채널에 들어간 뒤 아래 형식으로 메시지를 보내 주세요.\n\n"
+            "`곡명` 또는 `YouTube URL`\n"
+            "`album: 앨범명`\n"
+            "`playlist: 플레이리스트명`\n"
+            "`auto: 곡명` 또는 `auto: 12 곡명`\n\n"
+            "자동재생은 아래 버튼으로 켜고 끌 수 있어요."
+        ),
+        color=discord.Color.blurple(),
+    )
+
+
 def make_bulk_embed(tracks: list[Track], title: str) -> discord.Embed:
     embed = discord.Embed(title=title)
     preview = [
-        f"{index}. [{track.title}]({track.webpage_url})"
+        f"{index}. {make_track_link(track, DISCORD_EMBED_FIELD_LIMIT - 8)}"
         for index, track in enumerate(tracks[:10], start=1)
     ]
     if len(tracks) > 10:
@@ -442,6 +713,8 @@ def truncate_text(value: str, limit: int) -> str:
 
 def make_track_link(track: Track, limit: int = DISCORD_EMBED_FIELD_LIMIT) -> str:
     title = truncate_text(track.title, 120)
+    if not track.webpage_url:
+        return title
     value = f"[{title}]({track.webpage_url})"
     if len(value) <= limit:
         return value
@@ -527,8 +800,9 @@ class QueueRemoveSelect(discord.ui.Select):
             )
             return
 
+        schedule_autoplay_refill(self.guild_id)
         if state.current:
-            await send_player_panel(self.guild_id, state, state.current)
+            await update_control_panel(self.guild_id, state)
 
         await interaction.response.edit_message(
             content=f"대기열에서 `{removed.title}`을 삭제했어요.",
@@ -549,20 +823,56 @@ class QueueManageView(discord.ui.View):
 
 
 class MusicControlView(discord.ui.View):
-    def __init__(self, guild_id: int):
+    def __init__(self, guild_id: int, *, disabled: bool = False):
         super().__init__(timeout=None)
         self.guild_id = guild_id
+        state = get_state(guild_id)
+        for child in self.children:
+            if not isinstance(child, discord.ui.Button):
+                continue
+            if child.custom_id == AUTOPLAY_BUTTON_CUSTOM_ID:
+                child.label = f"자동재생: {'켜짐' if state.autoplay_enabled else '꺼짐'}"
+                child.style = (
+                    discord.ButtonStyle.success
+                    if state.autoplay_enabled
+                    else discord.ButtonStyle.secondary
+                )
+            elif disabled:
+                child.disabled = True
 
     def get_state(self) -> GuildMusicState:
         return get_state(self.guild_id)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        custom_id = (interaction.data or {}).get("custom_id")
+        if custom_id == AUTOPLAY_BUTTON_CUSTOM_ID:
+            state = self.get_state()
+            if state.voice and state.voice.is_connected():
+                return await ensure_same_voice_channel(interaction, state)
+
+            member_channel = getattr(
+                getattr(interaction.user, "voice", None),
+                "channel",
+                None,
+            )
+            if member_channel is not None:
+                return True
+
+            await interaction.response.send_message(
+                "먼저 음성 채널에 들어가 주세요.",
+                ephemeral=True,
+            )
+            return False
+
         return await ensure_same_voice_channel(interaction, self.get_state())
 
     async def edit_panel(self, interaction: discord.Interaction) -> None:
         state = self.get_state()
         if state.current is None:
-            await interaction.response.edit_message(embed=discord.Embed(title="⏹️ 재생이 멈췄어요"), view=None)
+            await interaction.response.edit_message(
+                embed=make_idle_player_embed(),
+                view=MusicControlView(self.guild_id, disabled=True),
+            )
             return
 
         await interaction.response.edit_message(
@@ -603,7 +913,7 @@ class MusicControlView(discord.ui.View):
         state = self.get_state()
         stop_playback(state)
         await interaction.response.defer()
-        await delete_player_panel(state)
+        await show_idle_panel(self.guild_id, state)
 
     @discord.ui.button(label="반복", emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
     async def repeat(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -628,61 +938,65 @@ class MusicControlView(discord.ui.View):
             ephemeral=True,
         )
 
+    @discord.ui.button(
+        label="자동재생: 꺼짐",
+        emoji="♾️",
+        style=discord.ButtonStyle.secondary,
+        custom_id=AUTOPLAY_BUTTON_CUSTOM_ID,
+        row=2,
+    )
+    async def autoplay(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        state = self.get_state()
+        state.autoplay_enabled = not state.autoplay_enabled
+        set_autoplay_enabled(self.guild_id, state.autoplay_enabled)
+        if state.autoplay_enabled:
+            schedule_autoplay_refill(self.guild_id)
+        else:
+            cancel_autoplay_refill(state)
+        await self.edit_panel(interaction)
 
-def normalize_youtube_music_section(section: str) -> str:
-    if section in YOUTUBE_MUSIC_SECTIONS:
-        return section
 
-    logger.warning("Invalid YOUTUBE_MUSIC_SECTION=%s. Falling back to songs.", section)
-    return "songs"
+def build_youtube_search_query(query: str) -> str:
+    return f"ytsearch1:{query} music"
 
 
-def build_youtube_music_search_url(query: str, section: str | None = None) -> str:
-    section = normalize_youtube_music_section(section or YOUTUBE_MUSIC_SECTION)
-    encoded_query = urllib.parse.urlencode({"q": query})
-    encoded_section = urllib.parse.quote_plus(section)
-    return f"https://music.youtube.com/search?{encoded_query}#{encoded_section}"
+def build_youtube_playlist_search_url(query: str, search_kind: str) -> str:
+    search_text = f"{query} full album" if search_kind == "album" else query
+    encoded_query = urllib.parse.quote_plus(search_text)
+    return (
+        "https://www.youtube.com/results?"
+        f"search_query={encoded_query}&sp={YOUTUBE_PLAYLIST_SEARCH_FILTER}"
+    )
 
 
-def resolve_query(query: str, section: str | None = None) -> str:
+def resolve_query(query: str, search_kind: str | None = None) -> str:
     query = query.strip()
     parsed = urllib.parse.urlparse(query)
 
     if parsed.scheme in {"http", "https"}:
         host = parsed.netloc.lower().removeprefix("www.")
-        if YOUTUBE_MUSIC_ONLY and host != "music.youtube.com":
-            raise ValueError("YouTube Music 링크나 곡명만 사용할 수 있어요.")
+        if host not in YOUTUBE_HOSTS:
+            raise ValueError("YouTube 링크나 검색어만 사용할 수 있어요.")
         return query
 
-    if YOUTUBE_MUSIC_ONLY:
-        return build_youtube_music_search_url(query, section)
+    if search_kind in {"album", "playlist"}:
+        return build_youtube_playlist_search_url(query, search_kind)
 
-    return query
-
-
-def is_url(value: str) -> bool:
-    return urllib.parse.urlparse(value.strip()).scheme in {"http", "https"}
+    return build_youtube_search_query(query)
 
 
-def build_youtube_search_fallback(query: str) -> str:
-    return f"ytsearch1:{query} music"
-
-
-async def extract_info_with_fallback(
+async def extract_first_info(
     query: str,
     resolved_query: str,
-    *,
-    allow_fallback: bool,
 ) -> dict:
     try:
-        info = await extract_ytdl_info(YTDL_OPTIONS, resolved_query, "YouTube Music search")
+        info = await extract_ytdl_info(YTDL_OPTIONS, resolved_query, "YouTube search")
     except asyncio.TimeoutError:
-        if not (allow_fallback and YOUTUBE_SEARCH_FALLBACK and not is_url(query)):
-            raise ValueError(f"Timed out while searching for '{query}'.")
-
-        fallback_query = build_youtube_search_fallback(query)
-        logger.info("YouTube Music search timed out. Falling back to %s", fallback_query)
-        return await extract_ytdl_info(YTDL_OPTIONS, fallback_query, "YouTube fallback search")
+        raise ValueError(f"Timed out while searching for '{query}'.") from None
 
     if "entries" not in info:
         return info
@@ -690,16 +1004,6 @@ async def extract_info_with_fallback(
     entries = [entry for entry in info["entries"] if entry]
     if entries:
         return entries[0]
-
-    if allow_fallback and YOUTUBE_SEARCH_FALLBACK and not is_url(query):
-        fallback_query = build_youtube_search_fallback(query)
-        logger.info("YouTube Music search returned no results. Falling back to %s", fallback_query)
-        fallback_info = await extract_ytdl_info(
-            YTDL_OPTIONS, fallback_query, "YouTube fallback search"
-        )
-        fallback_entries = [entry for entry in fallback_info.get("entries", []) if entry]
-        if fallback_entries:
-            return fallback_entries[0]
 
     raise ValueError(f"No playable search results were found for '{query}'.")
 
@@ -755,16 +1059,84 @@ def get_entry_url(info: dict, fallback_url: str) -> str:
     return raw_url
 
 
+BRACKETED_TITLE_PART_RE = re.compile(
+    r"\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|【[^】]*】|（[^）]*）|［[^］]*］|「[^」]*」|『[^』]*』"
+)
+VERSION_MARKER_RE = re.compile(
+    r"\b(?:live|remix|cover|acoustic|instrumental|demo|version|edit|sped\s*up|slowed(?:\s*down)?|nightcore)\b"
+    r"|라이브|리믹스|커버|어쿠스틱|인스트루멘털|데모"
+    r"|ライブ|リミックス|カバー|アコースティック|インスト",
+    flags=re.IGNORECASE,
+)
+NON_SONG_LABEL_RE = re.compile(
+    r"\b(?:official|music\s*video|m\s*/?\s*v|audio|lyric(?:s|\s*video)?|visuali[sz]er|4k|hd|ost|original\s*soundtrack|theme\s*song)\b"
+    r"|공식|뮤직비디오|가사|음원|오디오|주제가"
+    r"|公式|ミュージックビデオ|オーディオ|歌詞|音源|主題歌",
+    flags=re.IGNORECASE,
+)
+NON_SONG_SUFFIX_RE = re.compile(
+    r"(?:\s*[-|:]\s*|\s+)"
+    r"(?:official\s*(?:music\s*)?(?:video|mv|audio)|music\s*video|m\s*/?\s*v|official\s*audio|lyric(?:s|\s*video)?|visuali[sz]er|4k|hd|ost|original\s*soundtrack|theme\s*song|공식\s*(?:뮤직비디오|음원|오디오)?|뮤직비디오|가사|음원|오디오|公式\s*(?:mv|ミュージックビデオ|オーディオ|音源)?|ミュージックビデオ|オーディオ|歌詞|音源|主題歌)\s*$",
+    flags=re.IGNORECASE,
+)
+ARTIST_CHANNEL_SUFFIX_RE = re.compile(
+    r"(?:\s*-\s*topic|\s*official(?:\s+channel)?|vevo|\s*공식(?:\s*채널)?|\s*公式(?:チャンネル)?)$",
+    flags=re.IGNORECASE,
+)
+
+
+def clean_track_title(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value).casefold()
+
+    def replace_bracketed_part(match: re.Match[str]) -> str:
+        part = match.group(0)
+        if VERSION_MARKER_RE.search(part):
+            return part
+        if NON_SONG_LABEL_RE.search(part):
+            return " "
+        return part
+
+    value = BRACKETED_TITLE_PART_RE.sub(replace_bracketed_part, value)
+    previous = None
+    while previous != value:
+        previous = value
+        value = NON_SONG_SUFFIX_RE.sub("", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_identity_component(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value).casefold()
+    return re.sub(r"[\W_]+", " ", value, flags=re.UNICODE).strip()
+
+
+def normalize_artist_name(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value).casefold().strip()
+    value = ARTIST_CHANNEL_SUFFIX_RE.sub("", value)
+    return normalize_identity_component(value)
+
+
 def normalize_track_key(track: Track) -> str:
+    cleaned_title = clean_track_title(track.title)
+    title_parts = re.split(r"\s+(?:-|–|—|\|)\s+", cleaned_title, maxsplit=1)
+    parsed_artist = title_parts[0] if len(title_parts) == 2 else None
+    parsed_song_name = title_parts[1] if len(title_parts) == 2 else cleaned_title
+
+    artist = track.artist or parsed_artist or track.uploader
+    song_name = track.song_name or parsed_song_name
+    artist_key = normalize_artist_name(artist) if artist else ""
+    song_key = normalize_identity_component(clean_track_title(song_name))
+
+    if artist_key and song_key.startswith(f"{artist_key} "):
+        song_key = song_key[len(artist_key) + 1 :]
+    if artist_key and song_key:
+        return f"song:{artist_key}|{song_key}"
+    if song_key:
+        return f"song:{song_key}"
+
     parsed = urllib.parse.urlparse(track.webpage_url)
     params = urllib.parse.parse_qs(parsed.query)
     video_id = params.get("v", [None])[0]
-    if video_id:
-        return video_id
-
-    title = re.sub(r"\s+", " ", track.title).strip().lower()
-    title = re.sub(r"\s*[\(\[].*?(official|mv|music video|lyrics?|audio|live).*?[\)\]]", "", title)
-    return title
+    return f"video:{video_id}" if video_id else track.webpage_url.casefold()
 
 
 def make_track_from_info(
@@ -784,45 +1156,68 @@ def make_track_from_info(
         duration=info.get("duration"),
         stream_url=stream_url,
         thumbnail_url=get_thumbnail_url(info),
-        stream_resolved_at=time.monotonic() if stream_url else None,
+        artist=info.get("artist") or info.get("creator"),
+        song_name=info.get("track") or info.get("alt_title"),
+        uploader=info.get("uploader") or info.get("channel"),
+        stream_resolved_at=(
+            info.get("_music_bot_extracted_at", time.monotonic())
+            if stream_url
+            else None
+        ),
     )
 
 
-def is_search_url(url: str) -> bool:
+def is_playlist_search_url(url: str) -> bool:
     parsed = urllib.parse.urlparse(url)
-    return parsed.netloc.lower().removeprefix("www.") == "music.youtube.com" and parsed.path == "/search"
+    host = parsed.netloc.lower().removeprefix("www.")
+    return host == "youtube.com" and parsed.path == "/results"
 
 
-def is_bulk_music_url(query: str) -> bool:
+def get_playlist_result_url(info: dict) -> str:
+    raw_url = info.get("webpage_url") or info.get("url") or ""
+    if raw_url:
+        parsed = urllib.parse.urlparse(raw_url)
+        if parsed.scheme in {"http", "https"}:
+            params = urllib.parse.parse_qs(parsed.query)
+            if parsed.path == "/playlist" or "list" in params:
+                return raw_url
+
+    playlist_id = info.get("playlist_id") or info.get("id")
+    if playlist_id and not re.fullmatch(r"[\w-]{11}", str(playlist_id)):
+        return f"https://www.youtube.com/playlist?list={playlist_id}"
+
+    raise ValueError("No YouTube playlist was found in the search results.")
+
+
+def is_bulk_youtube_url(query: str) -> bool:
     parsed = urllib.parse.urlparse(query.strip())
     if parsed.scheme not in {"http", "https"}:
         return False
 
     host = parsed.netloc.lower().removeprefix("www.")
-    if host != "music.youtube.com":
+    if host not in YOUTUBE_HOSTS:
         return False
 
-    params = urllib.parse.parse_qs(parsed.query)
-    return parsed.path == "/playlist" or ("list" in params and parsed.path != "/watch")
+    return parsed.path == "/playlist"
 
 
 def parse_music_request(query: str) -> tuple[str, str | None, bool]:
     query = query.strip()
     lowered = query.lower()
     prefixes: dict[str, tuple[str, bool]] = {
-        "album:": ("albums", True),
-        "album ": ("albums", True),
-        "playlist:": ("community playlists", True),
-        "playlist ": ("community playlists", True),
-        "list:": ("community playlists", True),
-        "list ": ("community playlists", True),
+        "album:": ("album", True),
+        "album ": ("album", True),
+        "playlist:": ("playlist", True),
+        "playlist ": ("playlist", True),
+        "list:": ("playlist", True),
+        "list ": ("playlist", True),
     }
 
-    for prefix, (section, bulk) in prefixes.items():
+    for prefix, (search_kind, bulk) in prefixes.items():
         if lowered.startswith(prefix):
-            return query[len(prefix):].strip(), section, bulk
+            return query[len(prefix):].strip(), search_kind, bulk
 
-    return query, None, is_bulk_music_url(query)
+    return query, None, is_bulk_youtube_url(query)
 
 
 def clamp_auto_count(count: int) -> int:
@@ -849,6 +1244,14 @@ def parse_auto_request(query: str) -> tuple[str, int] | None:
 
 
 async def resolve_track_stream(track: Track) -> None:
+    if track.is_local:
+        source_path = Path(track.source_url)
+        if not source_path.is_file():
+            raise ValueError(f"로컬 테스트 음원 파일을 찾지 못했어요: {source_path}")
+        track.stream_url = str(source_path)
+        track.stream_resolved_at = time.monotonic()
+        return
+
     stream_age = (
         time.monotonic() - track.stream_resolved_at
         if track.stream_resolved_at is not None
@@ -859,7 +1262,12 @@ async def resolve_track_stream(track: Track) -> None:
 
     track.stream_url = None
     track.stream_resolved_at = None
-    info = await extract_ytdl_info(YTDL_OPTIONS, track.source_url, "audio stream resolve")
+    info = await extract_ytdl_info(
+        YTDL_OPTIONS,
+        track.source_url,
+        "audio stream resolve",
+        use_cache=False,
+    )
 
     if "entries" in info:
         entries = [entry for entry in info["entries"] if entry]
@@ -877,20 +1285,65 @@ async def resolve_track_stream(track: Track) -> None:
     track.stream_url = stream_url
     track.stream_resolved_at = time.monotonic()
     track.thumbnail_url = get_thumbnail_url(info) or track.thumbnail_url
+    track.artist = info.get("artist") or info.get("creator") or track.artist
+    track.song_name = info.get("track") or info.get("alt_title") or track.song_name
+    track.uploader = info.get("uploader") or info.get("channel") or track.uploader
+
+
+def get_music_test_audio_path() -> Path | None:
+    if not MUSIC_TEST_AUDIO_FILE:
+        return None
+    path = resolve_project_path(MUSIC_TEST_AUDIO_FILE)
+    if not path.is_file():
+        raise ValueError(f"MUSIC_TEST_AUDIO_FILE을 찾지 못했어요: {path}")
+    return path
+
+
+def make_music_test_track(
+    query: str,
+    requester: str,
+    requester_id: int | None = None,
+) -> Track:
+    source_path = get_music_test_audio_path()
+    if source_path is None:
+        raise RuntimeError("MUSIC_TEST_AUDIO_FILE is not configured")
+
+    sequence = next(music_test_track_counter)
+    return Track(
+        title=f"[TEST {sequence}] {query}",
+        webpage_url="",
+        requester=requester,
+        source_url=str(source_path),
+        requester_id=requester_id,
+        stream_url=str(source_path),
+        stream_resolved_at=time.monotonic(),
+        is_local=True,
+    )
+
+
+def make_music_test_tracks(
+    query: str,
+    requester: str,
+    count: int,
+    requester_id: int | None = None,
+) -> list[Track]:
+    return [
+        make_music_test_track(query, requester, requester_id)
+        for _ in range(count)
+    ]
 
 
 async def extract_track(
     query: str,
     requester: str,
-    section: str | None = None,
+    search_kind: str | None = None,
     requester_id: int | None = None,
 ) -> Track:
-    resolved_query = resolve_query(query, section)
-    info = await extract_info_with_fallback(
-        query,
-        resolved_query,
-        allow_fallback=section in {None, "songs", "videos"},
-    )
+    if MUSIC_TEST_AUDIO_FILE:
+        return make_music_test_track(query, requester, requester_id)
+
+    resolved_query = resolve_query(query, search_kind)
+    info = await extract_first_info(query, resolved_query)
 
     track = make_track_from_info(info, requester, resolved_query, requester_id)
     await resolve_track_stream(track)
@@ -900,27 +1353,35 @@ async def extract_track(
 async def extract_tracks(
     query: str,
     requester: str,
-    section: str | None = None,
+    search_kind: str | None = None,
     requester_id: int | None = None,
 ) -> list[Track]:
-    resolved_query = resolve_query(query, section)
+    if MUSIC_TEST_AUDIO_FILE:
+        return make_music_test_tracks(
+            query,
+            requester,
+            min(MUSIC_TEST_BULK_TRACKS, MAX_BULK_TRACKS),
+            requester_id,
+        )
+
+    resolved_query = resolve_query(query, search_kind)
     info = await extract_ytdl_info(
         YTDL_PLAYLIST_OPTIONS, resolved_query, "playlist or album search"
     )
 
-    if is_search_url(resolved_query):
+    if is_playlist_search_url(resolved_query):
         search_entries = [entry for entry in info.get("entries", []) if entry]
         if not search_entries:
             raise ValueError("No matching album or playlist was found.")
 
-        first_result_url = get_entry_url(search_entries[0], resolved_query)
+        first_result_url = get_playlist_result_url(search_entries[0])
         info = await extract_ytdl_info(
             YTDL_PLAYLIST_OPTIONS, first_result_url, "playlist or album resolve"
         )
 
     entries = [entry for entry in info.get("entries", []) if entry]
     if not entries:
-        return [await extract_track(query, requester, section, requester_id)]
+        return [await extract_track(query, requester, search_kind, requester_id)]
 
     return [
         make_track_from_info(entry, requester, resolved_query, requester_id)
@@ -935,9 +1396,11 @@ async def extract_auto_tracks(
     requester_id: int | None = None,
 ) -> list[Track]:
     auto_count = clamp_auto_count(count)
+    if MUSIC_TEST_AUDIO_FILE:
+        return make_music_test_tracks(query, requester, auto_count, requester_id)
 
-    seed_query = resolve_query(query, "songs")
-    seed_info = await extract_info_with_fallback(query, seed_query, allow_fallback=True)
+    seed_query = resolve_query(query)
+    seed_info = await extract_first_info(query, seed_query)
     seed_track = make_track_from_info(seed_info, requester, seed_query, requester_id)
     seed_id = get_video_id(seed_info, seed_track.webpage_url)
 
@@ -1001,6 +1464,211 @@ async def extract_auto_tracks(
         raise ValueError(f"관련 곡을 찾지 못했어요: {query}")
 
     return tracks
+
+
+def remember_autoplay_track(state: GuildMusicState, track: Track) -> None:
+    key = normalize_track_key(track)
+    try:
+        state.recent_track_keys.remove(key)
+    except ValueError:
+        pass
+    state.recent_track_keys.append(key)
+
+
+def get_autoplay_seed(state: GuildMusicState) -> Track | None:
+    if state.queue:
+        return state.queue[-1]
+    return state.current
+
+
+def get_autoplay_excluded_keys(state: GuildMusicState) -> set[str]:
+    keys = set(state.recent_track_keys)
+    if state.current is not None:
+        keys.add(normalize_track_key(state.current))
+    keys.update(normalize_track_key(track) for track in state.queue)
+    return keys
+
+
+def select_autoplay_candidate(
+    state: GuildMusicState,
+    candidates: list[Track],
+    extra_excluded_keys: set[str] | None = None,
+) -> Track | None:
+    excluded_keys = get_autoplay_excluded_keys(state)
+    if extra_excluded_keys:
+        excluded_keys.update(extra_excluded_keys)
+    for candidate in candidates:
+        if normalize_track_key(candidate) not in excluded_keys:
+            return candidate
+    return None
+
+
+def cancel_autoplay_refill(state: GuildMusicState) -> None:
+    task = state.autoplay_task
+    if task and not task.done():
+        task.cancel()
+    state.autoplay_task = None
+
+
+def autoplay_can_refill(state: GuildMusicState, generation: int) -> bool:
+    voice = state.voice
+    return (
+        state.autoplay_enabled
+        and generation == state.playback_generation
+        and voice is not None
+        and voice.is_connected()
+        and len(state.queue) <= 1
+    )
+
+
+def get_autoplay_retry_delay(failure_count: int) -> int:
+    index = min(max(0, failure_count), len(AUTOPLAY_RETRY_DELAYS_SECONDS) - 1)
+    return AUTOPLAY_RETRY_DELAYS_SECONDS[index]
+
+
+def schedule_autoplay_refill(
+    guild_id: int,
+) -> tuple[asyncio.Task[None] | None, bool]:
+    state = get_state(guild_id)
+    if not autoplay_can_refill(state, state.playback_generation):
+        return None, False
+
+    seed = get_autoplay_seed(state)
+    if seed is None:
+        return None, False
+
+    if state.autoplay_task and not state.autoplay_task.done():
+        return state.autoplay_task, False
+
+    task = asyncio.create_task(
+        refill_autoplay_queue(
+            guild_id,
+            state.playback_generation,
+            seed,
+        )
+    )
+    state.autoplay_task = task
+    return task, True
+
+
+async def refill_autoplay_queue(
+    guild_id: int,
+    generation: int,
+    fallback_seed: Track,
+) -> None:
+    state = get_state(guild_id)
+    current_task = asyncio.current_task()
+    starting_track_id = state.current.track_id if state.current else None
+    initial_seed_key = normalize_track_key(fallback_seed)
+    added_track = False
+    failure_count = 0
+    candidate_count = clamp_auto_count(max(DEFAULT_AUTO_TRACKS, 5))
+
+    try:
+        while autoplay_can_refill(state, generation):
+            seed = get_autoplay_seed(state) or fallback_seed
+            fallback_seed = seed
+            try:
+                candidates = await extract_auto_tracks(
+                    seed.webpage_url,
+                    "자동재생",
+                    candidate_count,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                retry_delay = get_autoplay_retry_delay(failure_count)
+                failure_count += 1
+                if isinstance(exc, YouTubeCircuitOpenError):
+                    retry_delay = max(retry_delay, exc.retry_after_seconds)
+                logger.warning(
+                    "Autoplay search failed in guild %s; retrying in %s seconds: %s",
+                    guild_id,
+                    retry_delay,
+                    exc,
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+
+            if not autoplay_can_refill(state, generation):
+                return
+
+            candidate = select_autoplay_candidate(
+                state,
+                candidates,
+                {
+                    initial_seed_key,
+                    normalize_track_key(seed),
+                },
+            )
+            if candidate is None:
+                retry_delay = get_autoplay_retry_delay(failure_count)
+                failure_count += 1
+                logger.warning(
+                    "Autoplay found no new candidate in guild %s; retrying in %s seconds",
+                    guild_id,
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+
+            should_start = False
+            async with state.lock:
+                if not autoplay_can_refill(state, generation):
+                    return
+                if normalize_track_key(candidate) in get_autoplay_excluded_keys(state):
+                    continue
+
+                state.queue.append(candidate)
+                added_track = True
+                voice = state.voice
+                should_start = (
+                    state.current is None
+                    and voice is not None
+                    and voice.is_connected()
+                    and not voice.is_playing()
+                    and not voice.is_paused()
+                )
+
+            logger.info(
+                "Autoplay queued %s in guild %s",
+                candidate.title,
+                guild_id,
+            )
+            if state.current is not None:
+                await update_control_panel(guild_id, state)
+
+            if should_start:
+                advance_task = state.advance_task
+                if advance_task and advance_task is not current_task:
+                    try:
+                        await asyncio.shield(advance_task)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "Playback advance failed before autoplay restart in guild %s",
+                            guild_id,
+                        )
+
+                voice = state.voice
+                if (
+                    generation == state.playback_generation
+                    and state.current is None
+                    and state.queue
+                    and voice is not None
+                    and voice.is_connected()
+                    and not voice.is_playing()
+                    and not voice.is_paused()
+                ):
+                    schedule_play_next(guild_id)
+            return
+    finally:
+        if state.autoplay_task is current_task:
+            state.autoplay_task = None
+            current_track_id = state.current.track_id if state.current else None
+            if added_track and current_track_id != starting_track_id:
+                schedule_autoplay_refill(guild_id)
 
 
 async def ensure_voice(interaction: discord.Interaction, state: GuildMusicState) -> bool:
@@ -1083,6 +1751,7 @@ def stop_playback(state: GuildMusicState) -> None:
     state.stop_requested = True
     state.queue.clear()
     state.current = None
+    cancel_autoplay_refill(state)
 
     if state.advance_task and not state.advance_task.done():
         state.advance_task.cancel()
@@ -1090,6 +1759,64 @@ def stop_playback(state: GuildMusicState) -> None:
 
     if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
         state.voice.stop()
+
+
+def channel_has_human_listener(channel: discord.abc.Connectable) -> bool:
+    return any(not member.bot for member in getattr(channel, "members", []))
+
+
+def cancel_empty_channel_disconnect(state: GuildMusicState) -> None:
+    task = state.empty_channel_task
+    if task and not task.done():
+        task.cancel()
+    state.empty_channel_task = None
+
+
+async def disconnect_from_empty_channel(guild_id: int, channel_id: int) -> None:
+    state = get_state(guild_id)
+    current_task = asyncio.current_task()
+    try:
+        await asyncio.sleep(EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS)
+        voice = state.voice
+        if (
+            voice is None
+            or not voice.is_connected()
+            or voice.channel.id != channel_id
+            or channel_has_human_listener(voice.channel)
+        ):
+            return
+
+        stop_playback(state)
+        await show_idle_panel(guild_id, state)
+        await voice.disconnect()
+        if state.voice is voice:
+            state.voice = None
+        logger.info(
+            "Left empty voice channel %s in guild %s",
+            channel_id,
+            guild_id,
+        )
+    finally:
+        if state.empty_channel_task is current_task:
+            state.empty_channel_task = None
+
+
+def update_empty_channel_disconnect(state: GuildMusicState, guild_id: int) -> None:
+    voice = state.voice
+    if voice is None or not voice.is_connected():
+        cancel_empty_channel_disconnect(state)
+        return
+
+    if channel_has_human_listener(voice.channel):
+        cancel_empty_channel_disconnect(state)
+        return
+
+    if state.empty_channel_task and not state.empty_channel_task.done():
+        return
+
+    state.empty_channel_task = asyncio.create_task(
+        disconnect_from_empty_channel(guild_id, voice.channel.id)
+    )
 
 
 def schedule_play_next(
@@ -1113,9 +1840,8 @@ async def enqueue_tracks(
     query: str,
     *,
     initial_response: discord.Message | None = None,
-    interaction: discord.Interaction | None = None,
     bulk: bool | None = None,
-    section: str | None = None,
+    search_kind: str | None = None,
     auto_count: int | None = None,
 ) -> bool:
     state = get_state(guild_id)
@@ -1136,30 +1862,6 @@ async def enqueue_tracks(
                 )
             return initial_response
 
-        if interaction:
-            send_kwargs = {
-                "content": content,
-                "embed": embed,
-                "ephemeral": private,
-                "silent": is_silent_music_channel(interaction.channel),
-                "wait": True,
-            }
-            if view is not None:
-                send_kwargs["view"] = view
-
-            try:
-                return await interaction.followup.send(**send_kwargs)
-            except discord.Forbidden:
-                fallback_kwargs = {
-                    "content": content,
-                    "embed": embed,
-                    "ephemeral": True,
-                    "wait": True,
-                }
-                if view is not None:
-                    fallback_kwargs["view"] = view
-                return await interaction.followup.send(**fallback_kwargs)
-
         message = await text_channel.send(
             content=content,
             embed=embed,
@@ -1177,17 +1879,17 @@ async def enqueue_tracks(
             auto_count = auto_count or parsed_auto_count
             bulk = True
         else:
-            query, parsed_section, parsed_bulk = parse_music_request(query)
-            section = section or parsed_section
+            query, parsed_search_kind, parsed_bulk = parse_music_request(query)
+            search_kind = search_kind or parsed_search_kind
             bulk = parsed_bulk if bulk is None else bulk
 
         tracks = (
             await extract_auto_tracks(query, requester.display_name, auto_count, requester.id)
             if auto_count is not None
             else (
-                await extract_tracks(query, requester.display_name, section, requester.id)
+                await extract_tracks(query, requester.display_name, search_kind, requester.id)
                 if bulk
-                else [await extract_track(query, requester.display_name, section, requester.id)]
+                else [await extract_track(query, requester.display_name, search_kind, requester.id)]
             )
         )
     except Exception as exc:
@@ -1200,6 +1902,7 @@ async def enqueue_tracks(
         return False
 
     state.queue.extend(tracks)
+    schedule_autoplay_refill(guild_id)
     should_start = (
         bool(state.voice)
         and state.current is None
@@ -1214,12 +1917,8 @@ async def enqueue_tracks(
     if started_playback and playback_task:
         await playback_task
         if state.current:
-            message = await send_feedback(
-                embed=make_player_embed(state.current, state),
-                view=MusicControlView(guild_id),
-            )
-            if message:
-                state.control_message = message
+            await update_control_panel(guild_id, state)
+            await send_feedback(content="재생을 시작했어요.", private=True)
         else:
             await send_feedback(content="재생을 시작하지 못했어요. 로그를 확인해 주세요.")
         return state.current is not None
@@ -1233,44 +1932,182 @@ async def enqueue_tracks(
 
     await send_feedback(embed=embed, private=True)
     if state.current:
-        await send_player_panel(guild_id, state, state.current)
+        await update_control_panel(guild_id, state)
     return True
 
 
-async def send_player_panel(guild_id: int, state: GuildMusicState, track: Track) -> None:
-    if not state.announcement_channel:
-        return
+def resolve_control_panel_channel(
+    guild_id: int,
+    state: GuildMusicState,
+) -> discord.abc.Messageable | None:
+    channel_id = get_music_channel_id(guild_id)
+    if channel_id is not None:
+        channel = bot.get_channel(channel_id)
+        if channel is not None and hasattr(channel, "send"):
+            return channel
+    return state.announcement_channel
 
-    embed = make_player_embed(track, state)
-    view = MusicControlView(guild_id)
 
-    if state.control_message:
-        try:
-            await state.control_message.edit(embed=embed, view=view)
-            return
-        except (discord.Forbidden, discord.NotFound):
+async def update_control_panel(
+    guild_id: int,
+    state: GuildMusicState,
+    *,
+    channel: discord.abc.Messageable | None = None,
+) -> discord.Message | None:
+    async with state.control_panel_lock:
+        return await _update_control_panel(guild_id, state, channel=channel)
+
+
+async def _update_control_panel(
+    guild_id: int,
+    state: GuildMusicState,
+    *,
+    channel: discord.abc.Messageable | None = None,
+) -> discord.Message | None:
+    control_channel = channel or resolve_control_panel_channel(guild_id, state)
+    if control_channel is None:
+        return None
+
+    state.announcement_channel = control_channel
+    control_channel_id = getattr(control_channel, "id", None)
+    if state.control_message is not None:
+        message_channel_id = getattr(
+            getattr(state.control_message, "channel", None),
+            "id",
+            None,
+        )
+        if (
+            control_channel_id is not None
+            and message_channel_id is not None
+            and message_channel_id != control_channel_id
+        ):
             state.control_message = None
 
+    if state.control_message is None:
+        message_id = get_control_message_id(guild_id)
+        fetch_message = getattr(control_channel, "fetch_message", None)
+        if message_id is not None and fetch_message is not None:
+            try:
+                state.control_message = await fetch_message(message_id)
+            except discord.NotFound:
+                clear_control_message_id(guild_id)
+            except discord.Forbidden:
+                logger.warning(
+                    "Missing permission to fetch music control panel in guild %s",
+                    guild_id,
+                )
+                return None
+            except discord.HTTPException:
+                logger.exception(
+                    "Failed to fetch music control panel in guild %s",
+                    guild_id,
+                )
+                return None
+
+    if state.current is None:
+        embed = make_idle_player_embed()
+        view = MusicControlView(guild_id, disabled=True)
+    else:
+        embed = make_player_embed(state.current, state)
+        view = MusicControlView(guild_id)
+
+    if state.control_message is not None:
+        try:
+            await state.control_message.edit(content=None, embed=embed, view=view)
+            return state.control_message
+        except discord.NotFound:
+            state.control_message = None
+            clear_control_message_id(guild_id)
+        except discord.Forbidden:
+            logger.warning(
+                "Missing permission to edit music control panel in guild %s",
+                guild_id,
+            )
+            return None
+        except discord.HTTPException:
+            logger.exception("Failed to edit music control panel in guild %s", guild_id)
+            return None
+
     try:
-        state.control_message = await state.announcement_channel.send(
+        state.control_message = await control_channel.send(
             embed=embed,
             view=view,
-            silent=is_silent_music_channel(state.announcement_channel),
+            silent=is_silent_music_channel(control_channel),
         )
     except discord.Forbidden:
         logger.warning("Missing permission to send music control panel in guild %s", guild_id)
+        return None
+    except discord.HTTPException:
+        logger.exception("Failed to send music control panel in guild %s", guild_id)
+        return None
+
+    set_control_message_id(guild_id, state.control_message.id)
+    return state.control_message
 
 
-async def delete_player_panel(state: GuildMusicState) -> None:
-    if state.control_message is None:
-        return
+async def show_idle_panel(guild_id: int, state: GuildMusicState) -> None:
+    await update_control_panel(guild_id, state)
 
-    try:
-        await state.control_message.delete()
-    except discord.NotFound:
-        pass
-    finally:
-        state.control_message = None
+
+async def delete_control_panel(
+    guild_id: int,
+    state: GuildMusicState,
+    *,
+    channel: discord.abc.Messageable | None = None,
+) -> None:
+    async with state.control_panel_lock:
+        await _delete_control_panel(guild_id, state, channel=channel)
+
+
+async def _delete_control_panel(
+    guild_id: int,
+    state: GuildMusicState,
+    *,
+    channel: discord.abc.Messageable | None = None,
+) -> None:
+    control_channel = channel or resolve_control_panel_channel(guild_id, state)
+    message = state.control_message
+    if message is None and control_channel is not None:
+        message_id = get_control_message_id(guild_id)
+        fetch_message = getattr(control_channel, "fetch_message", None)
+        if message_id is not None and fetch_message is not None:
+            try:
+                message = await fetch_message(message_id)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                message = None
+
+    if message is not None:
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            logger.exception("Failed to delete music control panel in guild %s", guild_id)
+
+    state.control_message = None
+    clear_control_message_id(guild_id)
+
+
+async def restore_control_panels() -> None:
+    for guild in bot.guilds:
+        channel_id = get_music_channel_id(guild.id)
+        if channel_id is None:
+            continue
+
+        channel = guild.get_channel(channel_id)
+        if channel is None or not hasattr(channel, "send"):
+            logger.warning(
+                "Configured music channel %s was not found in guild %s",
+                channel_id,
+                guild.id,
+            )
+            continue
+
+        state = get_state(guild.id)
+        try:
+            await update_control_panel(guild.id, state, channel=channel)
+        except Exception:
+            logger.exception("Failed to restore music control panel in guild %s", guild.id)
 
 
 async def play_next(guild_id: int, announce: bool = True) -> None:
@@ -1282,7 +2119,8 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
         if not ffmpeg_is_available():
             state.current = None
             state.queue.clear()
-            await delete_player_panel(state)
+            cancel_autoplay_refill(state)
+            await show_idle_panel(guild_id, state)
             await notify_playback_error(
                 state,
                 "FFmpeg를 찾지 못해서 재생할 수 없어요. "
@@ -1314,16 +2152,17 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                     should_delete_panel = False
 
             if should_delete_panel:
-                await delete_player_panel(state)
+                await show_idle_panel(guild_id, state)
                 return
             assert track is not None
 
             try:
                 await resolve_track_stream(track)
+                ffmpeg_options = FFMPEG_LOCAL_OPTIONS if track.is_local else FFMPEG_OPTIONS
                 ffmpeg_source = discord.FFmpegPCMAudio(
                     track.stream_url,
                     executable=FFMPEG_EXECUTABLE,
-                    **FFMPEG_OPTIONS,
+                    **ffmpeg_options,
                 )
                 source = discord.PCMVolumeTransformer(ffmpeg_source, volume=BOT_VOLUME)
             except asyncio.CancelledError:
@@ -1382,8 +2221,10 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                     source.cleanup()
                 raise
 
+            remember_autoplay_track(state, track)
+            schedule_autoplay_refill(guild_id)
             if announce and state.current is track:
-                await send_player_panel(guild_id, state, track)
+                await update_control_panel(guild_id, state)
             return
     finally:
         if state.advance_task is current_task:
@@ -1405,6 +2246,14 @@ async def on_ready() -> None:
         logger.error(
             "FFmpeg executable was not found. Set FFMPEG_PATH in .env or add ffmpeg to PATH."
         )
+    if MUSIC_TEST_AUDIO_FILE:
+        logger.warning(
+            "Local music test mode is enabled with MUSIC_TEST_AUDIO_FILE=%s; "
+            "YouTube will not be queried.",
+            MUSIC_TEST_AUDIO_FILE,
+        )
+
+    await restore_control_panels()
 
     if commands_synced:
         return
@@ -1466,6 +2315,26 @@ async def on_message(message: discord.Message) -> None:
     await bot.process_commands(message)
 
 
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+) -> None:
+    if member.bot:
+        return
+
+    state = music_states.get(member.guild.id)
+    if state is None or state.voice is None or not state.voice.is_connected():
+        return
+
+    bot_channel = state.voice.channel
+    if before.channel != bot_channel and after.channel != bot_channel:
+        return
+
+    update_empty_channel_disconnect(state, member.guild.id)
+
+
 @bot.tree.command(
     name="setupmusic",
     description="Create or select a text channel for quick music requests.",
@@ -1495,10 +2364,19 @@ async def setup_music_channel(
             reason="Music request channel setup",
         )
 
-    set_music_channel(interaction.guild.id, selected_channel.id)
+    guild_id = interaction.guild.id
+    state = get_state(guild_id)
+    previous_channel_id = get_music_channel_id(guild_id)
+    if previous_channel_id is not None and previous_channel_id != selected_channel.id:
+        previous_channel = interaction.guild.get_channel(previous_channel_id)
+        await delete_control_panel(guild_id, state, channel=previous_channel)
+
+    set_music_channel(guild_id, selected_channel.id)
+    state.announcement_channel = selected_channel
+    await update_control_panel(guild_id, state, channel=selected_channel)
     await interaction.followup.send(
         f"{selected_channel.mention} 채널을 음악 신청 전용 채널로 설정했어요. "
-        "이제 그 채널에 곡명이나 YouTube URL만 보내면 재생됩니다.",
+        "이제 그 채널에 곡명이나 YouTube URL만 보내면 재생되고, 컨트롤 패널은 항상 유지됩니다.",
         ephemeral=True,
     )
 
@@ -1534,107 +2412,6 @@ async def join(interaction: discord.Interaction) -> None:
     if await ensure_voice(interaction, state):
         state.announcement_channel = interaction.channel
         await interaction.followup.send("음성 채널에 들어왔어요.", ephemeral=True)
-
-
-@bot.tree.command(name="play", description="Play a YouTube Music URL or search YouTube Music.")
-@app_commands.describe(query="YouTube Music URL or song search text")
-@app_commands.guild_only()
-async def play(interaction: discord.Interaction, query: str) -> None:
-    await interaction.response.defer()
-    if interaction.guild_id is None:
-        await interaction.followup.send(guild_only_error(), ephemeral=True)
-        return
-
-    state = get_state(interaction.guild_id)
-    if not await ensure_voice(interaction, state):
-        return
-
-    await enqueue_tracks(
-        interaction.guild_id,
-        interaction.channel,
-        interaction.user,
-        query,
-        interaction=interaction,
-    )
-
-
-@bot.tree.command(name="playalbum", description="Search YouTube Music albums and queue the first match.")
-@app_commands.describe(query="Album search text or YouTube Music album URL")
-@app_commands.guild_only()
-async def play_album(interaction: discord.Interaction, query: str) -> None:
-    await interaction.response.defer()
-    if interaction.guild_id is None:
-        await interaction.followup.send(guild_only_error(), ephemeral=True)
-        return
-
-    state = get_state(interaction.guild_id)
-    if not await ensure_voice(interaction, state):
-        return
-
-    await enqueue_tracks(
-        interaction.guild_id,
-        interaction.channel,
-        interaction.user,
-        query,
-        interaction=interaction,
-        bulk=True,
-        section="albums",
-    )
-
-
-@bot.tree.command(name="playplaylist", description="Search YouTube Music playlists and queue the first match.")
-@app_commands.describe(query="Playlist search text or YouTube Music playlist URL")
-@app_commands.guild_only()
-async def play_playlist(interaction: discord.Interaction, query: str) -> None:
-    await interaction.response.defer()
-    if interaction.guild_id is None:
-        await interaction.followup.send(guild_only_error(), ephemeral=True)
-        return
-
-    state = get_state(interaction.guild_id)
-    if not await ensure_voice(interaction, state):
-        return
-
-    await enqueue_tracks(
-        interaction.guild_id,
-        interaction.channel,
-        interaction.user,
-        query,
-        interaction=interaction,
-        bulk=True,
-        section="community playlists",
-    )
-
-
-@bot.tree.command(name="playauto", description="Queue related songs from a YouTube search.")
-@app_commands.describe(
-    query="Song, artist, or mood to start from",
-    count="Number of related tracks to queue",
-)
-@app_commands.guild_only()
-async def play_auto(
-    interaction: discord.Interaction,
-    query: str,
-    count: app_commands.Range[int, 1, 25] = DEFAULT_AUTO_TRACKS,
-) -> None:
-    await interaction.response.defer()
-    if interaction.guild_id is None:
-        await interaction.followup.send(guild_only_error(), ephemeral=True)
-        return
-
-    state = get_state(interaction.guild_id)
-    if not await ensure_voice(interaction, state):
-        return
-
-    await enqueue_tracks(
-        interaction.guild_id,
-        interaction.channel,
-        interaction.user,
-        query,
-        interaction=interaction,
-        bulk=True,
-        auto_count=clamp_auto_count(count),
-    )
 
 
 @bot.tree.command(name="pause", description="Pause the current track.")
@@ -1704,7 +2481,7 @@ async def stop(interaction: discord.Interaction) -> None:
         return
     stop_playback(state)
 
-    await delete_player_panel(state)
+    await show_idle_panel(interaction.guild_id, state)
     await interaction.response.send_message("재생을 멈추고 대기열을 비웠어요.")
 
 
@@ -1739,8 +2516,9 @@ async def remove_from_queue(interaction: discord.Interaction, position: int) -> 
         await interaction.response.send_message("그 번호의 대기열 곡을 찾지 못했어요.", ephemeral=True)
         return
 
+    schedule_autoplay_refill(interaction.guild_id)
     if state.current:
-        await send_player_panel(interaction.guild_id, state, state.current)
+        await update_control_panel(interaction.guild_id, state)
 
     await interaction.response.send_message(
         f"대기열에서 `{removed.title}`을 삭제했어요.",
@@ -1776,10 +2554,11 @@ async def leave(interaction: discord.Interaction) -> None:
     state = get_state(interaction.guild_id)
     if not await ensure_same_voice_channel(interaction, state):
         return
+    cancel_empty_channel_disconnect(state)
     stop_playback(state)
 
     if state.voice and state.voice.is_connected():
-        await delete_player_panel(state)
+        await show_idle_panel(interaction.guild_id, state)
         await state.voice.disconnect()
         state.voice = None
         await interaction.response.send_message("음성 채널에서 나왔어요.")
