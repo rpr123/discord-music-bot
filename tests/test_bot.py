@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from collections import deque
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import bot
 
@@ -66,6 +66,60 @@ class SearchRoutingTests(unittest.TestCase):
             bot.get_playlist_result_url(result),
             "https://www.youtube.com/playlist?list=PL1234567890ABCDEFG",
         )
+
+
+class DiscordHttpResilienceTests(unittest.IsolatedAsyncioTestCase):
+    def make_server_error(self) -> bot.discord.DiscordServerError:
+        response = MagicMock(status=500, reason="Internal Server Error")
+        return bot.discord.DiscordServerError(response, "<html>temporary failure</html>")
+
+    async def asyncTearDown(self) -> None:
+        bot.music_states.clear()
+
+    async def test_music_reply_ignores_transient_discord_500(self) -> None:
+        message = MagicMock()
+        message.reply = AsyncMock(side_effect=self.make_server_error())
+
+        with (
+            patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
+            self.assertLogs("music-bot", level="WARNING") as logs,
+        ):
+            result = await bot.send_music_request_reply(message, "곡을 찾고 있어요...")
+
+        self.assertIsNone(result)
+        self.assertIn("HTTP 500", "\n".join(logs.output))
+        self.assertNotIn("<html>", "\n".join(logs.output))
+
+    async def test_feedback_500_does_not_undo_queued_track(self) -> None:
+        class Requester:
+            display_name = "tester"
+            id = 123
+
+        channel = MagicMock()
+        channel.send = AsyncMock(side_effect=self.make_server_error())
+        track = make_track("queued")
+
+        with (
+            patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
+            patch.object(bot, "extract_track", new=AsyncMock(return_value=track)),
+            self.assertLogs("music-bot", level="WARNING"),
+        ):
+            result = await bot.enqueue_tracks(987, channel, Requester(), "queued")
+
+        self.assertTrue(result)
+        self.assertEqual(list(bot.get_state(987).queue), [track])
+
+    async def test_request_delete_ignores_transient_discord_500(self) -> None:
+        message = MagicMock()
+        message.delete = AsyncMock(side_effect=self.make_server_error())
+
+        with (
+            patch.object(bot, "MUSIC_CHANNEL_DELETE_REQUESTS", True),
+            self.assertLogs("music-bot", level="WARNING") as logs,
+        ):
+            await bot.delete_music_request_message(message)
+
+        self.assertIn("HTTP 500", "\n".join(logs.output))
 
 
 class AutoRequestParsingTests(unittest.TestCase):

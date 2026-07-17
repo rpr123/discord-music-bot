@@ -396,6 +396,30 @@ def is_silent_music_channel(channel: discord.abc.Messageable | None) -> bool:
     return get_music_channel_id(guild.id) == channel_id
 
 
+def log_discord_http_error(action: str, error: discord.HTTPException) -> None:
+    logger.warning(
+        "Discord API failed while %s: HTTP %s (code %s)",
+        action,
+        getattr(error, "status", "unknown"),
+        getattr(error, "code", "unknown"),
+    )
+
+
+async def send_music_request_reply(
+    message: discord.Message,
+    content: str,
+) -> discord.Message | None:
+    try:
+        return await message.reply(
+            content,
+            mention_author=False,
+            silent=is_silent_music_channel(message.channel),
+        )
+    except discord.HTTPException as error:
+        log_discord_http_error("sending a music request reply", error)
+        return None
+
+
 async def delete_music_request_message(message: discord.Message) -> None:
     if not MUSIC_CHANNEL_DELETE_REQUESTS:
         return
@@ -404,6 +428,8 @@ async def delete_music_request_message(message: discord.Message) -> None:
         await message.delete()
     except discord.NotFound:
         pass
+    except discord.HTTPException as error:
+        log_discord_http_error("deleting a music request", error)
 
 
 async def delete_message_later(message: discord.Message, delay_seconds: int) -> None:
@@ -412,8 +438,8 @@ async def delete_message_later(message: discord.Message, delay_seconds: int) -> 
         await message.delete()
     except discord.NotFound:
         pass
-    except discord.HTTPException:
-        logger.exception("Failed to delete temporary music feedback message")
+    except discord.HTTPException as error:
+        log_discord_http_error("deleting temporary music feedback", error)
 
 
 async def notify_playback_error(state: GuildMusicState, content: str) -> None:
@@ -425,8 +451,8 @@ async def notify_playback_error(state: GuildMusicState, content: str) -> None:
             content,
             silent=is_silent_music_channel(state.announcement_channel),
         )
-    except discord.Forbidden:
-        logger.warning("Missing permission to send playback error message")
+    except discord.HTTPException as error:
+        log_discord_http_error("sending a playback error message", error)
 
 
 @dataclass
@@ -1901,20 +1927,36 @@ async def enqueue_tracks(
         private: bool = False,
     ) -> discord.Message | None:
         if initial_response:
-            await initial_response.edit(content=content, embed=embed, view=view)
-            if view is None or private:
+            try:
+                await initial_response.edit(content=content, embed=embed, view=view)
+            except discord.NotFound:
+                pass
+            except discord.HTTPException as error:
+                log_discord_http_error("editing music feedback", error)
                 asyncio.create_task(
                     delete_message_later(initial_response, MUSIC_FEEDBACK_DELETE_SECONDS)
                 )
-            return initial_response
+            else:
+                if view is None or private:
+                    asyncio.create_task(
+                        delete_message_later(
+                            initial_response,
+                            MUSIC_FEEDBACK_DELETE_SECONDS,
+                        )
+                    )
+                return initial_response
 
-        message = await text_channel.send(
-            content=content,
-            embed=embed,
-            view=view,
-            silent=is_silent_music_channel(text_channel),
-        )
-        if private:
+        try:
+            message = await text_channel.send(
+                content=content,
+                embed=embed,
+                view=view,
+                silent=is_silent_music_channel(text_channel),
+            )
+        except discord.HTTPException as error:
+            log_discord_http_error("sending music feedback", error)
+            return None
+        if view is None or private:
             asyncio.create_task(delete_message_later(message, MUSIC_FEEDBACK_DELETE_SECONDS))
         return message
 
@@ -2484,21 +2526,16 @@ async def on_message(message: discord.Message) -> None:
     state = get_state(message.guild.id)
     ok, error = await ensure_voice_for_member(message.author, state)
     if not ok:
-        error_message = await message.reply(
-            error,
-            mention_author=False,
-            silent=is_silent_music_channel(message.channel),
-        )
-        asyncio.create_task(delete_message_later(error_message, MUSIC_FEEDBACK_DELETE_SECONDS))
+        error_message = await send_music_request_reply(message, error)
+        if error_message is not None:
+            asyncio.create_task(
+                delete_message_later(error_message, MUSIC_FEEDBACK_DELETE_SECONDS)
+            )
         await delete_music_request_message(message)
         return
 
-    async with message.channel.typing():
-        loading_message = await message.reply(
-            "곡을 찾고 있어요...",
-            mention_author=False,
-            silent=is_silent_music_channel(message.channel),
-        )
+    loading_message = await send_music_request_reply(message, "곡을 찾고 있어요...")
+    try:
         await enqueue_tracks(
             message.guild.id,
             message.channel,
@@ -2506,6 +2543,13 @@ async def on_message(message: discord.Message) -> None:
             query,
             initial_response=loading_message,
         )
+    except discord.HTTPException as error:
+        log_discord_http_error("processing a music request", error)
+        if loading_message is not None:
+            asyncio.create_task(
+                delete_message_later(loading_message, MUSIC_FEEDBACK_DELETE_SECONDS)
+            )
+    finally:
         await delete_music_request_message(message)
 
     await bot.process_commands(message)
