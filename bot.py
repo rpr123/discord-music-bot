@@ -127,6 +127,7 @@ DEFAULT_AUTO_TRACKS = parse_positive_int_env("DEFAULT_AUTO_TRACKS", 8)
 MAX_AUTO_TRACKS = parse_positive_int_env("MAX_AUTO_TRACKS", 25)
 BOT_VOLUME = parse_volume_env("BOT_VOLUME", 0.2)
 DISCORD_EMBED_FIELD_LIMIT = 1024
+QUEUE_SELECT_LIMIT = 25
 YTDL_EXTRACT_TIMEOUT_SECONDS = parse_positive_int_env("YTDL_EXTRACT_TIMEOUT_SECONDS", 45)
 YTDL_MAX_CONCURRENT_EXTRACTIONS = parse_positive_int_env(
     "YTDL_MAX_CONCURRENT_EXTRACTIONS", 1
@@ -803,6 +804,34 @@ def remove_queued_track_by_id(state: GuildMusicState, track_id: str) -> Track | 
     return None
 
 
+def remove_queued_track_range_by_ids(
+    state: GuildMusicState,
+    first_track_id: str,
+    second_track_id: str,
+) -> tuple[list[Track], int, int] | None:
+    tracks = list(state.queue)
+    positions = {track.track_id: index for index, track in enumerate(tracks)}
+    if first_track_id not in positions or second_track_id not in positions:
+        return None
+
+    start_index, end_index = sorted(
+        (positions[first_track_id], positions[second_track_id])
+    )
+    removed = tracks[start_index : end_index + 1]
+    state.queue = deque(tracks[:start_index] + tracks[end_index + 1 :])
+    return removed, start_index, end_index
+
+
+def describe_queue_selection(state: GuildMusicState, track_id: str | None) -> str:
+    if track_id is None:
+        return "선택 안 함"
+
+    for index, track in enumerate(state.queue, start=1):
+        if track.track_id == track_id:
+            return f"{index}. {truncate_text(track.title, 72)}"
+    return "대기열에서 찾을 수 없음"
+
+
 class QueueRemoveSelect(discord.ui.Select):
     def __init__(self, guild_id: int):
         self.guild_id = guild_id
@@ -813,7 +842,10 @@ class QueueRemoveSelect(discord.ui.Select):
                 description=truncate_option_text(f"신청자: {track.requester}", 100),
                 value=track.track_id,
             )
-            for index, track in enumerate(list(state.queue)[:25], start=1)
+            for index, track in enumerate(
+                list(state.queue)[:QUEUE_SELECT_LIMIT],
+                start=1,
+            )
         ]
         super().__init__(
             placeholder="삭제할 대기열 곡을 선택하세요",
@@ -853,6 +885,135 @@ class QueueManageView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await ensure_same_voice_channel(interaction, get_state(self.guild_id))
+
+
+class QueueRangeBoundarySelect(discord.ui.Select):
+    def __init__(
+        self,
+        range_view: QueueRangeDeleteView,
+        boundary: str,
+        *,
+        row: int,
+    ):
+        self.range_view = range_view
+        self.boundary = boundary
+        state = get_state(range_view.guild_id)
+        options = [
+            discord.SelectOption(
+                label=truncate_option_text(f"{index}. {track.title}"),
+                description=truncate_option_text(f"신청자: {track.requester}", 100),
+                value=track.track_id,
+            )
+            for index, track in enumerate(
+                list(state.queue)[:QUEUE_SELECT_LIMIT],
+                start=1,
+            )
+        ]
+        boundary_label = "시작" if boundary == "start" else "끝"
+        super().__init__(
+            placeholder=f"삭제 구간의 {boundary_label} 곡을 선택하세요",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        selected_track_id = self.values[0]
+        if self.boundary == "start":
+            self.range_view.start_track_id = selected_track_id
+        else:
+            self.range_view.end_track_id = selected_track_id
+
+        for option in self.options:
+            option.default = option.value == selected_track_id
+        self.range_view.confirm_button.disabled = not (
+            self.range_view.start_track_id and self.range_view.end_track_id
+        )
+        state = get_state(self.range_view.guild_id)
+        await interaction.response.edit_message(
+            content=self.range_view.make_selection_content(state),
+            embed=make_queue_embed(state),
+            view=self.range_view,
+        )
+
+
+class QueueRangeDeleteButton(discord.ui.Button):
+    def __init__(self, range_view: QueueRangeDeleteView):
+        self.range_view = range_view
+        super().__init__(
+            label="선택 구간 삭제",
+            emoji="✂️",
+            style=discord.ButtonStyle.danger,
+            disabled=True,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.range_view.delete_selected_range(interaction)
+
+
+class QueueRangeDeleteView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.start_track_id: str | None = None
+        self.end_track_id: str | None = None
+        self.add_item(QueueRangeBoundarySelect(self, "start", row=0))
+        self.add_item(QueueRangeBoundarySelect(self, "end", row=1))
+        self.confirm_button = QueueRangeDeleteButton(self)
+        self.add_item(self.confirm_button)
+
+    def make_selection_content(self, state: GuildMusicState) -> str:
+        return (
+            "삭제할 구간의 시작 곡과 끝 곡을 선택한 뒤 확인 버튼을 누르세요.\n"
+            f"시작: {describe_queue_selection(state, self.start_track_id)}\n"
+            f"끝: {describe_queue_selection(state, self.end_track_id)}"
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await ensure_same_voice_channel(interaction, get_state(self.guild_id))
+
+    async def delete_selected_range(self, interaction: discord.Interaction) -> None:
+        if self.start_track_id is None or self.end_track_id is None:
+            await interaction.response.edit_message(
+                content=self.make_selection_content(get_state(self.guild_id)),
+                view=self,
+            )
+            return
+
+        state = get_state(self.guild_id)
+        async with state.lock:
+            result = remove_queued_track_range_by_ids(
+                state,
+                self.start_track_id,
+                self.end_track_id,
+            )
+
+        if result is None:
+            await interaction.response.edit_message(
+                content=(
+                    "대기열이 변경되어 선택한 곡을 찾을 수 없어요. "
+                    "삭제할 구간을 다시 선택해 주세요."
+                ),
+                embed=make_queue_embed(state),
+                view=QueueRangeDeleteView(self.guild_id) if state.queue else None,
+            )
+            return
+
+        removed, start_index, end_index = result
+        schedule_autoplay_refill(self.guild_id)
+        if state.current:
+            await update_control_panel(self.guild_id, state)
+
+        await interaction.response.edit_message(
+            content=(
+                f"대기열 {start_index + 1}~{end_index + 1}번, "
+                f"{len(removed)}곡을 삭제했어요."
+            ),
+            embed=make_queue_embed(state),
+            view=None,
+        )
 
 
 class MusicControlView(discord.ui.View):
@@ -968,6 +1129,25 @@ class MusicControlView(discord.ui.View):
         await interaction.response.send_message(
             embed=make_queue_embed(state),
             view=QueueManageView(self.guild_id) if state.queue else None,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="구간 삭제", emoji="✂️", style=discord.ButtonStyle.secondary, row=1)
+    async def queue_range(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        state = self.get_state()
+        view = QueueRangeDeleteView(self.guild_id) if state.queue else None
+        await interaction.response.send_message(
+            content=(
+                view.make_selection_content(state)
+                if view
+                else "대기열이 비어 있어요."
+            ),
+            embed=make_queue_embed(state),
+            view=view,
             ephemeral=True,
         )
 

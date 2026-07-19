@@ -1004,6 +1004,96 @@ class QueueTests(unittest.TestCase):
         self.assertIs(removed, second)
         self.assertEqual(list(state.queue), [third, first])
 
+    def test_remove_range_is_inclusive(self) -> None:
+        tracks = [make_track(f"track-{index}") for index in range(1, 21)]
+        state = bot.GuildMusicState(queue=deque(tracks))
+
+        result = bot.remove_queued_track_range_by_ids(
+            state,
+            tracks[4].track_id,
+            tracks[12].track_id,
+        )
+
+        self.assertIsNotNone(result)
+        removed, start_index, end_index = result
+        self.assertEqual((start_index, end_index), (4, 12))
+        self.assertEqual(removed, tracks[4:13])
+        self.assertEqual(len(state.queue), 11)
+        self.assertEqual(list(state.queue), tracks[:4] + tracks[13:])
+
+    def test_remove_range_accepts_reversed_boundaries(self) -> None:
+        tracks = [make_track(f"track-{index}") for index in range(1, 21)]
+        state = bot.GuildMusicState(queue=deque(tracks))
+
+        result = bot.remove_queued_track_range_by_ids(
+            state,
+            tracks[12].track_id,
+            tracks[4].track_id,
+        )
+
+        self.assertIsNotNone(result)
+        removed, start_index, end_index = result
+        self.assertEqual((start_index, end_index), (4, 12))
+        self.assertEqual(removed, tracks[4:13])
+        self.assertEqual(len(state.queue), 11)
+
+    def test_remove_range_keeps_queue_when_endpoint_is_missing(self) -> None:
+        tracks = [make_track("first"), make_track("second")]
+        state = bot.GuildMusicState(queue=deque(tracks))
+
+        result = bot.remove_queued_track_range_by_ids(
+            state,
+            tracks[0].track_id,
+            "missing-track-id",
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(list(state.queue), tracks)
+
+
+class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self) -> None:
+        bot.music_states.clear()
+
+    async def test_view_has_two_selects_and_disabled_confirm_button(self) -> None:
+        guild_id = 987
+        state = bot.get_state(guild_id)
+        state.queue.extend([make_track("first"), make_track("second")])
+
+        view = bot.QueueRangeDeleteView(guild_id)
+        selects = [
+            item for item in view.children if isinstance(item, bot.discord.ui.Select)
+        ]
+
+        self.assertEqual(len(selects), 2)
+        self.assertIn("시작", selects[0].placeholder)
+        self.assertIn("끝", selects[1].placeholder)
+        self.assertTrue(view.confirm_button.disabled)
+
+    async def test_confirm_deletes_inclusive_range(self) -> None:
+        guild_id = 988
+        tracks = [make_track(f"track-{index}") for index in range(1, 21)]
+        state = bot.get_state(guild_id)
+        state.queue.extend(tracks)
+        view = bot.QueueRangeDeleteView(guild_id)
+        view.start_track_id = tracks[4].track_id
+        view.end_track_id = tracks[12].track_id
+        view.confirm_button.disabled = False
+        interaction = MagicMock()
+        interaction.response.edit_message = AsyncMock()
+
+        with patch.object(bot, "schedule_autoplay_refill") as schedule_refill:
+            await view.confirm_button.callback(interaction)
+
+        self.assertEqual(len(state.queue), 11)
+        self.assertEqual(list(state.queue), tracks[:4] + tracks[13:])
+        schedule_refill.assert_called_once_with(guild_id)
+        interaction.response.edit_message.assert_awaited_once()
+        kwargs = interaction.response.edit_message.await_args.kwargs
+        self.assertIn("5~13번", kwargs["content"])
+        self.assertIn("9곡", kwargs["content"])
+        self.assertIsNone(kwargs["view"])
+
 
 class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
