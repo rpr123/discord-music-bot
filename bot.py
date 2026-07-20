@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import io
 import json
 import itertools
 import logging
@@ -12,7 +13,9 @@ import re
 import shutil
 import time
 import unicodedata
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -128,6 +131,11 @@ MAX_AUTO_TRACKS = parse_positive_int_env("MAX_AUTO_TRACKS", 25)
 BOT_VOLUME = parse_volume_env("BOT_VOLUME", 0.2)
 DISCORD_EMBED_FIELD_LIMIT = 1024
 QUEUE_SELECT_LIMIT = 25
+LYRICS_API_URL = os.getenv("LYRICS_API_URL", "https://lrclib.net/api/search")
+LYRICS_REQUEST_TIMEOUT_SECONDS = parse_positive_int_env(
+    "LYRICS_REQUEST_TIMEOUT_SECONDS", 10
+)
+LYRICS_INLINE_LIMIT = 3900
 YTDL_EXTRACT_TIMEOUT_SECONDS = parse_positive_int_env("YTDL_EXTRACT_TIMEOUT_SECONDS", 45)
 YTDL_MAX_CONCURRENT_EXTRACTIONS = parse_positive_int_env(
     "YTDL_MAX_CONCURRENT_EXTRACTIONS", 1
@@ -471,6 +479,8 @@ class Track:
     uploader: str | None = None
     is_local: bool = False
     stream_resolved_at: float | None = None
+    lyrics: str | None = None
+    lyrics_loaded: bool = False
     track_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
@@ -495,6 +505,8 @@ class GuildMusicState:
     control_panel_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     advance_task: asyncio.Task[None] | None = None
     autoplay_task: asyncio.Task[None] | None = None
+    lyrics_task: asyncio.Task[None] | None = None
+    lyrics_message: discord.Message | None = None
     empty_channel_task: asyncio.Task[None] | None = None
     playback_generation: int = 0
 
@@ -832,6 +844,21 @@ def describe_queue_selection(state: GuildMusicState, track_id: str | None) -> st
     return "대기열에서 찾을 수 없음"
 
 
+def make_lyrics_embed(track: Track, description: str) -> discord.Embed:
+    song_title = track.song_name or track.title
+    embed = discord.Embed(
+        title=f"가사 · {truncate_text(song_title, 220)}",
+        description=description,
+        color=discord.Color.blurple(),
+    )
+    artist = track.artist or track.uploader
+    if artist:
+        embed.set_author(name=truncate_text(artist, 200))
+
+    embed.set_footer(text="LRCLIB · 원문 가사")
+    return embed
+
+
 class QueueRemoveSelect(discord.ui.Select):
     def __init__(self, guild_id: int):
         self.guild_id = guild_id
@@ -1105,7 +1132,7 @@ class MusicControlView(discord.ui.View):
     @discord.ui.button(label="정지", emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
     async def stop(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
-        stop_playback(state)
+        stop_playback(state, self.guild_id)
         await interaction.response.defer()
         await show_idle_panel(self.guild_id, state)
 
@@ -1366,6 +1393,352 @@ def get_track_identity_keys(track: Track) -> set[str]:
     if video_id:
         keys.add(f"video:{video_id}")
     return keys
+
+
+LRC_TIMESTAMP_RE = re.compile(
+    r"\[(?:(?:\d{1,2}):)?\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]"
+)
+LRC_METADATA_RE = re.compile(
+    r"^\[(?:ar|ti|al|by|offset|length|re|ve):.*\]\s*$",
+    flags=re.IGNORECASE,
+)
+
+
+class LyricsLookupError(RuntimeError):
+    pass
+
+
+def get_lyrics_search_terms(track: Track) -> tuple[str, str | None]:
+    cleaned_title = clean_track_title(track.song_name or track.title)
+    parsed_artist: str | None = None
+    song_name = cleaned_title
+    if track.song_name is None:
+        title_parts = re.split(
+            r"\s+(?:-|–|—|\|)\s+",
+            cleaned_title,
+            maxsplit=1,
+        )
+        if len(title_parts) == 2:
+            parsed_artist, song_name = title_parts
+
+    artist = track.artist or parsed_artist or track.uploader
+    artist_name = normalize_artist_name(artist) if artist else None
+    return song_name.strip(), artist_name or None
+
+
+def extract_original_lyrics(record: dict) -> str | None:
+    if record.get("instrumental"):
+        return None
+
+    plain_lyrics = record.get("plainLyrics")
+    if isinstance(plain_lyrics, str) and plain_lyrics.strip():
+        return plain_lyrics.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    synced_lyrics = record.get("syncedLyrics")
+    if not isinstance(synced_lyrics, str) or not synced_lyrics.strip():
+        return None
+
+    lines = []
+    for line in synced_lyrics.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if LRC_METADATA_RE.fullmatch(line.strip()):
+            continue
+        lines.append(LRC_TIMESTAMP_RE.sub("", line))
+    lyrics = "\n".join(lines).strip()
+    return lyrics or None
+
+
+def normalize_lyrics_match_text(value: str) -> str:
+    return normalize_identity_component(clean_track_title(value))
+
+
+def lyrics_record_score(
+    record: dict,
+    track_name: str,
+    artist_name: str | None,
+    duration: int | None,
+) -> int | None:
+    if extract_original_lyrics(record) is None:
+        return None
+
+    expected_title = normalize_lyrics_match_text(track_name)
+    candidate_title = normalize_lyrics_match_text(str(record.get("trackName") or ""))
+    if not expected_title or not candidate_title:
+        return None
+
+    if candidate_title == expected_title:
+        score = 100
+    elif (
+        len(expected_title) >= 4
+        and (expected_title in candidate_title or candidate_title in expected_title)
+    ):
+        score = 40
+    else:
+        return None
+
+    if artist_name:
+        expected_artist = normalize_artist_name(artist_name)
+        candidate_artist = normalize_artist_name(str(record.get("artistName") or ""))
+        if not candidate_artist:
+            return None
+        if candidate_artist == expected_artist:
+            score += 80
+        elif (
+            len(expected_artist) >= 3
+            and (expected_artist in candidate_artist or candidate_artist in expected_artist)
+        ):
+            score += 25
+        else:
+            return None
+
+    candidate_duration = record.get("duration")
+    if duration is not None and isinstance(candidate_duration, (int, float)):
+        difference = abs(float(candidate_duration) - duration)
+        if difference <= 2:
+            score += 40
+        elif difference <= 8:
+            score += 20
+        elif difference <= 20:
+            score += 5
+
+    return score
+
+
+def select_lyrics_record(
+    records: list[dict],
+    track_name: str,
+    artist_name: str | None,
+    duration: int | None,
+) -> dict | None:
+    best_record: dict | None = None
+    best_score = -1
+    for record in records:
+        score = lyrics_record_score(record, track_name, artist_name, duration)
+        if score is not None and score > best_score:
+            best_record = record
+            best_score = score
+    return best_record
+
+
+def request_lyrics_records(track_name: str, artist_name: str | None) -> list[dict]:
+    params = {"track_name": track_name}
+    if artist_name:
+        params["artist_name"] = artist_name
+    separator = "&" if "?" in LYRICS_API_URL else "?"
+    url = f"{LYRICS_API_URL}{separator}{urllib.parse.urlencode(params)}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": (
+                "discord-music-bot/1.0 "
+                "(https://github.com/rpr123/discord-music-bot)"
+            ),
+        },
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=LYRICS_REQUEST_TIMEOUT_SECONDS,
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+        raise LyricsLookupError(str(error)) from error
+
+    if not isinstance(payload, list):
+        raise LyricsLookupError("Lyrics API returned an invalid response.")
+    return [record for record in payload if isinstance(record, dict)]
+
+
+def lookup_track_lyrics(track: Track) -> str | None:
+    if track.is_local:
+        return None
+
+    track_name, artist_name = get_lyrics_search_terms(track)
+    if not track_name:
+        return None
+    records = request_lyrics_records(track_name, artist_name)
+    record = select_lyrics_record(
+        records,
+        track_name,
+        artist_name,
+        track.duration,
+    )
+    return extract_original_lyrics(record) if record else None
+
+
+async def get_track_lyrics(track: Track) -> str | None:
+    if track.lyrics_loaded:
+        return track.lyrics
+
+    try:
+        lyrics = await asyncio.wait_for(
+            asyncio.to_thread(lookup_track_lyrics, track),
+            timeout=LYRICS_REQUEST_TIMEOUT_SECONDS + 2,
+        )
+    except (asyncio.TimeoutError, LyricsLookupError) as error:
+        logger.warning("Lyrics lookup failed for %s: %s", track.title, error)
+        return None
+
+    track.lyrics = lyrics
+    track.lyrics_loaded = True
+    return lyrics
+
+
+def cancel_lyrics_publish(state: GuildMusicState) -> None:
+    task = state.lyrics_task
+    if task and not task.done():
+        task.cancel()
+    state.lyrics_task = None
+
+
+async def clear_lyrics_message(guild_id: int, state: GuildMusicState) -> None:
+    message = state.lyrics_message
+    state.lyrics_message = None
+    if message is not None:
+        await delete_music_channel_message(guild_id, message)
+
+
+def schedule_lyrics_message_cleanup(guild_id: int, state: GuildMusicState) -> None:
+    message = state.lyrics_message
+    state.lyrics_message = None
+    if message is not None:
+        asyncio.create_task(delete_music_channel_message(guild_id, message))
+
+
+def make_lyrics_file(lyrics: str) -> discord.File:
+    return discord.File(
+        io.BytesIO(lyrics.encode("utf-8")),
+        filename="lyrics.txt",
+    )
+
+
+async def upsert_lyrics_message(
+    guild_id: int,
+    state: GuildMusicState,
+    track: Track,
+    description: str,
+    *,
+    attachment_lyrics: str | None = None,
+) -> discord.Message | None:
+    channel = resolve_control_panel_channel(guild_id, state)
+    if channel is None or state.current is not track:
+        return None
+
+    message = state.lyrics_message
+    if message is not None:
+        message_channel_id = getattr(getattr(message, "channel", None), "id", None)
+        channel_id = getattr(channel, "id", None)
+        if (
+            message_channel_id is not None
+            and channel_id is not None
+            and message_channel_id != channel_id
+        ):
+            await delete_music_channel_message(guild_id, message)
+            state.lyrics_message = None
+            message = None
+
+    embed = make_lyrics_embed(track, description)
+    if message is not None:
+        attachments = (
+            [make_lyrics_file(attachment_lyrics)]
+            if attachment_lyrics is not None
+            else []
+        )
+        try:
+            edited_message = await message.edit(
+                content=None,
+                embed=embed,
+                attachments=attachments,
+            )
+        except discord.NotFound:
+            state.lyrics_message = None
+            message = None
+        except discord.Forbidden:
+            logger.warning(
+                "Missing permission to edit lyrics in guild %s",
+                guild_id,
+            )
+            return None
+        except discord.HTTPException:
+            logger.exception("Failed to edit lyrics in guild %s", guild_id)
+            return None
+        else:
+            if state.current is not track:
+                await delete_music_channel_message(
+                    guild_id,
+                    edited_message or message,
+                )
+                return None
+            state.lyrics_message = edited_message or message
+            return state.lyrics_message
+
+    send_options: dict[str, object] = {
+        "embed": embed,
+        "silent": is_silent_music_channel(channel),
+    }
+    if attachment_lyrics is not None:
+        send_options["file"] = make_lyrics_file(attachment_lyrics)
+    try:
+        message = await channel.send(**send_options)
+    except discord.Forbidden:
+        logger.warning("Missing permission to send lyrics in guild %s", guild_id)
+        return None
+    except discord.HTTPException:
+        logger.exception("Failed to send lyrics in guild %s", guild_id)
+        return None
+
+    if state.current is not track:
+        await delete_music_channel_message(guild_id, message)
+        return None
+    state.lyrics_message = message
+    return message
+
+
+def schedule_lyrics_publish(
+    guild_id: int,
+    track: Track,
+) -> tuple[asyncio.Task[None], bool]:
+    state = get_state(guild_id)
+    if state.lyrics_task and not state.lyrics_task.done():
+        if state.current is track:
+            return state.lyrics_task, False
+        state.lyrics_task.cancel()
+
+    task = asyncio.create_task(publish_current_lyrics(guild_id, track))
+    state.lyrics_task = task
+    return task, True
+
+
+async def publish_current_lyrics(guild_id: int, track: Track) -> None:
+    state = get_state(guild_id)
+    current_task = asyncio.current_task()
+    try:
+        await upsert_lyrics_message(
+            guild_id,
+            state,
+            track,
+            "가사를 찾고 있어요...",
+        )
+        lyrics = await get_track_lyrics(track)
+        if state.current is not track:
+            return
+        if not lyrics:
+            await upsert_lyrics_message(guild_id, state, track, "미제공")
+        elif len(lyrics) <= LYRICS_INLINE_LIMIT:
+            await upsert_lyrics_message(guild_id, state, track, lyrics)
+        else:
+            await upsert_lyrics_message(
+                guild_id,
+                state,
+                track,
+                "가사가 길어 전체 원문을 첨부했어요.",
+                attachment_lyrics=lyrics,
+            )
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if state.lyrics_task is current_task:
+            state.lyrics_task = None
 
 
 def make_track_from_info(
@@ -1933,7 +2306,7 @@ async def ensure_voice(interaction: discord.Interaction, state: GuildMusicState)
         return False
 
     if state.voice and not state.voice.is_connected():
-        stop_playback(state)
+        stop_playback(state, interaction.guild_id)
         state.voice = None
 
     if state.voice and state.voice.is_connected():
@@ -1963,7 +2336,7 @@ async def ensure_voice_for_member(
         return False, "먼저 음성 채널에 들어가 주세요."
 
     if state.voice and not state.voice.is_connected():
-        stop_playback(state)
+        stop_playback(state, member.guild.id)
         state.voice = None
 
     if state.voice and state.voice.is_connected():
@@ -1998,12 +2371,14 @@ async def ensure_same_voice_channel(
     return False
 
 
-def stop_playback(state: GuildMusicState) -> None:
+def stop_playback(state: GuildMusicState, guild_id: int) -> None:
     state.playback_generation += 1
     state.stop_requested = True
     state.queue.clear()
     state.current = None
     cancel_autoplay_refill(state)
+    cancel_lyrics_publish(state)
+    schedule_lyrics_message_cleanup(guild_id, state)
 
     if state.advance_task and not state.advance_task.done():
         state.advance_task.cancel()
@@ -2038,7 +2413,7 @@ async def disconnect_from_empty_channel(guild_id: int, channel_id: int) -> None:
         ):
             return
 
-        stop_playback(state)
+        stop_playback(state, guild_id)
         await show_idle_panel(guild_id, state)
         await voice.disconnect()
         if state.voice is voice:
@@ -2538,6 +2913,8 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
             state.current = None
             state.queue.clear()
             cancel_autoplay_refill(state)
+            cancel_lyrics_publish(state)
+            await clear_lyrics_message(guild_id, state)
             await show_idle_panel(guild_id, state)
             await notify_playback_error(
                 state,
@@ -2570,6 +2947,8 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                     should_delete_panel = False
 
             if should_delete_panel:
+                cancel_lyrics_publish(state)
+                await clear_lyrics_message(guild_id, state)
                 await show_idle_panel(guild_id, state)
                 return
             assert track is not None
@@ -2643,6 +3022,8 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
             schedule_autoplay_refill(guild_id)
             if announce and state.current is track:
                 await update_control_panel(guild_id, state)
+            if state.current is track:
+                schedule_lyrics_publish(guild_id, track)
             return
     finally:
         if state.advance_task is current_task:
@@ -2899,7 +3280,7 @@ async def stop(interaction: discord.Interaction) -> None:
     state = get_state(interaction.guild_id)
     if not await ensure_same_voice_channel(interaction, state):
         return
-    stop_playback(state)
+    stop_playback(state, interaction.guild_id)
 
     await show_idle_panel(interaction.guild_id, state)
     await interaction.response.send_message("재생을 멈추고 대기열을 비웠어요.")
@@ -2975,7 +3356,7 @@ async def leave(interaction: discord.Interaction) -> None:
     if not await ensure_same_voice_channel(interaction, state):
         return
     cancel_empty_channel_disconnect(state)
-    stop_playback(state)
+    stop_playback(state, interaction.guild_id)
 
     if state.voice and state.voice.is_connected():
         await show_idle_panel(interaction.guild_id, state)

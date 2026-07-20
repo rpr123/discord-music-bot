@@ -362,6 +362,209 @@ class TrackIdentityTests(unittest.TestCase):
         )
 
 
+class LyricsLookupTests(unittest.TestCase):
+    def test_search_terms_use_song_title_and_artist_in_original_script(self) -> None:
+        track = bot.Track(
+            title="back number - ブルーアンバー 【Official Music Video】",
+            webpage_url="https://www.youtube.com/watch?v=lyrics00001",
+            requester="tester",
+            source_url="https://www.youtube.com/watch?v=lyrics00001",
+            uploader="back number - Topic",
+        )
+
+        self.assertEqual(
+            bot.get_lyrics_search_terms(track),
+            ("ブルーアンバー", "back number"),
+        )
+
+    def test_plain_lyrics_are_returned_without_translation_or_romanization(self) -> None:
+        original = "君の声が聞こえる\n夜を越えて"
+        record = {
+            "instrumental": False,
+            "plainLyrics": original,
+            "syncedLyrics": "[00:01.00]Kimi no koe ga kikoeru",
+        }
+
+        self.assertEqual(bot.extract_original_lyrics(record), original)
+
+    def test_synced_lyrics_fallback_removes_only_lrc_metadata(self) -> None:
+        record = {
+            "instrumental": False,
+            "plainLyrics": None,
+            "syncedLyrics": (
+                "[ar:back number]\n"
+                "[00:01.00]君の声が聞こえる\n"
+                "[00:04.20]夜を越えて"
+            ),
+        }
+
+        self.assertEqual(
+            bot.extract_original_lyrics(record),
+            "君の声が聞こえる\n夜を越えて",
+        )
+
+    def test_exact_artist_match_is_selected_over_another_song(self) -> None:
+        wrong_artist = {
+            "trackName": "Blue Amber",
+            "artistName": "Different Artist",
+            "duration": 220,
+            "instrumental": False,
+            "plainLyrics": "wrong",
+        }
+        matching_record = {
+            "trackName": "Blue Amber",
+            "artistName": "back number",
+            "duration": 221,
+            "instrumental": False,
+            "plainLyrics": "correct",
+        }
+
+        selected = bot.select_lyrics_record(
+            [wrong_artist, matching_record],
+            "Blue Amber",
+            "back number",
+            220,
+        )
+
+        self.assertIs(selected, matching_record)
+
+    def test_instrumental_record_is_treated_as_unavailable(self) -> None:
+        self.assertIsNone(
+            bot.extract_original_lyrics(
+                {
+                    "instrumental": True,
+                    "plainLyrics": "should not be shown",
+                }
+            )
+        )
+
+    def test_local_test_track_skips_the_lyrics_service(self) -> None:
+        track = make_track("local")
+        track.is_local = True
+
+        with patch.object(bot, "request_lyrics_records") as request:
+            lyrics = bot.lookup_track_lyrics(track)
+
+        self.assertIsNone(lyrics)
+        request.assert_not_called()
+
+
+class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self) -> None:
+        for state in bot.music_states.values():
+            bot.cancel_lyrics_publish(state)
+        await asyncio.sleep(0)
+        bot.music_states.clear()
+        bot.configured_music_channels.clear()
+
+    def make_channel_and_message(self) -> tuple[MagicMock, MagicMock]:
+        channel = MagicMock()
+        channel.id = 700
+        channel.send = AsyncMock()
+        message = MagicMock()
+        message.id = 701
+        message.channel = channel
+        message.edit = AsyncMock(return_value=message)
+        message.delete = AsyncMock()
+        channel.send.return_value = message
+        return channel, message
+
+    async def test_new_track_edits_the_existing_lyrics_message(self) -> None:
+        guild_id = 600
+        channel, message = self.make_channel_and_message()
+        state = bot.get_state(guild_id)
+        state.announcement_channel = channel
+        first = make_track("first")
+        second = make_track("second")
+        state.current = first
+
+        await bot.upsert_lyrics_message(guild_id, state, first, "first lyrics")
+        state.current = second
+        await bot.upsert_lyrics_message(guild_id, state, second, "second lyrics")
+
+        channel.send.assert_awaited_once()
+        message.edit.assert_awaited_once()
+        edited_embed = message.edit.await_args.kwargs["embed"]
+        self.assertIn("second", edited_embed.title)
+        self.assertEqual(edited_embed.description, "second lyrics")
+        self.assertIs(state.lyrics_message, message)
+        message.delete.assert_not_awaited()
+
+    async def test_music_controls_do_not_add_a_lyrics_button(self) -> None:
+        guild_id = 605
+        view = bot.MusicControlView(guild_id)
+
+        self.assertNotIn("가사", {item.label for item in view.children})
+
+    async def test_missing_lyrics_edits_message_to_unavailable(self) -> None:
+        guild_id = 601
+        channel, message = self.make_channel_and_message()
+        state = bot.get_state(guild_id)
+        state.announcement_channel = channel
+        track = make_track("missing")
+        state.current = track
+
+        with patch.object(bot, "get_track_lyrics", new=AsyncMock(return_value=None)):
+            await bot.publish_current_lyrics(guild_id, track)
+
+        channel.send.assert_awaited_once()
+        message.edit.assert_awaited_once()
+        final_embed = message.edit.await_args.kwargs["embed"]
+        self.assertEqual(final_embed.description, "미제공")
+        self.assertIs(state.lyrics_message, message)
+
+    async def test_long_lyrics_replace_attachment_with_full_utf8_text(self) -> None:
+        guild_id = 602
+        channel, message = self.make_channel_and_message()
+        state = bot.get_state(guild_id)
+        state.announcement_channel = channel
+        track = make_track("long")
+        state.current = track
+        original_lyrics = "原文の歌詞\n" * 700
+
+        with patch.object(
+            bot,
+            "get_track_lyrics",
+            new=AsyncMock(return_value=original_lyrics),
+        ):
+            await bot.publish_current_lyrics(guild_id, track)
+
+        channel.send.assert_awaited_once()
+        attachments = message.edit.await_args.kwargs["attachments"]
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].filename, "lyrics.txt")
+        self.assertEqual(attachments[0].fp.read().decode("utf-8"), original_lyrics)
+
+    async def test_stop_deletes_the_lyrics_message(self) -> None:
+        guild_id = 603
+        _, message = self.make_channel_and_message()
+        state = bot.get_state(guild_id)
+        state.current = make_track("current")
+        state.lyrics_message = message
+
+        bot.stop_playback(state, guild_id)
+        await asyncio.sleep(0)
+
+        message.delete.assert_awaited_once()
+        self.assertIsNone(state.lyrics_message)
+
+    async def test_empty_queue_deletes_the_lyrics_message(self) -> None:
+        guild_id = 604
+        _, message = self.make_channel_and_message()
+        state = bot.get_state(guild_id)
+        state.lyrics_message = message
+
+        with (
+            patch.object(bot, "ffmpeg_is_available", return_value=True),
+            patch.object(bot, "show_idle_panel", new=AsyncMock()) as show_idle,
+        ):
+            await bot.play_next(guild_id)
+
+        message.delete.assert_awaited_once()
+        show_idle.assert_awaited_once_with(guild_id, state)
+        self.assertIsNone(state.lyrics_message)
+
+
 class CommandSurfaceTests(unittest.TestCase):
     def test_search_commands_are_message_only(self) -> None:
         command_names = {command.name for command in bot.bot.tree.get_commands()}
@@ -883,7 +1086,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         gate = asyncio.Event()
         state.autoplay_task = asyncio.create_task(gate.wait())
 
-        bot.stop_playback(state)
+        bot.stop_playback(state, 0)
         await asyncio.sleep(0)
 
         self.assertTrue(state.autoplay_enabled)
@@ -1099,6 +1302,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         for state in bot.music_states.values():
             bot.cancel_autoplay_refill(state)
+            bot.cancel_lyrics_publish(state)
             if state.advance_task and not state.advance_task.done():
                 state.advance_task.cancel()
         await asyncio.sleep(0)
@@ -1155,6 +1359,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot.discord, "FFmpegPCMAudio", return_value=object()),
             patch.object(bot.discord, "PCMVolumeTransformer", return_value=object()),
             patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+            patch.object(bot, "schedule_lyrics_publish") as schedule_lyrics,
         ):
             first_task, first_created = bot.schedule_play_next(guild_id, announce=False)
             second_task, second_created = bot.schedule_play_next(guild_id, announce=False)
@@ -1167,6 +1372,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(state.queue), [second])
         self.assertIn(bot.normalize_track_key(first), state.recent_track_keys)
         schedule_refill.assert_called_once_with(guild_id)
+        schedule_lyrics.assert_called_once_with(guild_id, first)
 
     async def test_fresh_stream_url_is_reused(self) -> None:
         track = make_track("fresh")

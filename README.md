@@ -12,6 +12,7 @@ Python 기반 디스코드 음악 봇입니다. 슬래시 명령어로 제어할
 - 곡명과 `auto` 시드는 일반 YouTube 검색을 공통으로 사용
 - YouTube 재생목록 링크를 보내면 여러 곡을 한 번에 대기열에 추가
 - 전용 채널에 항상 유지되는 컨트롤 패널에서 재생 상태와 다음 곡을 확인하고 재생/일시정지, 스킵, 정지, 반복, 셔플, 대기열 관리
+- 현재 곡의 원문 가사를 별도 메시지로 자동 표시하고 곡이 바뀌면 같은 메시지를 갱신
 - 음성 채널에서 사람이 모두 나가면 재생과 대기열을 정리하고 자동 퇴장
 - `/join` 현재 음성 채널에 입장
 - 곡 검색과 추가는 전용 채널 메시지로만 처리
@@ -93,6 +94,8 @@ Copy-Item .env.example .env
 MUSIC_CHANNEL_SILENT=true
 MUSIC_CHANNEL_DELETE_REQUESTS=true
 MUSIC_FEEDBACK_DELETE_SECONDS=10
+LYRICS_API_URL=https://lrclib.net/api/search
+LYRICS_REQUEST_TIMEOUT_SECONDS=10
 # YOUTUBE_COOKIES_FILE=./cookies.txt
 YTDL_EXTRACT_TIMEOUT_SECONDS=45
 YTDL_MAX_CONCURRENT_EXTRACTIONS=1
@@ -112,6 +115,8 @@ BOT_VOLUME=0.2
 `MUSIC_CHANNEL_DELETE_REQUESTS=true`이면 전용 채널에서 사용자가 보낸 곡 신청 메시지를 처리 후 삭제합니다. 검색 실패나 음성 채널 미입장처럼 재생을 시작하지 못한 경우에도 요청 메시지는 정리됩니다.
 
 `MUSIC_FEEDBACK_DELETE_SECONDS=10`이면 메시지로 곡을 신청했을 때 나오는 임시 추가 확인 메시지를 10초 뒤 삭제합니다. 슬래시 명령어 응답은 기존처럼 신청자에게만 보입니다.
+
+곡이 재생되기 시작하면 LRCLIB에서 현재 곡을 찾아 전용 채널에 별도의 가사 메시지를 자동으로 보냅니다. 이후 곡이 바뀔 때는 같은 메시지의 내용을 수정하며, 재생목록이 완전히 끝나거나 정지·퇴장할 때 삭제합니다. 번역이나 로마자 변환은 하지 않고 원문을 그대로 사용합니다. Discord 메시지 길이 제한을 넘는 가사는 같은 메시지의 UTF-8 텍스트 파일로 전체 원문을 첨부합니다. 검색 결과가 없거나 연주곡이거나 조회에 실패하면 `미제공`으로 표시합니다. `LYRICS_REQUEST_TIMEOUT_SECONDS`는 가사 조회를 기다리는 최대 시간입니다.
 
 `YTDL_MIN_INTERVAL_SECONDS=6`은 모든 실제 yt-dlp 작업 사이에 최소 6초를 둡니다. 같은 검색은 `YTDL_CACHE_TTL_SECONDS` 동안 메모리에서 재사용합니다. 429 또는 봇 확인 오류가 감지되면 `YOUTUBE_CIRCUIT_BREAKER_SECONDS` 동안 새 YouTube 요청을 즉시 거절해 차단을 더 악화시키지 않습니다. 자동재생 검색 실패도 1분, 2분, 5분, 15분, 30분 순서로 간격을 늘려 재시도합니다.
 
