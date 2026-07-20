@@ -428,6 +428,56 @@ class LyricsLookupTests(unittest.TestCase):
 
         self.assertIs(selected, matching_record)
 
+    def test_native_script_beats_nearby_romanized_duplicate(self) -> None:
+        romanized_record = {
+            "trackName": "Sparkle - movie ver.",
+            "artistName": "RADWIMPS",
+            "duration": 538,
+            "instrumental": False,
+            "plainLyrics": "Mada kono sekai wa boku o kainarashi tetai mitai da",
+        }
+        japanese_record = {
+            "trackName": "Sparkle (movie ver.)",
+            "artistName": "RADWIMPS",
+            "duration": 535,
+            "instrumental": False,
+            "plainLyrics": "まだこの世界は僕を飼いならしてたいみたいだ",
+        }
+
+        selected = bot.select_lyrics_record(
+            [romanized_record, japanese_record],
+            "Sparkle - movie ver.",
+            "RADWIMPS",
+            538,
+        )
+
+        self.assertIs(selected, japanese_record)
+
+    def test_native_script_preference_does_not_override_distant_match(self) -> None:
+        exact_english_record = {
+            "trackName": "Original English Song",
+            "artistName": "Artist",
+            "duration": 200,
+            "instrumental": False,
+            "plainLyrics": "This is the original English lyric",
+        }
+        unrelated_native_record = {
+            "trackName": "Original English Song translated version",
+            "artistName": "Artist",
+            "duration": 200,
+            "instrumental": False,
+            "plainLyrics": "これは別の候補です",
+        }
+
+        selected = bot.select_lyrics_record(
+            [exact_english_record, unrelated_native_record],
+            "Original English Song",
+            "Artist",
+            200,
+        )
+
+        self.assertIs(selected, exact_english_record)
+
     def test_instrumental_record_is_treated_as_unavailable(self) -> None:
         self.assertIsNone(
             bot.extract_original_lyrics(

@@ -136,6 +136,8 @@ LYRICS_REQUEST_TIMEOUT_SECONDS = parse_positive_int_env(
     "LYRICS_REQUEST_TIMEOUT_SECONDS", 10
 )
 LYRICS_INLINE_LIMIT = 3900
+LYRICS_NATIVE_SCRIPT_MIN_RATIO = 0.3
+LYRICS_NATIVE_SCRIPT_SCORE_WINDOW = 20
 YTDL_EXTRACT_TIMEOUT_SECONDS = parse_positive_int_env("YTDL_EXTRACT_TIMEOUT_SECONDS", 45)
 YTDL_MAX_CONCURRENT_EXTRACTIONS = parse_positive_int_env(
     "YTDL_MAX_CONCURRENT_EXTRACTIONS", 1
@@ -1451,6 +1453,19 @@ def normalize_lyrics_match_text(value: str) -> str:
     return normalize_identity_component(clean_track_title(value))
 
 
+def lyrics_native_script_ratio(record: dict) -> float:
+    lyrics = extract_original_lyrics(record) or ""
+    letters = [character for character in lyrics if character.isalpha()]
+    if not letters:
+        return 0.0
+
+    non_latin_letters = sum(
+        "LATIN" not in unicodedata.name(character, "")
+        for character in letters
+    )
+    return non_latin_letters / len(letters)
+
+
 def lyrics_record_score(
     record: dict,
     track_name: str,
@@ -1509,14 +1524,33 @@ def select_lyrics_record(
     artist_name: str | None,
     duration: int | None,
 ) -> dict | None:
-    best_record: dict | None = None
-    best_score = -1
+    scored_records: list[tuple[dict, int]] = []
     for record in records:
         score = lyrics_record_score(record, track_name, artist_name, duration)
-        if score is not None and score > best_score:
-            best_record = record
-            best_score = score
-    return best_record
+        if score is not None:
+            scored_records.append((record, score))
+
+    if not scored_records:
+        return None
+
+    best_score = max(score for _, score in scored_records)
+    close_matches = [
+        (record, score)
+        for record, score in scored_records
+        if score >= best_score - LYRICS_NATIVE_SCRIPT_SCORE_WINDOW
+    ]
+    native_script_matches: list[tuple[dict, int, float]] = []
+    for record, score in close_matches:
+        native_script_ratio = lyrics_native_script_ratio(record)
+        if native_script_ratio >= LYRICS_NATIVE_SCRIPT_MIN_RATIO:
+            native_script_matches.append((record, score, native_script_ratio))
+    if native_script_matches:
+        return max(
+            native_script_matches,
+            key=lambda candidate: (candidate[1], candidate[2]),
+        )[0]
+
+    return max(scored_records, key=lambda candidate: candidate[1])[0]
 
 
 def request_lyrics_records(track_name: str, artist_name: str | None) -> list[dict]:
