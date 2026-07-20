@@ -499,6 +499,108 @@ class LyricsLookupTests(unittest.TestCase):
         request.assert_not_called()
 
 
+class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
+    def test_json3_manual_subtitles_are_converted_to_plain_lyrics(self) -> None:
+        payload = json.dumps(
+            {
+                "events": [
+                    {"segs": [{"utf8": "君の声が"}, {"utf8": "聞こえる"}]},
+                    {"segs": [{"utf8": "夜を越えて"}]},
+                    {"segs": [{"utf8": "夜を越えて"}]},
+                ]
+            }
+        )
+
+        self.assertEqual(
+            bot.extract_json3_lyrics(payload),
+            "君の声が聞こえる\n夜を越えて",
+        )
+
+    def test_invalid_json3_document_is_rejected(self) -> None:
+        with self.assertRaises(bot.YouTubeSubtitleError):
+            bot.extract_json3_lyrics("[]")
+
+    def test_vtt_manual_subtitles_drop_timestamps_and_markup(self) -> None:
+        payload = (
+            "WEBVTT\n\n"
+            "00:00:01.000 --> 00:00:03.000\n"
+            "<c>First &amp; second</c>\n\n"
+            "00:00:03.000 --> 00:00:05.000\n"
+            "Next line\n"
+        )
+
+        self.assertEqual(
+            bot.extract_vtt_lyrics(payload),
+            "First & second\nNext line",
+        )
+
+    def test_original_language_manual_subtitle_is_preferred(self) -> None:
+        track = make_track("captioned")
+        track.subtitle_language = "ja"
+        track.manual_subtitles = {
+            "en": [{"ext": "json3", "url": "https://example.com/en"}],
+            "ja": [{"ext": "vtt", "url": "https://example.com/ja"}],
+        }
+
+        self.assertEqual(
+            bot.select_manual_subtitle(track),
+            ("ja", "vtt", "https://example.com/ja"),
+        )
+
+    def test_track_keeps_manual_but_not_automatic_caption_metadata(self) -> None:
+        track = bot.make_track_from_info(
+            {
+                "id": "captions001",
+                "title": "Captioned song",
+                "webpage_url": "https://www.youtube.com/watch?v=captions001",
+                "subtitles": {
+                    "ja": [{"ext": "json3", "url": "https://example.com/manual"}]
+                },
+                "automatic_captions": {
+                    "en": [{"ext": "json3", "url": "https://example.com/auto"}]
+                },
+                "language": "ja",
+            },
+            "tester",
+            "https://www.youtube.com/watch?v=captions001",
+        )
+
+        self.assertEqual(set(track.manual_subtitles), {"ja"})
+        self.assertEqual(track.subtitle_language, "ja")
+
+    async def test_lrclib_miss_falls_back_to_youtube_manual_subtitles(self) -> None:
+        track = make_track("fallback")
+        with (
+            patch.object(bot, "lookup_track_lyrics", return_value=None),
+            patch.object(
+                bot,
+                "get_youtube_manual_lyrics",
+                new=AsyncMock(return_value="manual captions"),
+            ) as youtube_lookup,
+        ):
+            lyrics = await bot.get_track_lyrics(track)
+
+        self.assertEqual(lyrics, "manual captions")
+        self.assertEqual(track.lyrics_source, "YouTube 수동 자막")
+        youtube_lookup.assert_awaited_once_with(track)
+
+    async def test_lrclib_hit_does_not_request_youtube_subtitles(self) -> None:
+        track = make_track("lrclib")
+        with (
+            patch.object(bot, "lookup_track_lyrics", return_value="lrclib lyrics"),
+            patch.object(
+                bot,
+                "get_youtube_manual_lyrics",
+                new=AsyncMock(),
+            ) as youtube_lookup,
+        ):
+            lyrics = await bot.get_track_lyrics(track)
+
+        self.assertEqual(lyrics, "lrclib lyrics")
+        self.assertEqual(track.lyrics_source, "LRCLIB")
+        youtube_lookup.assert_not_awaited()
+
+
 class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         for state in bot.music_states.values():

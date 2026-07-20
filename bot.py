@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import html
 import io
 import json
 import itertools
@@ -135,6 +136,12 @@ LYRICS_API_URL = os.getenv("LYRICS_API_URL", "https://lrclib.net/api/search")
 LYRICS_REQUEST_TIMEOUT_SECONDS = parse_positive_int_env(
     "LYRICS_REQUEST_TIMEOUT_SECONDS", 10
 )
+YOUTUBE_LYRICS_FALLBACK = os.getenv("YOUTUBE_LYRICS_FALLBACK", "true").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 LYRICS_INLINE_LIMIT = 3900
 LYRICS_NATIVE_SCRIPT_MIN_RATIO = 0.3
 LYRICS_NATIVE_SCRIPT_SCORE_WINDOW = 20
@@ -483,6 +490,9 @@ class Track:
     stream_resolved_at: float | None = None
     lyrics: str | None = None
     lyrics_loaded: bool = False
+    lyrics_source: str | None = None
+    manual_subtitles: dict[str, list[dict]] = field(default_factory=dict)
+    subtitle_language: str | None = None
     track_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
@@ -857,7 +867,8 @@ def make_lyrics_embed(track: Track, description: str) -> discord.Embed:
     if artist:
         embed.set_author(name=truncate_text(artist, 200))
 
-    embed.set_footer(text="LRCLIB · 원문 가사")
+    source = track.lyrics_source or "LRCLIB → YouTube 수동 자막"
+    embed.set_footer(text=f"{source} · 원문 가사")
     return embed
 
 
@@ -1410,6 +1421,10 @@ class LyricsLookupError(RuntimeError):
     pass
 
 
+class YouTubeSubtitleError(RuntimeError):
+    pass
+
+
 def get_lyrics_search_terms(track: Track) -> tuple[str, str | None]:
     cleaned_title = clean_track_title(track.song_name or track.title)
     parsed_artist: str | None = None
@@ -1600,18 +1615,180 @@ def lookup_track_lyrics(track: Track) -> str | None:
     return extract_original_lyrics(record) if record else None
 
 
+def normalize_subtitle_text(value: str) -> str:
+    return html.unescape(value).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def extract_json3_lyrics(payload: str) -> str | None:
+    try:
+        document = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise YouTubeSubtitleError("YouTube returned invalid JSON3 subtitles.") from error
+    if not isinstance(document, dict):
+        raise YouTubeSubtitleError("YouTube returned invalid JSON3 subtitles.")
+
+    lines: list[str] = []
+    for event in document.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        segments = event.get("segs") or []
+        text = "".join(
+            str(segment.get("utf8") or "")
+            for segment in segments
+            if isinstance(segment, dict)
+        )
+        for line in normalize_subtitle_text(text).splitlines():
+            line = line.strip()
+            if line and (not lines or line != lines[-1]):
+                lines.append(line)
+    lyrics = "\n".join(lines).strip()
+    return lyrics or None
+
+
+VTT_TIMESTAMP_LINE_RE = re.compile(
+    r"^(?:\d{2}:)?\d{2}:\d{2}[.,]\d{3}\s+-->\s+(?:\d{2}:)?\d{2}:\d{2}[.,]\d{3}"
+)
+VTT_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def extract_vtt_lyrics(payload: str) -> str | None:
+    lines: list[str] = []
+    skip_block = False
+    for raw_line in normalize_subtitle_text(payload).splitlines():
+        line = raw_line.strip()
+        if line.startswith(("NOTE", "STYLE", "REGION")):
+            skip_block = True
+            continue
+        if not line:
+            skip_block = False
+            continue
+        if skip_block or line == "WEBVTT" or VTT_TIMESTAMP_LINE_RE.match(line):
+            continue
+        if line.isdigit():
+            continue
+        line = normalize_subtitle_text(VTT_TAG_RE.sub("", line))
+        if line and (not lines or line != lines[-1]):
+            lines.append(line)
+    lyrics = "\n".join(lines).strip()
+    return lyrics or None
+
+
+def select_manual_subtitle(track: Track) -> tuple[str, str, str] | None:
+    preferred_language = (track.subtitle_language or "").casefold()
+    candidates: list[tuple[int, str, str, str]] = []
+    format_scores = {"json3": 30, "vtt": 20}
+
+    for language, formats in track.manual_subtitles.items():
+        if not isinstance(formats, list):
+            continue
+        language_key = str(language).casefold()
+        language_score = 0
+        if preferred_language and (
+            language_key == preferred_language
+            or language_key.split("-", 1)[0] == preferred_language.split("-", 1)[0]
+        ):
+            language_score += 100
+        if language_key.endswith("-orig"):
+            language_score += 50
+
+        for subtitle_format in formats:
+            if not isinstance(subtitle_format, dict):
+                continue
+            extension = str(subtitle_format.get("ext") or "").casefold()
+            url = subtitle_format.get("url")
+            if extension not in format_scores or not isinstance(url, str) or not url:
+                continue
+            candidates.append(
+                (language_score + format_scores[extension], str(language), extension, url)
+            )
+
+    if not candidates:
+        return None
+    _, language, extension, url = max(candidates, key=lambda candidate: candidate[0])
+    return language, extension, url
+
+
+def request_youtube_subtitle(url: str, extension: str) -> str | None:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 discord-music-bot/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=LYRICS_REQUEST_TIMEOUT_SECONDS,
+        ) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise YouTubeSubtitleError(str(error)) from error
+
+    if extension == "json3":
+        return extract_json3_lyrics(payload)
+    if extension == "vtt":
+        return extract_vtt_lyrics(payload)
+    return None
+
+
+async def get_youtube_manual_lyrics(track: Track) -> str | None:
+    if not YOUTUBE_LYRICS_FALLBACK or track.is_local:
+        return None
+
+    selected = select_manual_subtitle(track)
+    if selected is None:
+        return None
+    language, extension, url = selected
+
+    ensure_youtube_circuit_closed()
+    try:
+        await asyncio.wait_for(
+            ytdl_semaphore.acquire(),
+            timeout=LYRICS_REQUEST_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as error:
+        raise YouTubeSubtitleError("Timed out waiting to fetch YouTube subtitles.") from error
+
+    try:
+        ensure_youtube_circuit_closed()
+        await wait_for_ytdl_interval()
+        lyrics = await asyncio.wait_for(
+            asyncio.to_thread(request_youtube_subtitle, url, extension),
+            timeout=LYRICS_REQUEST_TIMEOUT_SECONDS + 2,
+        )
+    except Exception as error:
+        trip_youtube_circuit(error)
+        if isinstance(error, YouTubeCircuitOpenError):
+            raise
+        raise YouTubeSubtitleError(str(error)) from error
+    finally:
+        ytdl_semaphore.release()
+
+    if lyrics:
+        logger.info("YouTube manual subtitles selected for %s (%s)", track.title, language)
+    return lyrics
+
+
 async def get_track_lyrics(track: Track) -> str | None:
     if track.lyrics_loaded:
         return track.lyrics
 
+    lyrics: str | None = None
     try:
         lyrics = await asyncio.wait_for(
             asyncio.to_thread(lookup_track_lyrics, track),
             timeout=LYRICS_REQUEST_TIMEOUT_SECONDS + 2,
         )
     except (asyncio.TimeoutError, LyricsLookupError) as error:
-        logger.warning("Lyrics lookup failed for %s: %s", track.title, error)
-        return None
+        logger.warning("LRCLIB lookup failed for %s: %s", track.title, error)
+
+    if lyrics:
+        track.lyrics_source = "LRCLIB"
+    else:
+        try:
+            lyrics = await get_youtube_manual_lyrics(track)
+        except (asyncio.TimeoutError, YouTubeSubtitleError, YouTubeCircuitOpenError) as error:
+            logger.warning("YouTube subtitle lookup failed for %s: %s", track.title, error)
+        if lyrics:
+            track.lyrics_source = "YouTube 수동 자막"
 
     track.lyrics = lyrics
     track.lyrics_loaded = True
@@ -1775,6 +1952,18 @@ async def publish_current_lyrics(guild_id: int, track: Track) -> None:
             state.lyrics_task = None
 
 
+def get_manual_subtitles(info: dict) -> dict[str, list[dict]]:
+    subtitles = info.get("subtitles")
+    if not isinstance(subtitles, dict):
+        return {}
+
+    return {
+        str(language): [copy.deepcopy(item) for item in formats if isinstance(item, dict)]
+        for language, formats in subtitles.items()
+        if isinstance(formats, list)
+    }
+
+
 def make_track_from_info(
     info: dict,
     requester: str,
@@ -1795,6 +1984,8 @@ def make_track_from_info(
         artist=info.get("artist") or info.get("creator"),
         song_name=info.get("track") or info.get("alt_title"),
         uploader=info.get("uploader") or info.get("channel"),
+        manual_subtitles=get_manual_subtitles(info),
+        subtitle_language=info.get("language") or info.get("original_language"),
         stream_resolved_at=(
             info.get("_music_bot_extracted_at", time.monotonic())
             if stream_url
@@ -1941,6 +2132,10 @@ async def resolve_track_stream(track: Track) -> None:
     track.artist = info.get("artist") or info.get("creator") or track.artist
     track.song_name = info.get("track") or info.get("alt_title") or track.song_name
     track.uploader = info.get("uploader") or info.get("channel") or track.uploader
+    track.manual_subtitles = get_manual_subtitles(info)
+    track.subtitle_language = (
+        info.get("language") or info.get("original_language") or track.subtitle_language
+    )
 
 
 def get_music_test_audio_path() -> Path | None:
