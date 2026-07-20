@@ -145,6 +145,7 @@ YOUTUBE_LYRICS_FALLBACK = os.getenv("YOUTUBE_LYRICS_FALLBACK", "true").lower() n
 LYRICS_INLINE_LIMIT = 3900
 LYRICS_NATIVE_SCRIPT_MIN_RATIO = 0.3
 LYRICS_NATIVE_SCRIPT_SCORE_WINDOW = 20
+LYRICS_DURATION_MATCH_TOLERANCE_SECONDS = 8
 YTDL_EXTRACT_TIMEOUT_SECONDS = parse_positive_int_env("YTDL_EXTRACT_TIMEOUT_SECONDS", 45)
 YTDL_MAX_CONCURRENT_EXTRACTIONS = parse_positive_int_env(
     "YTDL_MAX_CONCURRENT_EXTRACTIONS", 1
@@ -1425,14 +1426,30 @@ class YouTubeSubtitleError(RuntimeError):
     pass
 
 
+QUOTED_TRACK_TITLE_RE = re.compile(
+    r"^\s*(?P<artist>.+?)\s*[「『](?P<title>[^」』]+)[」』]"
+)
+
+
 def get_lyrics_search_terms(track: Track) -> tuple[str, str | None]:
-    cleaned_title = clean_track_title(track.song_name or track.title)
     parsed_artist: str | None = None
-    song_name = cleaned_title
-    if track.song_name is None:
+    raw_title = track.song_name or track.title
+    quoted_match = (
+        QUOTED_TRACK_TITLE_RE.match(raw_title)
+        if track.song_name is None
+        else None
+    )
+    if quoted_match:
+        parsed_artist = quoted_match.group("artist")
+        song_name = clean_track_title(quoted_match.group("title"))
+    else:
+        cleaned_title = clean_track_title(raw_title)
+        song_name = cleaned_title
+
+    if track.song_name is None and quoted_match is None:
         title_parts = re.split(
             r"\s+(?:-|–|—|\|)\s+",
-            cleaned_title,
+            song_name,
             maxsplit=1,
         )
         if len(title_parts) == 2:
@@ -1495,7 +1512,8 @@ def lyrics_record_score(
     if not expected_title or not candidate_title:
         return None
 
-    if candidate_title == expected_title:
+    title_is_exact = candidate_title == expected_title
+    if title_is_exact:
         score = 100
     elif (
         len(expected_title) >= 4
@@ -1505,29 +1523,38 @@ def lyrics_record_score(
     else:
         return None
 
+    candidate_duration = record.get("duration")
+    duration_difference = (
+        abs(float(candidate_duration) - duration)
+        if duration is not None and isinstance(candidate_duration, (int, float))
+        else None
+    )
+    title_and_duration_match = (
+        title_is_exact
+        and duration_difference is not None
+        and duration_difference <= LYRICS_DURATION_MATCH_TOLERANCE_SECONDS
+    )
+
     if artist_name:
         expected_artist = normalize_artist_name(artist_name)
         candidate_artist = normalize_artist_name(str(record.get("artistName") or ""))
-        if not candidate_artist:
-            return None
         if candidate_artist == expected_artist:
             score += 80
         elif (
-            len(expected_artist) >= 3
+            candidate_artist
+            and len(expected_artist) >= 3
             and (expected_artist in candidate_artist or candidate_artist in expected_artist)
         ):
             score += 25
-        else:
+        elif not title_and_duration_match:
             return None
 
-    candidate_duration = record.get("duration")
-    if duration is not None and isinstance(candidate_duration, (int, float)):
-        difference = abs(float(candidate_duration) - duration)
-        if difference <= 2:
+    if duration_difference is not None:
+        if duration_difference <= 2:
             score += 40
-        elif difference <= 8:
+        elif duration_difference <= 8:
             score += 20
-        elif difference <= 20:
+        elif duration_difference <= 20:
             score += 5
 
     return score
@@ -1612,6 +1639,19 @@ def lookup_track_lyrics(track: Track) -> str | None:
         artist_name,
         track.duration,
     )
+    if record is None and artist_name:
+        records = request_lyrics_records(track_name, None)
+        record = select_lyrics_record(
+            records,
+            track_name,
+            artist_name,
+            track.duration,
+        )
+        if record is not None:
+            logger.info(
+                "LRCLIB title-only retry matched lyrics for %s",
+                track.title,
+            )
     return extract_original_lyrics(record) if record else None
 
 

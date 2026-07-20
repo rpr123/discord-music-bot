@@ -363,6 +363,24 @@ class TrackIdentityTests(unittest.TestCase):
 
 
 class LyricsLookupTests(unittest.TestCase):
+    def test_japanese_quoted_title_ignores_official_label_and_english_alias(self) -> None:
+        track = bot.Track(
+            title=(
+                "初星学園 「白線」Official Music Video "
+                "(HATSUBOSHI GAKUEN - Hakusen)"
+            ),
+            webpage_url="https://www.youtube.com/watch?v=m4VahiqP9vA",
+            requester="tester",
+            source_url="https://www.youtube.com/watch?v=m4VahiqP9vA",
+            uploader="HATSUBOSHI GAKUEN",
+            duration=218,
+        )
+
+        self.assertEqual(
+            bot.get_lyrics_search_terms(track),
+            ("白線", "初星学園"),
+        )
+
     def test_search_terms_use_song_title_and_artist_in_original_script(self) -> None:
         track = bot.Track(
             title="back number - ブルーアンバー 【Official Music Video】",
@@ -427,6 +445,71 @@ class LyricsLookupTests(unittest.TestCase):
         )
 
         self.assertIs(selected, matching_record)
+
+    def test_exact_title_and_duration_allow_a_different_artist_label(self) -> None:
+        record = {
+            "trackName": "Blue Amber",
+            "artistName": "バックナンバー",
+            "duration": 224,
+            "instrumental": False,
+            "plainLyrics": "correct",
+        }
+
+        selected = bot.select_lyrics_record(
+            [record],
+            "Blue Amber",
+            "back number",
+            220,
+        )
+
+        self.assertIs(selected, record)
+
+    def test_artist_mismatch_is_rejected_when_duration_is_not_close(self) -> None:
+        record = {
+            "trackName": "Blue Amber",
+            "artistName": "Different Artist",
+            "duration": 240,
+            "instrumental": False,
+            "plainLyrics": "wrong",
+        }
+
+        selected = bot.select_lyrics_record(
+            [record],
+            "Blue Amber",
+            "back number",
+            220,
+        )
+
+        self.assertIsNone(selected)
+
+    def test_lookup_retries_without_artist_when_strict_search_misses(self) -> None:
+        track = bot.Track(
+            title="Artist - Exact Song",
+            webpage_url="https://www.youtube.com/watch?v=retrylyrics",
+            requester="tester",
+            source_url="https://www.youtube.com/watch?v=retrylyrics",
+            duration=180,
+        )
+        record = {
+            "trackName": "Exact Song",
+            "artistName": "Artist feat. Guest",
+            "duration": 181,
+            "instrumental": False,
+            "plainLyrics": "found on retry",
+        }
+
+        with patch.object(
+            bot,
+            "request_lyrics_records",
+            side_effect=[[], [record]],
+        ) as request:
+            lyrics = bot.lookup_track_lyrics(track)
+
+        self.assertEqual(lyrics, "found on retry")
+        self.assertEqual(
+            [call.args for call in request.call_args_list],
+            [("exact song", "artist"), ("exact song", None)],
+        )
 
     def test_native_script_beats_nearby_romanized_duplicate(self) -> None:
         romanized_record = {
