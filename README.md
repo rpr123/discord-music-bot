@@ -41,7 +41,7 @@ Python 기반 디스코드 음악 봇입니다. 슬래시 명령어로 제어할
 ## 설치
 
 ```powershell
-cd C:\Users\정동환\Documents\Codex\discord-music-bot
+cd C:\path\to\discord-music-bot
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
