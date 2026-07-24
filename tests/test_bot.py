@@ -1249,12 +1249,12 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
     def test_explicit_readings_accept_common_bracket_styles(self) -> None:
         tokenizer = self.FakeTokenizer()
         examples = {
-            "運命(さだめ)": "さだめ",
-            "運命（さだめ）": "さだめ",
-            "運命[さだめ]": "さだめ",
-            "運命【さだめ】": "さだめ",
-            "運命《サダメ》": "さだめ",
-            "｜超電磁砲《レールガン》": "れーるがん",
+            "運命(さだめ)": "運命(さだめ)",
+            "運命（さだめ）": "運命(さだめ)",
+            "運命[さだめ]": "運命(さだめ)",
+            "運命【さだめ】": "運命(さだめ)",
+            "運命《サダメ》": "運命(さだめ)",
+            "｜超電磁砲《レールガン》": "超電磁砲(れーるがん)",
         }
 
         for source, expected in examples.items():
@@ -1275,8 +1275,23 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
             bot.replace_explicit_readings("愛してる(ああ)", self.FakeTokenizer()),
             "愛してる(ああ)",
         )
-        self.assertEqual(bot.token_to_hiragana("(", "キゴウ"), "(")
-        self.assertEqual(bot.token_to_hiragana("Oh", "オー"), "Oh")
+        self.assertEqual(bot.annotate_token_reading("(", "キゴウ"), "(")
+        self.assertEqual(bot.annotate_token_reading("Oh", "オー"), "Oh")
+
+    def test_dictionary_readings_are_added_after_kanji(self) -> None:
+        examples = {
+            ("運命", "ウンメイ"): "運命(うんめい)",
+            ("礼を持って", "レイヲモッテ"): "礼(れい)を持(も)って",
+            ("取り戻す", "トリモドス"): "取(と)り戻(もど)す",
+            ("かなだけ", "カナダケ"): "かなだけ",
+        }
+
+        for (surface, reading), expected in examples.items():
+            with self.subTest(surface=surface):
+                self.assertEqual(
+                    bot.annotate_token_reading(surface, reading),
+                    expected,
+                )
 
     def test_explicit_reading_overrides_dictionary_reading(self) -> None:
         tokenizer = self.FakeTokenizer()
@@ -1284,7 +1299,7 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, "get_sudachi_tokenizer", return_value=tokenizer):
             reading = bot.generate_hiragana_lyrics("未来(あした)")
 
-        self.assertEqual(reading, "あした")
+        self.assertEqual(reading, "未来(あした)")
 
     def test_variant_view_only_shows_modes_available_for_the_track(self) -> None:
         japanese_track = make_track("Japanese")
@@ -1377,10 +1392,7 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
         track = make_track("Foreign song")
         track.namuwiki_lyrics_checked = True
 
-        with (
-            patch.object(bot, "LYRICS_TRANSLATION_ENABLED", True),
-            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
-        ):
+        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True):
             self.assertFalse(bot.can_show_korean_lyrics(track, "foreign lyrics"))
 
     def test_korean_lyrics_button_is_available_when_original_lyrics_are_missing(
@@ -1438,11 +1450,16 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
             "예를 갖추어 다시 걸어가"
         )
         track.korean_lyrics_url = "https://namu.wiki/w/example"
+        namuwiki_lyrics = track.korean_lyrics
 
         with patch.object(bot, "sudachi_dictionary", None):
             reading = await bot.get_track_hiragana_reading(track)
 
-        self.assertEqual(reading, "でいねい めいめい\nれいをもって")
+        self.assertEqual(
+            reading,
+            "泥濘(でいねい) 鳴鳴(めいめい)\n礼(れい)を持(も)って",
+        )
+        self.assertEqual(track.korean_lyrics, namuwiki_lyrics)
         self.assertEqual(track.lyrics_reading_source, "나무위키 · 일본어 독음")
         self.assertEqual(track.lyrics_reading_url, track.korean_lyrics_url)
 
@@ -1865,6 +1882,20 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(candidates[0], self.DOCUMENT)
 
+    def test_artist_qualified_document_follows_ambiguous_song_title(
+        self,
+    ) -> None:
+        track = make_track("Official髭男dism - らしさ [Official Video]")
+        track.song_name = "らしさ"
+        track.artist = "Official髭男dism"
+
+        candidates = bot.get_namuwiki_document_candidates(track)
+
+        self.assertEqual(
+            candidates[:2],
+            ["らしさ", "らしさ(Official髭男dism)"],
+        )
+
     def test_document_candidate_keeps_case_while_removing_video_label(
         self,
     ) -> None:
@@ -1970,6 +2001,49 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         )
         html_lookup.assert_called_once_with(self.PAGE_URL)
 
+    def test_artist_mismatch_uses_qualified_namuwiki_document(self) -> None:
+        track = make_track("Official髭男dism - らしさ [Official Video]")
+        track.song_name = "らしさ"
+        track.artist = "Official髭男dism"
+        wrong_document = "らしさ"
+        right_document = "らしさ(Official髭男dism)"
+        wrong_url = bot.split_namuwiki_candidate(wrong_document)[1]
+        right_url = bot.split_namuwiki_candidate(right_document)[1]
+
+        def page_with_artist(artist: str) -> str:
+            return self.HTML_FIXTURE.replace(
+                "<body>",
+                (
+                    "<body><table><tr><td>가수</td>"
+                    f"<td>{artist}</td></tr></table>"
+                ),
+            )
+
+        def request_page(page_url: str):
+            if page_url == wrong_url:
+                return page_with_artist("SUPER BEAVER"), wrong_url
+            if page_url == right_url:
+                return page_with_artist("Official髭男dism"), right_url
+            return None
+
+        with (
+            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(bot, "NAMUWIKI_API_TOKEN", None),
+            patch.object(
+                bot,
+                "request_namuwiki_html",
+                side_effect=request_page,
+            ) as html_lookup,
+        ):
+            result = bot.lookup_namuwiki_lyrics(track)
+
+        self.assertEqual(result[0], self.EXPECTED_LYRICS)
+        self.assertEqual(result[2], right_url)
+        self.assertEqual(
+            [call.args[0] for call in html_lookup.call_args_list],
+            [wrong_url, right_url],
+        )
+
     def test_existing_namuwiki_page_without_lyrics_returns_none(self) -> None:
         track = make_track(self.DOCUMENT)
         page_without_lyrics = """
@@ -2002,6 +2076,29 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         html_lookup.assert_called_once_with(self.PAGE_URL)
 
+    def test_transient_page_failure_is_reported_for_retry(self) -> None:
+        track = make_track(self.DOCUMENT)
+
+        with (
+            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(bot, "NAMUWIKI_API_TOKEN", None),
+            patch.object(
+                bot,
+                "get_namuwiki_document_candidates",
+                return_value=[self.DOCUMENT],
+            ),
+            patch.object(
+                bot,
+                "request_namuwiki_html",
+                side_effect=bot.NamuWikiLyricsError("request blocked"),
+            ),
+            self.assertRaisesRegex(
+                bot.NamuWikiLyricsError,
+                "configure NAMUWIKI_API_TOKEN",
+            ),
+        ):
+            bot.lookup_namuwiki_lyrics(track)
+
     def test_api_namumark_is_preferred_when_token_is_configured(self) -> None:
         track = make_track(self.DOCUMENT)
         with (
@@ -2019,6 +2116,48 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0], self.EXPECTED_LYRICS)
         self.assertEqual(result[2], self.PAGE_URL)
         api_lookup.assert_called_once_with(self.DOCUMENT)
+        html_lookup.assert_not_called()
+
+    def test_api_artist_mismatch_uses_qualified_document(self) -> None:
+        track = make_track("Official髭男dism - らしさ [Official Video]")
+        track.song_name = "らしさ"
+        track.artist = "Official髭男dism"
+        right_document = "らしさ(Official髭男dism)"
+        wrong_source = (
+            "|| 가수 || SUPER BEAVER ||\n" + self.NAMUMARK_FIXTURE
+        )
+        right_source = (
+            "|| 가수 || Official髭男dism ||\n" + self.NAMUMARK_FIXTURE
+        )
+
+        def request_source(document: str):
+            if document == "らしさ":
+                return wrong_source
+            if document == right_document:
+                return right_source
+            return None
+
+        with (
+            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(bot, "NAMUWIKI_API_TOKEN", "test-token"),
+            patch.object(
+                bot,
+                "request_namuwiki_api_source",
+                side_effect=request_source,
+            ) as api_lookup,
+            patch.object(bot, "request_namuwiki_html") as html_lookup,
+        ):
+            result = bot.lookup_namuwiki_lyrics(track)
+
+        self.assertEqual(result[0], self.EXPECTED_LYRICS)
+        self.assertEqual(
+            result[2],
+            bot.split_namuwiki_candidate(right_document)[1],
+        )
+        self.assertEqual(
+            [call.args[0] for call in api_lookup.call_args_list],
+            ["らしさ", right_document],
+        )
         html_lookup.assert_not_called()
 
     async def test_namuwiki_lyrics_are_cached_before_youtube_fallback(
@@ -2051,6 +2190,38 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(track.korean_lyrics_url, self.PAGE_URL)
         namuwiki_lookup.assert_called_once_with(track)
         youtube_lookup.assert_not_awaited()
+
+    async def test_transient_namuwiki_failure_is_not_cached(self) -> None:
+        track = make_track(self.DOCUMENT)
+
+        with patch.object(
+            bot,
+            "lookup_namuwiki_lyrics",
+            side_effect=bot.NamuWikiLyricsError("request blocked"),
+        ) as namuwiki_lookup:
+            first = await bot.get_track_namuwiki_lyrics(track)
+            second = await bot.get_track_namuwiki_lyrics(track)
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertFalse(track.namuwiki_lyrics_checked)
+        self.assertEqual(namuwiki_lookup.call_count, 2)
+
+    async def test_confirmed_namuwiki_miss_is_cached(self) -> None:
+        track = make_track(self.DOCUMENT)
+
+        with patch.object(
+            bot,
+            "lookup_namuwiki_lyrics",
+            return_value=None,
+        ) as namuwiki_lookup:
+            first = await bot.get_track_namuwiki_lyrics(track)
+            second = await bot.get_track_namuwiki_lyrics(track)
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertTrue(track.namuwiki_lyrics_checked)
+        namuwiki_lookup.assert_called_once_with(track)
 
     async def test_unexpected_namuwiki_failure_still_uses_youtube(
         self,

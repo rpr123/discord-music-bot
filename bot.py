@@ -182,14 +182,6 @@ LYRICS_INLINE_LIMIT = 3900
 LYRICS_NATIVE_SCRIPT_MIN_RATIO = 0.3
 LYRICS_NATIVE_SCRIPT_SCORE_WINDOW = 20
 LYRICS_DURATION_MATCH_TOLERANCE_SECONDS = 8
-LYRICS_TRANSLATION_ENABLED = os.getenv(
-    "LYRICS_TRANSLATION_ENABLED", "true"
-).lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
 NAMUWIKI_LYRICS_ENABLED = os.getenv(
     "NAMUWIKI_LYRICS_ENABLED", "true"
 ).lower() not in {
@@ -3037,18 +3029,41 @@ def parse_namumark_tables(source: str) -> list[list[list[str]]]:
     return tables
 
 
-def extract_namuwiki_lyrics_from_namumark(source: str) -> str | None:
-    return extract_namuwiki_lyrics_from_tables(parse_namumark_tables(source))
+def extract_namuwiki_primary_artist_from_tables(
+    tables: list[list[list[str]]],
+) -> str | None:
+    artist_labels = {"가수", "아티스트", "artist", "歌手"}
+    for table in tables:
+        for row in table:
+            for index, cell in enumerate(row):
+                label = normalize_identity_component(cell)
+                if label not in artist_labels:
+                    continue
+                for value in row[index + 1 :]:
+                    artist = value.strip()
+                    if artist:
+                        return artist.splitlines()[0].strip()
+    return None
 
 
-def extract_namuwiki_lyrics_from_html(source: str) -> str | None:
+def parse_namuwiki_html_tables(source: str) -> list[list[list[str]]]:
     parser = NamuWikiHTMLTableParser()
     try:
         parser.feed(source)
         parser.close()
     except Exception as error:
         raise NamuWikiLyricsError(f"Could not parse NamuWiki HTML: {error}") from error
-    return extract_namuwiki_lyrics_from_tables(parser.tables)
+    return parser.tables
+
+
+def extract_namuwiki_lyrics_from_namumark(source: str) -> str | None:
+    return extract_namuwiki_lyrics_from_tables(parse_namumark_tables(source))
+
+
+def extract_namuwiki_lyrics_from_html(source: str) -> str | None:
+    return extract_namuwiki_lyrics_from_tables(
+        parse_namuwiki_html_tables(source)
+    )
 
 
 def get_namuwiki_override(track: Track) -> str | None:
@@ -3079,8 +3094,77 @@ def get_namuwiki_override(track: Track) -> str | None:
     return None
 
 
+def get_namuwiki_track_artists(track: Track) -> list[str]:
+    artists: list[str] = []
+
+    def add(value: str | None) -> None:
+        if not value:
+            return
+        artist = unicodedata.normalize("NFKC", value).strip().strip("\"'")
+        artist = ARTIST_CHANNEL_SUFFIX_RE.sub("", artist).strip()
+        normalized = normalize_artist_name(artist)
+        if (
+            not artist
+            or not normalized
+            or "\n" in artist
+            or len(artist) > 120
+            or any(normalize_artist_name(item) == normalized for item in artists)
+        ):
+            return
+        artists.append(artist)
+
+    add(track.artist)
+    if artists:
+        return artists
+
+    quoted_match = QUOTED_TRACK_TITLE_RE.match(track.title)
+    if quoted_match:
+        add(quoted_match.group("artist"))
+    elif track.song_name:
+        title_parts = re.split(
+            r"\s+(?:-|–|—|\|)\s+",
+            track.title,
+            maxsplit=1,
+        )
+        if len(title_parts) == 2:
+            normalized_song_name = normalize_identity_component(
+                track.song_name
+            )
+            normalized_left = normalize_identity_component(title_parts[0])
+            normalized_right = normalize_identity_component(title_parts[1])
+            if normalized_song_name and normalized_song_name in normalized_right:
+                add(title_parts[0])
+            elif normalized_song_name and normalized_song_name in normalized_left:
+                add(title_parts[1])
+    return artists
+
+
+def namuwiki_artist_matches_track(track: Track, page_artist: str | None) -> bool:
+    expected_artists = get_namuwiki_track_artists(track)
+    if not expected_artists or not page_artist:
+        return True
+
+    normalized_page_artist = normalize_artist_name(page_artist)
+    if not normalized_page_artist:
+        return True
+    for expected_artist in expected_artists:
+        normalized_expected_artist = normalize_artist_name(expected_artist)
+        if normalized_expected_artist == normalized_page_artist:
+            return True
+        if (
+            min(len(normalized_expected_artist), len(normalized_page_artist)) >= 4
+            and (
+                normalized_expected_artist in normalized_page_artist
+                or normalized_page_artist in normalized_expected_artist
+            )
+        ):
+            return True
+    return False
+
+
 def get_namuwiki_document_candidates(track: Track) -> list[str]:
     candidates: list[str] = []
+    artists = get_namuwiki_track_artists(track)
 
     def add(value: str | None) -> None:
         if not value:
@@ -3095,12 +3179,20 @@ def get_namuwiki_document_candidates(track: Track) -> list[str]:
             return
         candidates.append(candidate)
 
+    def add_title(value: str | None) -> None:
+        if not value:
+            return
+        title = value.strip().strip("\"'")
+        add(title)
+        for artist in artists:
+            add(f"{title}({artist})")
+
     add(get_namuwiki_override(track))
-    add(track.song_name)
+    add_title(track.song_name)
 
     quoted_match = QUOTED_TRACK_TITLE_RE.match(track.title)
     if quoted_match:
-        add(quoted_match.group("title"))
+        add_title(quoted_match.group("title"))
 
     raw_parts = re.split(
         r"\s+(?:-|–|—|\|)\s+",
@@ -3109,17 +3201,17 @@ def get_namuwiki_document_candidates(track: Track) -> list[str]:
     )
     if len(raw_parts) == 2:
         cleaned_part = clean_track_title_preserving_case(raw_parts[1])
-        add(cleaned_part)
-        add(strip_edge_title_tags(cleaned_part))
-        add(raw_parts[1])
+        add_title(cleaned_part)
+        add_title(strip_edge_title_tags(cleaned_part))
+        add_title(raw_parts[1])
     else:
         cleaned_title = clean_track_title_preserving_case(track.title)
-        add(cleaned_title)
-        add(strip_edge_title_tags(cleaned_title))
+        add_title(cleaned_title)
+        add_title(strip_edge_title_tags(cleaned_title))
 
     track_name, _ = get_lyrics_search_terms(track)
-    add(track_name)
-    add(clean_track_title(track.title))
+    add_title(track_name)
+    add_title(clean_track_title(track.title))
     return candidates[:NAMUWIKI_MAX_DOCUMENT_CANDIDATES]
 
 
@@ -3260,6 +3352,8 @@ def lookup_namuwiki_lyrics(
         return None
 
     candidates = get_namuwiki_document_candidates(track)
+    override = get_namuwiki_override(track)
+    transient_failures: list[str] = []
     for candidate in candidates:
         try:
             document, page_url = split_namuwiki_candidate(candidate)
@@ -3284,8 +3378,12 @@ def lookup_namuwiki_lyrics(
             else:
                 if namumark:
                     try:
-                        lyrics = extract_namuwiki_lyrics_from_namumark(
-                            namumark
+                        namumark_tables = parse_namumark_tables(namumark)
+                        lyrics = extract_namuwiki_lyrics_from_tables(
+                            namumark_tables
+                        )
+                        page_artist = extract_namuwiki_primary_artist_from_tables(
+                            namumark_tables
                         )
                     except Exception as error:
                         logger.warning(
@@ -3296,6 +3394,22 @@ def lookup_namuwiki_lyrics(
                         )
                         lyrics = None
                     if lyrics:
+                        if (
+                            candidate != override
+                            and not namuwiki_artist_matches_track(
+                                track,
+                                page_artist,
+                            )
+                        ):
+                            logger.info(
+                                "NamuWiki artist mismatch for %s (%s): "
+                                "expected %s, page has %s",
+                                track.title,
+                                document,
+                                ", ".join(get_namuwiki_track_artists(track)),
+                                page_artist,
+                            )
+                            continue
                         return lyrics, "나무위키 · 원문·독음·번역", page_url
 
         try:
@@ -3307,13 +3421,18 @@ def lookup_namuwiki_lyrics(
                 document,
                 error,
             )
+            transient_failures.append(f"{document}: {error}")
             continue
         if html_result is None:
             continue
 
         page_source, final_url = html_result
         try:
-            lyrics = extract_namuwiki_lyrics_from_html(page_source)
+            html_tables = parse_namuwiki_html_tables(page_source)
+            lyrics = extract_namuwiki_lyrics_from_tables(html_tables)
+            page_artist = extract_namuwiki_primary_artist_from_tables(
+                html_tables
+            )
         except NamuWikiLyricsError as error:
             logger.warning(
                 "NamuWiki HTML parsing failed for %s (%s): %s",
@@ -3321,14 +3440,35 @@ def lookup_namuwiki_lyrics(
                 document,
                 error,
             )
+            transient_failures.append(f"{document}: {error}")
             continue
         if lyrics:
+            if (
+                candidate != override
+                and not namuwiki_artist_matches_track(track, page_artist)
+            ):
+                logger.info(
+                    "NamuWiki artist mismatch for %s (%s): expected %s, "
+                    "page has %s",
+                    track.title,
+                    document,
+                    ", ".join(get_namuwiki_track_artists(track)),
+                    page_artist,
+                )
+                continue
             logger.info(
                 "NamuWiki lyrics selected for %s (%s)",
                 track.title,
                 document,
             )
             return lyrics, "나무위키 · 원문·독음·번역", final_url
+
+    if transient_failures:
+        raise NamuWikiLyricsError(
+            "NamuWiki candidate pages could not be verified. "
+            "On hosted servers, configure NAMUWIKI_API_TOKEN. "
+            f"Last failure: {transient_failures[-1]}"
+        )
 
     if candidates:
         logger.info(
@@ -3838,9 +3978,6 @@ def lyrics_are_primarily_korean(lyrics: str) -> bool:
 
 
 def can_show_korean_lyrics(track: Track, lyrics: str) -> bool:
-    if not LYRICS_TRANSLATION_ENABLED:
-        return False
-
     lyrics = lyrics.strip()
     if lyrics and lyrics_are_primarily_korean(lyrics):
         return False
@@ -3894,7 +4031,7 @@ def extract_namuwiki_original_lyrics(value: str) -> str | None:
     return "\n".join(source_lines) if source_lines else None
 
 
-def extract_namuwiki_hiragana_reading(value: str) -> str | None:
+def extract_namuwiki_annotated_reading(value: str) -> str | None:
     groups = split_namuwiki_lyrics_groups(value)
     japanese_groups = [
         lines
@@ -3920,7 +4057,7 @@ def extract_namuwiki_hiragana_reading(value: str) -> str | None:
         )
         if reading is None:
             return None
-        readings.append(katakana_to_hiragana(reading))
+        readings.append(annotate_japanese_reading(lines[0], reading))
     return "\n".join(readings)
 
 
@@ -3938,7 +4075,7 @@ def can_generate_lyrics_reading(track: Track, lyrics: str) -> bool:
     if (
         track.korean_lyrics
         and track.korean_lyrics_url
-        and extract_namuwiki_hiragana_reading(track.korean_lyrics)
+        and extract_namuwiki_annotated_reading(track.korean_lyrics)
     ):
         return True
     return bool(
@@ -3956,6 +4093,99 @@ def katakana_to_hiragana(value: str) -> str:
         else:
             converted.append(character)
     return "".join(converted)
+
+
+def normalize_japanese_reading(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    normalized = katakana_to_hiragana(normalized)
+    return re.sub(r"\s+", " ", normalized)
+
+
+def get_reading_surface_segment_kind(character: str) -> str:
+    if JAPANESE_HAN_RE.fullmatch(character):
+        return "han"
+    if JAPANESE_KANA_RE.fullmatch(character) or character == "ー":
+        return "anchor"
+    if character.isspace():
+        return "space"
+
+    normalized = unicodedata.normalize("NFKC", character)
+    if normalized and all(
+        item.isascii() and item.isalnum() for item in normalized
+    ):
+        return "anchor"
+    return "optional"
+
+
+def split_reading_surface(surface: str) -> list[tuple[str, str]]:
+    segments: list[tuple[str, str]] = []
+    for character in surface:
+        kind = get_reading_surface_segment_kind(character)
+        if segments and segments[-1][0] == kind:
+            previous_kind, previous_text = segments[-1]
+            segments[-1] = (previous_kind, previous_text + character)
+        else:
+            segments.append((kind, character))
+    return segments
+
+
+def annotate_japanese_reading(surface: str, reading: str) -> str:
+    if not surface or not JAPANESE_HAN_RE.search(surface):
+        return surface
+
+    normalized_reading = normalize_japanese_reading(reading).strip()
+    if (
+        not normalized_reading
+        or not JAPANESE_KANA_RE.search(normalized_reading)
+    ):
+        return surface
+
+    segments = split_reading_surface(surface)
+
+    @functools.lru_cache(maxsize=None)
+    def align(segment_index: int, reading_index: int) -> tuple[str, ...] | None:
+        if segment_index == len(segments):
+            return () if reading_index == len(normalized_reading) else None
+
+        kind, text = segments[segment_index]
+        if kind == "han":
+            remaining_han_segments = sum(
+                future_kind == "han"
+                for future_kind, _ in segments[segment_index + 1 :]
+            )
+            last_reading_index = len(normalized_reading) - remaining_han_segments
+            for end in range(reading_index + 1, last_reading_index + 1):
+                candidate = normalized_reading[reading_index:end]
+                if (
+                    any(character.isspace() for character in candidate)
+                    or not JAPANESE_READING_RE.fullmatch(candidate)
+                    or not JAPANESE_KANA_RE.search(candidate)
+                ):
+                    continue
+                remainder = align(segment_index + 1, end)
+                if remainder is not None:
+                    return (f"{text}({candidate})", *remainder)
+            return None
+
+        normalized_text = normalize_japanese_reading(text)
+        matching_end = reading_index + len(normalized_text)
+        if normalized_reading.startswith(normalized_text, reading_index):
+            remainder = align(segment_index + 1, matching_end)
+            if remainder is not None:
+                return (text, *remainder)
+
+        if kind in {"optional", "space"}:
+            remainder = align(segment_index + 1, reading_index)
+            if remainder is not None:
+                return (text, *remainder)
+        return None
+
+    aligned = align(0, 0)
+    if aligned is not None:
+        return "".join(aligned)
+    if JAPANESE_READING_RE.fullmatch(normalized_reading):
+        return f"{surface}({normalized_reading})"
+    return surface
 
 
 def get_sudachi_tokenizer():
@@ -4010,7 +4240,10 @@ def find_explicit_reading_base_start(prefix: str, tokenizer) -> int | None:
     return fallback.start() if fallback else None
 
 
-def replace_explicit_readings(line: str, tokenizer) -> str:
+def find_explicit_reading_replacements(
+    line: str,
+    tokenizer,
+) -> list[tuple[int, int, str]]:
     matches: list[tuple[int, int, str]] = []
     for opening, closing in EXPLICIT_READING_BRACKETS:
         pattern = re.compile(
@@ -4025,10 +4258,7 @@ def replace_explicit_readings(line: str, tokenizer) -> str:
             if reading and JAPANESE_READING_RE.fullmatch(reading):
                 matches.append((match.start(), match.end(), reading))
 
-    if not matches:
-        return line
-
-    output: list[str] = []
+    replacements: list[tuple[int, int, str]] = []
     cursor = 0
     for opening_start, annotation_end, reading in sorted(matches):
         if opening_start < cursor:
@@ -4036,19 +4266,68 @@ def replace_explicit_readings(line: str, tokenizer) -> str:
         prefix = line[cursor:opening_start]
         base_start = find_explicit_reading_base_start(prefix, tokenizer)
         if base_start is None:
-            output.append(line[cursor:annotation_end])
-        else:
-            output.append(prefix[:base_start])
-            output.append(katakana_to_hiragana(reading))
+            continue
+
+        absolute_base_start = cursor + base_start
+        base = line[absolute_base_start:opening_start]
+        if base.startswith(("|", "｜")):
+            base = base[1:]
+        replacements.append(
+            (
+                absolute_base_start,
+                annotation_end,
+                f"{base}({normalize_japanese_reading(reading).strip()})",
+            )
+        )
         cursor = annotation_end
+    return replacements
+
+
+def replace_explicit_readings(line: str, tokenizer) -> str:
+    replacements = find_explicit_reading_replacements(line, tokenizer)
+    if not replacements:
+        return line
+
+    output: list[str] = []
+    cursor = 0
+    for start, end, replacement in replacements:
+        output.append(line[cursor:start])
+        output.append(replacement)
+        cursor = end
     output.append(line[cursor:])
     return "".join(output)
 
 
-def token_to_hiragana(surface: str, reading: str) -> str:
+def protect_explicit_readings(
+    line: str,
+    tokenizer,
+) -> tuple[str, dict[str, str]]:
+    replacements = find_explicit_reading_replacements(line, tokenizer)
+    if not replacements:
+        return line, {}
+
+    output: list[str] = []
+    protected: dict[str, str] = {}
+    cursor = 0
+    placeholder_codepoint = 0xE000
+    for start, end, replacement in replacements:
+        while chr(placeholder_codepoint) in line:
+            placeholder_codepoint += 1
+        placeholder = chr(placeholder_codepoint)
+        placeholder_codepoint += 1
+        output.append(line[cursor:start])
+        output.append(placeholder)
+        protected[placeholder] = replacement
+        cursor = end
+    output.append(line[cursor:])
+    return "".join(output), protected
+
+
+def annotate_token_reading(surface: str, reading: str) -> str:
     if (
         not reading
         or re.search(r"[A-Za-z]", surface)
+        or not JAPANESE_HAN_RE.search(surface)
         or surface.isspace()
         or all(
             unicodedata.category(character).startswith(("P", "S"))
@@ -4056,7 +4335,7 @@ def token_to_hiragana(surface: str, reading: str) -> str:
         )
     ):
         return surface
-    return katakana_to_hiragana(reading)
+    return annotate_japanese_reading(surface, reading)
 
 
 def generate_hiragana_lyrics(lyrics: str) -> str:
@@ -4064,13 +4343,16 @@ def generate_hiragana_lyrics(lyrics: str) -> str:
         tokenizer = get_sudachi_tokenizer()
         converted_lines: list[str] = []
         for line in lyrics.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-            line = replace_explicit_readings(line, tokenizer)
+            line, protected_readings = protect_explicit_readings(line, tokenizer)
             converted_tokens: list[str] = []
             for token in tokenizer.tokenize(line):
                 surface = token.surface()
                 reading = token.reading_form()
-                converted_tokens.append(token_to_hiragana(surface, reading))
-            converted_lines.append("".join(converted_tokens))
+                converted_tokens.append(annotate_token_reading(surface, reading))
+            converted_line = "".join(converted_tokens)
+            for placeholder, replacement in protected_readings.items():
+                converted_line = converted_line.replace(placeholder, replacement)
+            converted_lines.append(converted_line)
     reading_text = "\n".join(converted_lines).strip()
     if not reading_text:
         raise LyricsReadingError("Sudachi returned empty reading text.")
@@ -4120,6 +4402,7 @@ async def get_track_namuwiki_lyrics(track: Track) -> str | None:
                 track.title,
                 error,
             )
+            return None
         except Exception:
             logger.exception(
                 "Unexpected NamuWiki lyrics failure for %s",
@@ -4176,7 +4459,7 @@ async def get_track_hiragana_reading(track: Track) -> str:
             return track.lyrics_reading
 
         if track.korean_lyrics and track.korean_lyrics_url:
-            reading = extract_namuwiki_hiragana_reading(track.korean_lyrics)
+            reading = extract_namuwiki_annotated_reading(track.korean_lyrics)
             if reading:
                 track.lyrics_reading = reading
                 track.lyrics_reading_loaded = True

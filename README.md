@@ -98,7 +98,6 @@ EPHEMERAL_RESPONSE_DELETE_SECONDS=15
 QUEUE_DELETE_RESPONSE_DELETE_SECONDS=30
 LYRICS_API_URL=https://lrclib.net/api/search
 LYRICS_REQUEST_TIMEOUT_SECONDS=10
-LYRICS_TRANSLATION_ENABLED=true
 LYRICS_READING_ENABLED=true
 NAMUWIKI_LYRICS_ENABLED=true
 NAMUWIKI_PAGE_BASE_URL=https://namu.wiki/w
@@ -140,9 +139,9 @@ BOT_VOLUME=0.2
 
 원문이 한국어가 아니면 가사 메시지에 `나무위키 가사` 버튼이 표시됩니다. 외국어 곡의 원문을 LRCLIB와 YouTube에서 찾지 못해 `미제공`으로 표시된 경우에도 버튼은 남습니다. 버튼을 누른 사용자에게만 결과를 보여주며, 먼저 곡명과 같은 나무위키 문서의 가사 표에서 `원문 → 한글 독음 → 한국어 번역`의 세 줄 묶음을 순서 그대로 가져옵니다. 열로 나뉜 표와 한 셀 또는 여러 행에 세 줄씩 이어지는 표를 모두 처리하며, 접기 문구·제목 뜻·번역 없는 독음 행은 제외합니다. 성공한 결과에는 원문 문서 링크와 출처를 표시합니다. 나무위키 가사가 없고 업로더가 직접 제공한 YouTube 수동 한국어 자막만 사용할 수 있으면 버튼 이름이 `한국어 자막`으로 바뀝니다. 자동 생성 자막과 `tlang=ko` 기계 번역 자막은 사용하지 않습니다. 최초 성공 결과와 출처는 현재 곡에 캐시하며, 개인 가사 메시지는 해당 곡이 끝나거나 스킵·정지되면 바로 삭제됩니다.
 
-`NAMUWIKI_LYRICS_ENABLED=true`는 나무위키 조회를 켭니다. 기본값은 공개 문서 HTML을 `NAMUWIKI_REQUEST_INTERVAL_SECONDS` 이상의 간격으로 읽습니다. GCP처럼 공개 페이지 접근이 제한되는 환경에서는 `api_access` 권한이 있는 계정의 토큰을 `NAMUWIKI_API_TOKEN`에 넣으면 [the seed 공개 API](https://doc.theseed.io/)의 나무마크 원문을 먼저 사용합니다. 영상 제목의 아티스트 접두사와 `Official MV` 같은 표시는 자동으로 제거합니다. 그래도 문서명이 다르면 `NAMUWIKI_DOCUMENT_OVERRIDES`에 `video:YouTube영상ID` 또는 곡 식별 키와 정확한 문서명을 한 줄짜리 JSON 객체로 지정할 수 있습니다. 예를 들어 `{"video:abcdefghijk":"泥濘鳴鳴"}`처럼 설정합니다. 토큰은 `.env`에만 두고 커밋하지 마세요. `LYRICS_TRANSLATION_ENABLED=false`로 나무위키 가사 버튼 전체를, `NAMUWIKI_LYRICS_ENABLED=false`로 나무위키 조회만 끌 수 있습니다.
+`NAMUWIKI_LYRICS_ENABLED=true`는 나무위키 조회와 나무위키 가사 버튼을 켭니다. 기본값은 공개 문서 HTML을 `NAMUWIKI_REQUEST_INTERVAL_SECONDS` 이상의 간격으로 읽습니다. GCP처럼 공개 페이지 접근이 제한되는 환경에서는 `api_access` 권한이 있는 계정의 토큰을 `NAMUWIKI_API_TOKEN`에 넣으면 [the seed 공개 API](https://doc.theseed.io/)의 나무마크 원문을 먼저 사용합니다. 영상 제목의 아티스트 접두사와 `Official MV` 같은 표시는 자동으로 제거합니다. 동명곡은 맨제목 문서의 `가수` 항목을 현재 트랙과 비교하며, 다르면 `곡명(아티스트)` 문서를 이어서 확인합니다. 그래도 문서명이 다르면 `NAMUWIKI_DOCUMENT_OVERRIDES`에 `video:YouTube영상ID` 또는 곡 식별 키와 정확한 문서명을 한 줄짜리 JSON 객체로 지정할 수 있습니다. 예를 들어 `{"video:keOnleW2eak":"らしさ(Official髭男dism)"}`처럼 설정합니다. 토큰은 `.env`에만 두고 커밋하지 마세요. 예전 기계번역용 `LYRICS_TRANSLATION_ENABLED` 설정은 더 이상 사용하지 않으므로 기존 `.env`에서 삭제해도 됩니다.
 
-일본어 가사에는 `히라가나 독음` 버튼이 추가됩니다. 나무위키 3줄 가사에 일본어 독음이 있으면 그 값을 우선 사용하고, 독음이 한글 표기뿐이면 나무위키의 일본어 원문을 Sudachi로 변환합니다. LRCLIB 원문에도 같은 변환을 사용합니다. 원문에 `運命(さだめ)`, `運命（さだめ）`, `運命[さだめ]`, `運命【さだめ】`, `運命《さだめ》`, `｜超電磁砲《レールガン》`처럼 명시된 특수 독음이 있으면 사전 결과보다 우선합니다. 괄호 안이 일본어 가나이고 바로 앞에 한자가 있을 때만 독음으로 인식하므로 일반적인 괄호 속 코러스는 그대로 둡니다. `LYRICS_READING_ENABLED=false`로 독음 버튼을 끌 수 있습니다. 가사와 독음이 Discord 표시 한도를 넘으면 각각 UTF-8 텍스트 파일로 첨부합니다.
+일본어 가사에는 `히라가나 독음` 버튼이 추가됩니다. 독음 메시지는 가사를 전부 히라가나로 치환하지 않고 원문을 유지한 채 `運命(うんめい)`처럼 한자 뒤에 독음을 붙입니다. `나무위키 가사`의 3줄 구성은 바꾸지 않습니다. 나무위키 3줄 가사에 일본어 독음이 있으면 그 값을 우선 사용하고, 독음이 한글 표기뿐이면 나무위키의 일본어 원문을 Sudachi로 변환합니다. LRCLIB 원문에도 같은 변환을 사용합니다. 원문에 `運命(さだめ)`, `運命（さだめ）`, `運命[さだめ]`, `運命【さだめ】`, `運命《さだめ》`, `｜超電磁砲《レールガン》`처럼 명시된 특수 독음이 있으면 사전 결과보다 우선하며 `運命(さだめ)`, `超電磁砲(れーるがん)`처럼 표시합니다. 괄호 안이 일본어 가나이고 바로 앞에 한자가 있을 때만 독음으로 인식하므로 일반적인 괄호 속 코러스는 그대로 둡니다. `LYRICS_READING_ENABLED=false`로 독음 버튼을 끌 수 있습니다. 가사와 독음이 Discord 표시 한도를 넘으면 각각 UTF-8 텍스트 파일로 첨부합니다.
 
 `YTDL_MIN_INTERVAL_SECONDS=6`은 검색 및 스트림 해석을 수행하는 yt-dlp 작업 사이에 최소 6초를 둡니다. 가벼운 YouTube Music 메타데이터 조회는 별도의 `YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS=1`을 사용하므로 일반 검색 시작을 불필요하게 6초 동안 막지 않습니다. Music 결과와 일반 검색 결과는 `YTDL_CACHE_TTL_SECONDS` 동안 메모리에서 재사용합니다. 일반 YouTube fallback은 `YOUTUBE_SEARCH_CANDIDATES`개의 가벼운 결과에서 제목 일치도, Music에서 얻은 아티스트, 길이, `Full Version`, `Short Ver.`, `Game MV` 같은 표시를 비교해 풀 버전을 우선합니다. 선택된 영상의 스트림은 대기열에 넣을 때 미리 해석하지 않고 실제 재생 직전에 준비하므로, 대기열 추가 결과가 먼저 표시되고 오래 대기한 스트림 URL을 다시 받는 요청도 줄어듭니다. 직접 URL을 보냈거나 검색어에 `short`, `game mv`, `live`, `cover`, `off vocal` 같은 버전을 명시한 경우에는 Music 카탈로그를 건너뛰고 그 요청을 우선합니다. 후보 수는 최대 20입니다. 429 또는 봇 확인 오류가 감지되면 `YOUTUBE_CIRCUIT_BREAKER_SECONDS` 동안 새 YouTube 요청을 즉시 거절해 차단을 더 악화시키지 않습니다. 자동재생 검색 실패도 1분, 2분, 5분, 15분, 30분 순서로 간격을 늘려 재시도합니다.
 
