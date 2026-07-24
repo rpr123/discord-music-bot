@@ -48,7 +48,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-`requirements.txt`는 YouTube JavaScript 챌린지 스크립트를 포함하도록 `yt-dlp[default]`를 설치합니다. Deno도 설치한 뒤 `deno --version`으로 확인하세요. Ubuntu에서는 다음처럼 설치할 수 있습니다.
+`requirements.txt`는 YouTube JavaScript 챌린지 스크립트를 포함하도록 `yt-dlp[default]`를 설치하고, 일본어 독음 생성을 위해 `SudachiPy`와 약 70MB 크기의 `SudachiDict-core` 사전을 설치합니다. Deno도 설치한 뒤 `deno --version`으로 확인하세요. Ubuntu에서는 다음처럼 설치할 수 있습니다.
 
 ```bash
 sudo apt update
@@ -96,6 +96,15 @@ MUSIC_CHANNEL_DELETE_REQUESTS=true
 MUSIC_FEEDBACK_DELETE_SECONDS=10
 LYRICS_API_URL=https://lrclib.net/api/search
 LYRICS_REQUEST_TIMEOUT_SECONDS=10
+LYRICS_TRANSLATION_ENABLED=true
+LYRICS_READING_ENABLED=true
+NAMUWIKI_LYRICS_ENABLED=true
+NAMUWIKI_PAGE_BASE_URL=https://namu.wiki/w
+NAMUWIKI_API_BASE_URL=https://wiki-api.namu.la/api
+# NAMUWIKI_API_TOKEN=
+NAMUWIKI_REQUEST_TIMEOUT_SECONDS=10
+NAMUWIKI_REQUEST_INTERVAL_SECONDS=1.1
+# NAMUWIKI_DOCUMENT_OVERRIDES={"video:abcdefghijk":"泥濘鳴鳴"}
 # YOUTUBE_COOKIES_FILE=./cookies.txt
 YTDL_EXTRACT_TIMEOUT_SECONDS=45
 YTDL_MAX_CONCURRENT_EXTRACTIONS=1
@@ -116,7 +125,13 @@ BOT_VOLUME=0.2
 
 `MUSIC_FEEDBACK_DELETE_SECONDS=10`이면 메시지로 곡을 신청했을 때 나오는 임시 추가 확인 메시지를 10초 뒤 삭제합니다. 슬래시 명령어 응답은 기존처럼 신청자에게만 보입니다.
 
-곡이 재생되기 시작하면 LRCLIB에서 현재 곡을 찾아 전용 채널에 별도의 가사 메시지를 자동으로 보냅니다. LRCLIB에 결과가 없거나 조회에 실패하면 해당 YouTube 영상에서 제공하는 수동 자막을 한 번 더 확인하며, 자동 생성 자막은 가사로 사용하지 않습니다. 자막 정보는 재생을 위해 이미 조회한 영상 정보에서 재사용하므로 별도의 영상 재검색은 하지 않습니다. 이후 곡이 바뀔 때는 같은 메시지의 내용을 수정하며, 재생목록이 완전히 끝나거나 정지·퇴장할 때 삭제합니다. 번역이나 로마자 변환은 하지 않고 원문을 그대로 사용하며, 같은 곡의 로마자판과 원문 문자판이 함께 검색되면 원문 문자판을 우선합니다. Discord 메시지 길이 제한을 넘는 가사는 같은 메시지의 UTF-8 텍스트 파일로 전체 원문을 첨부합니다. 두 출처 모두 결과가 없거나 연주곡이거나 조회에 실패하면 `미제공`으로 표시합니다. `LYRICS_REQUEST_TIMEOUT_SECONDS`는 각 가사 조회를 기다리는 최대 시간이며, `YOUTUBE_LYRICS_FALLBACK=false`로 수동 자막 fallback을 끌 수 있습니다.
+곡이 재생되기 시작하면 LRCLIB에서 현재 곡을 찾아 전용 채널에 별도의 원문 가사 메시지를 자동으로 보냅니다. LRCLIB에 결과가 없거나 조회에 실패하면 해당 YouTube 영상에서 제공하는 수동 자막을 한 번 더 확인하며, 자동 생성 자막은 가사로 사용하지 않습니다. 자막 정보는 재생을 위해 이미 조회한 영상 정보에서 재사용하므로 별도의 영상 재검색은 하지 않습니다. 이후 곡이 바뀔 때는 같은 메시지의 내용을 수정하며, 재생목록이 완전히 끝나거나 정지·퇴장할 때 삭제합니다. 같은 곡의 로마자판과 원문 문자판이 함께 검색되면 원문 문자판을 우선합니다. Discord 메시지 길이 제한을 넘는 가사는 같은 메시지의 UTF-8 텍스트 파일로 전체 원문을 첨부합니다. 두 출처 모두 결과가 없거나 연주곡이거나 조회에 실패하면 `미제공`으로 표시합니다. `LYRICS_REQUEST_TIMEOUT_SECONDS`는 각 가사 조회를 기다리는 최대 시간이며, `YOUTUBE_LYRICS_FALLBACK=false`로 수동 자막 fallback을 끌 수 있습니다.
+
+원문이 한국어가 아니면 가사 메시지에 `한국어 번역` 버튼이 표시됩니다. 외국어 곡의 원문을 LRCLIB와 YouTube에서 찾지 못해 `미제공`으로 표시된 경우에도 번역 버튼은 남습니다. 버튼을 누른 사용자에게만 결과를 보여주며, 먼저 곡명과 같은 나무위키 문서의 가사 표에서 `한국어 번역`, `한국어 해석` 같은 열을 찾습니다. 짧은 제목 번역이나 일반 정보 표는 가사로 오인하지 않도록 제외하고, 성공한 결과에는 원문 문서 링크와 출처를 표시합니다. 나무위키에 결과가 없거나 접근에 실패하면 작성자가 제공한 YouTube 수동 한국어 자막, yt-dlp의 `tlang=ko` 자동 번역 자막 순서로 이어서 확인합니다. 최초 성공 결과와 출처는 현재 곡에 캐시합니다.
+
+`NAMUWIKI_LYRICS_ENABLED=true`는 나무위키 조회를 켭니다. 기본값은 공개 문서 HTML을 `NAMUWIKI_REQUEST_INTERVAL_SECONDS` 이상의 간격으로 읽습니다. GCP처럼 공개 페이지 접근이 제한되는 환경에서는 `api_access` 권한이 있는 계정의 토큰을 `NAMUWIKI_API_TOKEN`에 넣으면 [the seed 공개 API](https://doc.theseed.io/)의 나무마크 원문을 먼저 사용합니다. 영상 제목의 아티스트 접두사와 `Official MV` 같은 표시는 자동으로 제거합니다. 그래도 문서명이 다르면 `NAMUWIKI_DOCUMENT_OVERRIDES`에 `video:YouTube영상ID` 또는 곡 식별 키와 정확한 문서명을 한 줄짜리 JSON 객체로 지정할 수 있습니다. 예를 들어 `{"video:abcdefghijk":"泥濘鳴鳴"}`처럼 설정합니다. 토큰은 `.env`에만 두고 커밋하지 마세요. `LYRICS_TRANSLATION_ENABLED=false`로 번역 버튼 전체를, `NAMUWIKI_LYRICS_ENABLED=false`로 나무위키 조회만 끌 수 있습니다.
+
+일본어 가사에는 `히라가나 독음` 버튼이 추가됩니다. Sudachi가 일반적인 한자 독음을 만들며, 원문에 `運命(さだめ)`, `運命（さだめ）`, `運命[さだめ]`, `運命【さだめ】`, `運命《さだめ》`, `｜超電磁砲《レールガン》`처럼 명시된 특수 독음이 있으면 사전 결과보다 우선합니다. 괄호 안이 일본어 가나이고 바로 앞에 한자가 있을 때만 독음으로 인식하므로 일반적인 괄호 속 코러스는 그대로 둡니다. `LYRICS_READING_ENABLED=false`로 독음 버튼을 끌 수 있습니다. 번역과 독음이 Discord 표시 한도를 넘으면 각각 UTF-8 텍스트 파일로 첨부합니다.
 
 `YTDL_MIN_INTERVAL_SECONDS=6`은 모든 실제 yt-dlp 작업 사이에 최소 6초를 둡니다. 같은 검색은 `YTDL_CACHE_TTL_SECONDS` 동안 메모리에서 재사용합니다. 429 또는 봇 확인 오류가 감지되면 `YOUTUBE_CIRCUIT_BREAKER_SECONDS` 동안 새 YouTube 요청을 즉시 거절해 차단을 더 악화시키지 않습니다. 자동재생 검색 실패도 1분, 2분, 5분, 15분, 30분 순서로 간격을 늘려 재시도합니다.
 

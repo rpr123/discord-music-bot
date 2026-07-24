@@ -12,6 +12,7 @@ import os
 import random
 import re
 import shutil
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -20,6 +21,7 @@ import urllib.request
 import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Deque
 
@@ -27,6 +29,11 @@ import discord
 import yt_dlp
 from discord import app_commands
 from discord.ext import commands
+
+try:
+    from sudachipy import dictionary as sudachi_dictionary
+except ImportError:
+    sudachi_dictionary = None
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -125,6 +132,25 @@ def parse_volume_env(name: str, default: float) -> float:
     return volume
 
 
+def parse_string_map_env(name: str) -> dict[str, str]:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return {}
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError:
+        logger.warning("%s must be a JSON object. Ignoring its value.", name)
+        return {}
+    if not isinstance(payload, dict):
+        logger.warning("%s must be a JSON object. Ignoring its value.", name)
+        return {}
+    return {
+        str(key).strip(): str(value).strip()
+        for key, value in payload.items()
+        if str(key).strip() and str(value).strip()
+    }
+
+
 MAX_BULK_TRACKS = parse_positive_int_env("MAX_BULK_TRACKS", 50)
 MUSIC_FEEDBACK_DELETE_SECONDS = parse_positive_int_env("MUSIC_FEEDBACK_DELETE_SECONDS", 10)
 DEFAULT_AUTO_TRACKS = parse_positive_int_env("DEFAULT_AUTO_TRACKS", 8)
@@ -146,6 +172,42 @@ LYRICS_INLINE_LIMIT = 3900
 LYRICS_NATIVE_SCRIPT_MIN_RATIO = 0.3
 LYRICS_NATIVE_SCRIPT_SCORE_WINDOW = 20
 LYRICS_DURATION_MATCH_TOLERANCE_SECONDS = 8
+LYRICS_TRANSLATION_ENABLED = os.getenv(
+    "LYRICS_TRANSLATION_ENABLED", "true"
+).lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+NAMUWIKI_LYRICS_ENABLED = os.getenv(
+    "NAMUWIKI_LYRICS_ENABLED", "true"
+).lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+NAMUWIKI_PAGE_BASE_URL = os.getenv(
+    "NAMUWIKI_PAGE_BASE_URL", "https://namu.wiki/w"
+).rstrip("/")
+NAMUWIKI_API_BASE_URL = os.getenv(
+    "NAMUWIKI_API_BASE_URL", "https://wiki-api.namu.la/api"
+).rstrip("/")
+NAMUWIKI_API_TOKEN = os.getenv("NAMUWIKI_API_TOKEN", "").strip() or None
+NAMUWIKI_REQUEST_TIMEOUT_SECONDS = parse_positive_int_env(
+    "NAMUWIKI_REQUEST_TIMEOUT_SECONDS", 10
+)
+NAMUWIKI_REQUEST_INTERVAL_SECONDS = parse_nonnegative_float_env(
+    "NAMUWIKI_REQUEST_INTERVAL_SECONDS", 1.1
+)
+NAMUWIKI_DOCUMENT_OVERRIDES = parse_string_map_env("NAMUWIKI_DOCUMENT_OVERRIDES")
+LYRICS_READING_ENABLED = os.getenv("LYRICS_READING_ENABLED", "true").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 YTDL_EXTRACT_TIMEOUT_SECONDS = parse_positive_int_env("YTDL_EXTRACT_TIMEOUT_SECONDS", 45)
 YTDL_MAX_CONCURRENT_EXTRACTIONS = parse_positive_int_env(
     "YTDL_MAX_CONCURRENT_EXTRACTIONS", 1
@@ -492,7 +554,22 @@ class Track:
     lyrics: str | None = None
     lyrics_loaded: bool = False
     lyrics_source: str | None = None
+    lyrics_translation: str | None = None
+    lyrics_translation_loaded: bool = False
+    lyrics_translation_source: str | None = None
+    lyrics_translation_url: str | None = None
+    lyrics_reading: str | None = None
+    lyrics_reading_loaded: bool = False
+    lyrics_translation_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        repr=False,
+    )
+    lyrics_reading_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        repr=False,
+    )
     manual_subtitles: dict[str, list[dict]] = field(default_factory=dict)
+    korean_automatic_subtitles: dict[str, list[dict]] = field(default_factory=dict)
     subtitle_language: str | None = None
     track_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
@@ -520,6 +597,7 @@ class GuildMusicState:
     autoplay_task: asyncio.Task[None] | None = None
     lyrics_task: asyncio.Task[None] | None = None
     lyrics_message: discord.Message | None = None
+    lyrics_view: discord.ui.View | None = None
     empty_channel_task: asyncio.Task[None] | None = None
     playback_generation: int = 0
 
@@ -870,6 +948,28 @@ def make_lyrics_embed(track: Track, description: str) -> discord.Embed:
 
     source = track.lyrics_source or "LRCLIB → YouTube 수동 자막"
     embed.set_footer(text=f"{source} · 원문 가사")
+    return embed
+
+
+def make_lyrics_variant_embed(
+    track: Track,
+    label: str,
+    description: str,
+    source: str,
+    source_url: str | None = None,
+) -> discord.Embed:
+    song_title = track.song_name or track.title
+    embed = discord.Embed(
+        title=f"{label} · {truncate_text(song_title, 220)}",
+        description=description,
+        color=discord.Color.blurple(),
+    )
+    artist = track.artist or track.uploader
+    if artist:
+        embed.set_author(name=truncate_text(artist, 200))
+    if source_url:
+        embed.url = source_url
+    embed.set_footer(text=source)
     return embed
 
 
@@ -1316,6 +1416,12 @@ def get_entry_url(info: dict, fallback_url: str) -> str:
 BRACKETED_TITLE_PART_RE = re.compile(
     r"\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|【[^】]*】|（[^）]*）|［[^］]*］|「[^」]*」|『[^』]*』"
 )
+LEADING_BRACKETED_TITLE_PART_RE = re.compile(
+    r"^\s*(?:\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|【[^】]*】|（[^）]*）|［[^］]*］)\s*"
+)
+TRAILING_BRACKETED_TITLE_PART_RE = re.compile(
+    r"\s*(?:\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|【[^】]*】|（[^）]*）|［[^］]*］)\s*$"
+)
 VERSION_MARKER_RE = re.compile(
     r"\b(?:live|remix|cover|acoustic|instrumental|demo|version|edit|sped\s*up|slowed(?:\s*down)?|nightcore)\b"
     r"|라이브|리믹스|커버|어쿠스틱|인스트루멘털|데모"
@@ -1339,8 +1445,8 @@ ARTIST_CHANNEL_SUFFIX_RE = re.compile(
 )
 
 
-def clean_track_title(value: str) -> str:
-    value = unicodedata.normalize("NFKC", value).casefold()
+def clean_track_title_preserving_case(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value)
 
     def replace_bracketed_part(match: re.Match[str]) -> str:
         part = match.group(0)
@@ -1356,6 +1462,20 @@ def clean_track_title(value: str) -> str:
         previous = value
         value = NON_SONG_SUFFIX_RE.sub("", value)
     return re.sub(r"\s+", " ", value).strip()
+
+
+def clean_track_title(value: str) -> str:
+    return clean_track_title_preserving_case(value).casefold()
+
+
+def strip_edge_title_tags(value: str) -> str:
+    value = value.strip()
+    previous = None
+    while value and previous != value:
+        previous = value
+        value = LEADING_BRACKETED_TITLE_PART_RE.sub("", value)
+        value = TRAILING_BRACKETED_TITLE_PART_RE.sub("", value)
+    return value.strip()
 
 
 def normalize_identity_component(value: str) -> str:
@@ -1426,9 +1546,719 @@ class YouTubeSubtitleError(RuntimeError):
     pass
 
 
+class LyricsTranslationError(RuntimeError):
+    pass
+
+
+class NamuWikiLyricsError(RuntimeError):
+    pass
+
+
+class LyricsReadingError(RuntimeError):
+    pass
+
+
 QUOTED_TRACK_TITLE_RE = re.compile(
     r"^\s*(?P<artist>.+?)\s*[「『](?P<title>[^」』]+)[」』]"
 )
+JAPANESE_KANA_RE = re.compile(r"[\u3041-\u309f\u30a0-\u30ff]")
+JAPANESE_READING_RE = re.compile(
+    r"^[\u3041-\u309f\u30a0-\u30ff\u30fc\u3005\u30fb\uff65\s]+$"
+)
+JAPANESE_HAN_RE = re.compile(
+    r"[\u3005\u3007\u303b\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"
+)
+HANGUL_RE = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
+EXPLICIT_READING_BRACKETS = (
+    ("(", ")"),
+    ("（", "）"),
+    ("[", "]"),
+    ("［", "］"),
+    ("{", "}"),
+    ("｛", "｝"),
+    ("〈", "〉"),
+    ("《", "》"),
+    ("【", "】"),
+    ("〔", "〕"),
+)
+SUDACHI_TOKENIZER = None
+SUDACHI_TOKENIZER_LOCK = threading.Lock()
+NAMUWIKI_REQUEST_LOCK = threading.Lock()
+namuwiki_last_request_started_at = 0.0
+NAMUWIKI_MAX_DOCUMENT_CANDIDATES = 4
+NAMUWIKI_MAX_RESPONSE_BYTES = 3_000_000
+NAMUWIKI_IGNORED_HTML_TAGS = frozenset(
+    {"button", "noscript", "script", "style", "sup", "svg"}
+)
+NAMUWIKI_VOID_HTML_TAGS = frozenset(
+    {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source"}
+)
+NAMUWIKI_BLOCKED_MARKERS = (
+    "captcha 인증이 필요",
+    "로봇이 아닙니다",
+    "idc 대역 ip",
+    "ip 우회 수단",
+    "rate limit",
+    "too many requests",
+    "비정상적인 접근",
+    "차단되었습니다",
+)
+
+
+@dataclass
+class _NamuWikiHTMLTableContext:
+    rows: list[list[str]] = field(default_factory=list)
+    row: list[str] | None = None
+    cell_fragments: list[str] | None = None
+    cell_colspan: int = 1
+
+
+class NamuWikiHTMLTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: list[list[list[str]]] = []
+        self._table_stack: list[_NamuWikiHTMLTableContext] = []
+        self._ignored_tags: list[str] = []
+
+    def _current_context(self) -> _NamuWikiHTMLTableContext | None:
+        return self._table_stack[-1] if self._table_stack else None
+
+    def _append_cell_fragment(self, value: str) -> None:
+        context = self._current_context()
+        if context is not None and context.cell_fragments is not None:
+            context.cell_fragments.append(value)
+
+    def _append_cell_break(self) -> None:
+        context = self._current_context()
+        if context is None or context.cell_fragments is None:
+            return
+        if context.cell_fragments and context.cell_fragments[-1].endswith("\n"):
+            return
+        context.cell_fragments.append("\n")
+
+    def _finish_cell(self, context: _NamuWikiHTMLTableContext) -> None:
+        if context.cell_fragments is None:
+            return
+        if context.row is None:
+            context.row = []
+        text = normalize_namuwiki_table_text("".join(context.cell_fragments))
+        context.row.append(text)
+        context.row.extend("" for _ in range(max(1, context.cell_colspan) - 1))
+        context.cell_fragments = None
+        context.cell_colspan = 1
+
+    def _finish_row(self, context: _NamuWikiHTMLTableContext) -> None:
+        self._finish_cell(context)
+        if context.row is not None and any(cell for cell in context.row):
+            context.rows.append(context.row)
+        context.row = None
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        tag = tag.casefold()
+        if self._ignored_tags:
+            if tag not in NAMUWIKI_VOID_HTML_TAGS:
+                self._ignored_tags.append(tag)
+            return
+        if tag in NAMUWIKI_IGNORED_HTML_TAGS:
+            self._ignored_tags.append(tag)
+            return
+
+        if tag == "table":
+            self._table_stack.append(_NamuWikiHTMLTableContext())
+            return
+
+        context = self._current_context()
+        if context is None:
+            return
+        if tag == "tr":
+            self._finish_row(context)
+            context.row = []
+        elif tag in {"td", "th"}:
+            self._finish_cell(context)
+            context.cell_fragments = []
+            attributes = dict(attrs)
+            try:
+                context.cell_colspan = max(1, int(attributes.get("colspan") or "1"))
+            except ValueError:
+                context.cell_colspan = 1
+        elif tag == "br":
+            self._append_cell_break()
+        elif tag == "img":
+            alt_text = dict(attrs).get("alt")
+            if alt_text and not alt_text.startswith("파일:"):
+                self._append_cell_fragment(alt_text)
+        elif tag in {"div", "li", "p"}:
+            self._append_cell_break()
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if tag.casefold() in NAMUWIKI_IGNORED_HTML_TAGS:
+            return
+        self.handle_starttag(tag, attrs)
+        if tag.casefold() not in NAMUWIKI_VOID_HTML_TAGS:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.casefold()
+        if self._ignored_tags:
+            if tag == self._ignored_tags[-1]:
+                self._ignored_tags.pop()
+            return
+
+        context = self._current_context()
+        if context is None:
+            return
+        if tag in {"td", "th"}:
+            self._finish_cell(context)
+        elif tag == "tr":
+            self._finish_row(context)
+        elif tag == "table":
+            self._finish_row(context)
+            completed = self._table_stack.pop()
+            if completed.rows:
+                self.tables.append(completed.rows)
+        elif tag in {"div", "li", "p"}:
+            self._append_cell_break()
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_tags:
+            self._append_cell_fragment(data)
+
+
+def normalize_namuwiki_table_text(value: str) -> str:
+    value = html.unescape(value)
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = value.replace("\u200b", "").replace("\ufeff", "").replace("\xa0", " ")
+    normalized_lines: list[str] = []
+    for raw_line in value.split("\n"):
+        line = re.sub(r"[ \t\f\v]+", " ", raw_line).strip()
+        if line:
+            normalized_lines.append(line)
+        elif normalized_lines and normalized_lines[-1]:
+            normalized_lines.append("")
+    while normalized_lines and not normalized_lines[-1]:
+        normalized_lines.pop()
+    return "\n".join(normalized_lines).strip()
+
+
+def namuwiki_translation_header_score(value: str) -> int:
+    key = re.sub(r"[\W_]+", "", value, flags=re.UNICODE)
+    if "한국어번역" in key:
+        return 100
+    if "한국어해석" in key:
+        return 95
+    if "한국어가사" in key:
+        return 90
+    if key in {"번역", "해석", "한국어"}:
+        return 70
+    return 0
+
+
+def is_valid_korean_translation(value: str) -> bool:
+    hangul_count = sum(
+        bool(HANGUL_RE.fullmatch(character))
+        for character in value
+    )
+    nonempty_lines = [line for line in value.splitlines() if line.strip()]
+    return hangul_count >= 8 and (
+        len(nonempty_lines) >= 2 or len(value) >= 30
+    )
+
+
+def extract_interleaved_korean_lines(
+    value: str,
+) -> tuple[list[str], int, int]:
+    translated_lines: list[str] = []
+    source_line_count = 0
+    translated_group_count = 0
+    current_hangul_lines: list[str] | None = None
+
+    def finish_group() -> None:
+        nonlocal translated_group_count
+        if current_hangul_lines and len(current_hangul_lines) >= 2:
+            translated_lines.append(current_hangul_lines[-1])
+            translated_group_count += 1
+
+    for line in normalize_namuwiki_table_text(value).splitlines():
+        has_hangul = bool(HANGUL_RE.search(line))
+        has_japanese = bool(
+            JAPANESE_KANA_RE.search(line) or JAPANESE_HAN_RE.search(line)
+        )
+        if has_japanese and not has_hangul:
+            finish_group()
+            source_line_count += 1
+            current_hangul_lines = []
+        elif current_hangul_lines is not None and has_hangul:
+            current_hangul_lines.append(line)
+
+    finish_group()
+    return translated_lines, source_line_count, translated_group_count
+
+
+def extract_interleaved_korean_translation(
+    rows: list[list[str]],
+) -> str | None:
+    table_text = "\n".join(
+        cell
+        for row in rows
+        for cell in row
+    )
+    (
+        translated_lines,
+        source_line_count,
+        translated_group_count,
+    ) = extract_interleaved_korean_lines(table_text)
+
+    translation = "\n".join(translated_lines).strip()
+    if (
+        source_line_count < 3
+        or len(translated_lines) < 3
+        or translated_group_count == 0
+        or not is_valid_korean_translation(translation)
+    ):
+        return None
+    return translation
+
+
+def extract_korean_translation_from_tables(
+    tables: list[list[list[str]]],
+) -> str | None:
+    candidates: list[tuple[int, int, int, str]] = []
+    for rows in tables:
+        for header_row_index, row in enumerate(rows):
+            for column_index, header in enumerate(row):
+                header_score = namuwiki_translation_header_score(header)
+                if header_score == 0:
+                    continue
+
+                translated_cells: list[str] = []
+                for candidate_row in rows[header_row_index + 1 :]:
+                    if any(
+                        namuwiki_translation_header_score(cell) >= header_score
+                        for cell in candidate_row
+                    ):
+                        break
+                    if column_index >= len(candidate_row):
+                        continue
+                    cell = normalize_namuwiki_table_text(candidate_row[column_index])
+                    if not cell or namuwiki_translation_header_score(cell):
+                        continue
+                    translated_cells.append(cell)
+
+                translation = "\n".join(translated_cells).strip()
+                if not translation or not is_valid_korean_translation(translation):
+                    continue
+                hangul_count = sum(
+                    bool(HANGUL_RE.fullmatch(character))
+                    for character in translation
+                )
+                candidates.append(
+                    (hangul_count, header_score, len(translation), translation)
+                )
+
+        interleaved_translation = extract_interleaved_korean_translation(rows)
+        if interleaved_translation:
+            hangul_count = sum(
+                bool(HANGUL_RE.fullmatch(character))
+                for character in interleaved_translation
+            )
+            candidates.append(
+                (
+                    hangul_count,
+                    50,
+                    len(interleaved_translation),
+                    interleaved_translation,
+                )
+            )
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate[:3])[3]
+
+
+NAMUMARK_STYLE_PREFIX_RE = re.compile(r"^(?:\s*<[^>\n]*>)+")
+NAMUMARK_RUBY_RE = re.compile(
+    r"\[ruby\((?P<base>.*?),\s*ruby=.*?\)\]",
+    flags=re.IGNORECASE,
+)
+NAMUMARK_LINK_RE = re.compile(r"\[\[(?P<value>[^\]]+)\]\]")
+NAMUMARK_FOOTNOTE_RE = re.compile(r"\[\*(?:[^\]]*)\]")
+
+
+def clean_namumark_cell(value: str) -> str:
+    value = NAMUMARK_STYLE_PREFIX_RE.sub("", value.strip())
+    value = re.sub(r"\[br\]", "\n", value, flags=re.IGNORECASE)
+    value = NAMUMARK_RUBY_RE.sub(lambda match: match.group("base"), value)
+    value = NAMUMARK_FOOTNOTE_RE.sub("", value)
+    value = NAMUMARK_LINK_RE.sub(
+        lambda match: match.group("value").split("|", 1)[-1],
+        value,
+    )
+    value = re.sub(r"\[(?:clearfix|목차)\]", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\{\{\{(?:#!wiki[^\n]*|#[^\s}]+\s*)?", "", value)
+    value = value.replace("{{{", "").replace("}}}", "")
+    value = re.sub(r"<[^>]+>", "", value)
+    value = value.replace("'''", "").replace("''", "")
+    return normalize_namuwiki_table_text(value)
+
+
+def parse_namumark_tables(source: str) -> list[list[list[str]]]:
+    tables: list[list[list[str]]] = []
+    current_table: list[list[str]] = []
+    pending_row_lines: list[str] = []
+
+    def finish_table() -> None:
+        nonlocal current_table
+        if current_table:
+            tables.append(current_table)
+            current_table = []
+
+    def finish_row() -> None:
+        nonlocal pending_row_lines
+        row_source = "\n".join(pending_row_lines).strip()
+        pending_row_lines = []
+        if not row_source.startswith("||"):
+            return
+        row_source = row_source[2:]
+        if row_source.endswith("||"):
+            row_source = row_source[:-2]
+        cells = [
+            clean_namumark_cell(cell)
+            for cell in re.split(r"\s*\|\|\s*", row_source)
+        ]
+        if any(cells):
+            current_table.append(cells)
+
+    normalized_source = source.replace("\r\n", "\n").replace("\r", "\n")
+    for raw_line in normalized_source.split("\n"):
+        line = raw_line.strip()
+        if pending_row_lines:
+            pending_row_lines.append(raw_line)
+            if line.endswith("||"):
+                finish_row()
+            continue
+
+        if line.startswith("||"):
+            pending_row_lines = [line]
+            if line.endswith("||") and len(line) > 2:
+                finish_row()
+            continue
+
+        finish_table()
+
+    if pending_row_lines:
+        finish_row()
+    finish_table()
+    return tables
+
+
+def extract_korean_translation_from_namumark(source: str) -> str | None:
+    return extract_korean_translation_from_tables(parse_namumark_tables(source))
+
+
+def extract_korean_translation_from_html(source: str) -> str | None:
+    parser = NamuWikiHTMLTableParser()
+    try:
+        parser.feed(source)
+        parser.close()
+    except Exception as error:
+        raise NamuWikiLyricsError(f"Could not parse NamuWiki HTML: {error}") from error
+    return extract_korean_translation_from_tables(parser.tables)
+
+
+def get_namuwiki_override(track: Track) -> str | None:
+    if not NAMUWIKI_DOCUMENT_OVERRIDES:
+        return None
+
+    keys: list[str] = []
+    video_id = get_track_video_id(track)
+    if video_id:
+        keys.extend((f"video:{video_id}", video_id))
+    keys.extend(
+        value
+        for value in (
+            normalize_track_key(track),
+            track.song_name,
+            track.title,
+        )
+        if value
+    )
+    normalized_overrides = {
+        key.casefold(): value
+        for key, value in NAMUWIKI_DOCUMENT_OVERRIDES.items()
+    }
+    for key in keys:
+        override = normalized_overrides.get(key.casefold())
+        if override:
+            return override
+    return None
+
+
+def get_namuwiki_document_candidates(track: Track) -> list[str]:
+    candidates: list[str] = []
+
+    def add(value: str | None) -> None:
+        if not value:
+            return
+        candidate = value.strip().strip("\"'")
+        if (
+            not candidate
+            or "\n" in candidate
+            or len(candidate) > 1000
+            or candidate in candidates
+        ):
+            return
+        candidates.append(candidate)
+
+    add(get_namuwiki_override(track))
+    add(track.song_name)
+
+    quoted_match = QUOTED_TRACK_TITLE_RE.match(track.title)
+    if quoted_match:
+        add(quoted_match.group("title"))
+
+    raw_parts = re.split(
+        r"\s+(?:-|–|—|\|)\s+",
+        track.title,
+        maxsplit=1,
+    )
+    if len(raw_parts) == 2:
+        cleaned_part = clean_track_title_preserving_case(raw_parts[1])
+        add(cleaned_part)
+        add(strip_edge_title_tags(cleaned_part))
+        add(raw_parts[1])
+    else:
+        cleaned_title = clean_track_title_preserving_case(track.title)
+        add(cleaned_title)
+        add(strip_edge_title_tags(cleaned_title))
+
+    track_name, _ = get_lyrics_search_terms(track)
+    add(track_name)
+    add(clean_track_title(track.title))
+    return candidates[:NAMUWIKI_MAX_DOCUMENT_CANDIDATES]
+
+
+def split_namuwiki_candidate(candidate: str) -> tuple[str, str]:
+    parsed = urllib.parse.urlparse(candidate)
+    if parsed.scheme:
+        if parsed.scheme not in {"http", "https"}:
+            raise NamuWikiLyricsError("NamuWiki override URL must use HTTP or HTTPS.")
+        marker = "/w/"
+        if marker not in parsed.path:
+            raise NamuWikiLyricsError("NamuWiki override URL must point to a /w/ page.")
+        path_prefix, encoded_document = parsed.path.split(marker, 1)
+        document = urllib.parse.unquote(encoded_document).strip()
+        encoded_path = (
+            f"{path_prefix}{marker}"
+            f"{urllib.parse.quote(document, safe='')}"
+        )
+        page_url = urllib.parse.urlunparse(
+            (parsed.scheme, parsed.netloc, encoded_path, "", "", "")
+        )
+    else:
+        document = candidate.strip()
+        page_url = (
+            f"{NAMUWIKI_PAGE_BASE_URL}/"
+            f"{urllib.parse.quote(document, safe='')}"
+        )
+
+    if not document or "\n" in document or len(document) > 255:
+        raise NamuWikiLyricsError("NamuWiki document title is invalid.")
+    return document, page_url
+
+
+def wait_for_namuwiki_interval() -> None:
+    global namuwiki_last_request_started_at
+    with NAMUWIKI_REQUEST_LOCK:
+        elapsed = time.monotonic() - namuwiki_last_request_started_at
+        delay = max(0.0, NAMUWIKI_REQUEST_INTERVAL_SECONDS - elapsed)
+        if delay:
+            time.sleep(delay)
+        namuwiki_last_request_started_at = time.monotonic()
+
+
+def read_limited_http_response(response) -> bytes:
+    payload = response.read(NAMUWIKI_MAX_RESPONSE_BYTES + 1)
+    if len(payload) > NAMUWIKI_MAX_RESPONSE_BYTES:
+        raise NamuWikiLyricsError("NamuWiki response was too large.")
+    return payload
+
+
+def request_namuwiki_api_source(document: str) -> str | None:
+    if not NAMUWIKI_API_TOKEN:
+        return None
+
+    url = (
+        f"{NAMUWIKI_API_BASE_URL}/edit/"
+        f"{urllib.parse.quote(document, safe='')}"
+    )
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {NAMUWIKI_API_TOKEN}",
+            "User-Agent": (
+                "discord-music-bot/1.0 "
+                "(https://github.com/rpr123/discord-music-bot)"
+            ),
+        },
+    )
+    wait_for_namuwiki_interval()
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=NAMUWIKI_REQUEST_TIMEOUT_SECONDS,
+        ) as response:
+            payload = json.loads(
+                read_limited_http_response(response).decode("utf-8")
+            )
+    except urllib.error.HTTPError as error:
+        if error.code in {404, 410}:
+            return None
+        raise NamuWikiLyricsError(f"NamuWiki API returned HTTP {error.code}.") from error
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise NamuWikiLyricsError(str(error)) from error
+
+    if not isinstance(payload, dict) or payload.get("exists") is False:
+        return None
+    source = payload.get("text")
+    return source if isinstance(source, str) and source.strip() else None
+
+
+def request_namuwiki_html(page_url: str) -> tuple[str, str] | None:
+    request = urllib.request.Request(
+        page_url,
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "ko-KR,ko;q=0.9",
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+        },
+    )
+    wait_for_namuwiki_interval()
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=NAMUWIKI_REQUEST_TIMEOUT_SECONDS,
+        ) as response:
+            payload = read_limited_http_response(response)
+            final_url = response.geturl()
+    except urllib.error.HTTPError as error:
+        if error.code in {404, 410}:
+            return None
+        raise NamuWikiLyricsError(
+            f"NamuWiki page returned HTTP {error.code}."
+        ) from error
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise NamuWikiLyricsError(str(error)) from error
+
+    source = payload.decode("utf-8", errors="replace")
+    lowered_source = source.casefold()
+    if any(marker in lowered_source for marker in NAMUWIKI_BLOCKED_MARKERS):
+        raise NamuWikiLyricsError("NamuWiki blocked or challenged the request.")
+    return source, final_url
+
+
+def lookup_namuwiki_korean_lyrics(
+    track: Track,
+) -> tuple[str, str, str] | None:
+    if not NAMUWIKI_LYRICS_ENABLED or track.is_local:
+        return None
+
+    candidates = get_namuwiki_document_candidates(track)
+    for candidate in candidates:
+        try:
+            document, page_url = split_namuwiki_candidate(candidate)
+        except NamuWikiLyricsError as error:
+            logger.warning(
+                "Invalid NamuWiki document candidate for %s: %s",
+                track.title,
+                error,
+            )
+            continue
+
+        if NAMUWIKI_API_TOKEN:
+            try:
+                namumark = request_namuwiki_api_source(document)
+            except NamuWikiLyricsError as error:
+                logger.warning(
+                    "NamuWiki API lookup failed for %s (%s): %s",
+                    track.title,
+                    document,
+                    error,
+                )
+            else:
+                if namumark:
+                    try:
+                        translation = extract_korean_translation_from_namumark(
+                            namumark
+                        )
+                    except Exception as error:
+                        logger.warning(
+                            "NamuWiki source parsing failed for %s (%s): %s",
+                            track.title,
+                            document,
+                            error,
+                        )
+                        translation = None
+                    if translation:
+                        return translation, "나무위키 · 한국어 번역", page_url
+
+        try:
+            html_result = request_namuwiki_html(page_url)
+        except NamuWikiLyricsError as error:
+            logger.warning(
+                "NamuWiki page lookup failed for %s (%s): %s",
+                track.title,
+                document,
+                error,
+            )
+            continue
+        if html_result is None:
+            continue
+
+        page_source, final_url = html_result
+        try:
+            translation = extract_korean_translation_from_html(page_source)
+        except NamuWikiLyricsError as error:
+            logger.warning(
+                "NamuWiki HTML parsing failed for %s (%s): %s",
+                track.title,
+                document,
+                error,
+            )
+            continue
+        if translation:
+            logger.info(
+                "NamuWiki Korean lyrics selected for %s (%s)",
+                track.title,
+                document,
+            )
+            return translation, "나무위키 · 한국어 번역", final_url
+
+    if candidates:
+        logger.info(
+            "No NamuWiki Korean lyrics found for %s (candidates: %s)",
+            track.title,
+            ", ".join(candidates),
+        )
+    return None
 
 
 def get_lyrics_search_terms(track: Track) -> tuple[str, str | None]:
@@ -1713,24 +2543,14 @@ def extract_vtt_lyrics(payload: str) -> str | None:
     return lyrics or None
 
 
-def select_manual_subtitle(track: Track) -> tuple[str, str, str] | None:
-    preferred_language = (track.subtitle_language or "").casefold()
-    candidates: list[tuple[int, str, str, str]] = []
+def get_subtitle_candidates(
+    subtitles: dict[str, list[dict]],
+) -> list[tuple[str, str, str, int]]:
+    candidates: list[tuple[str, str, str, int]] = []
     format_scores = {"json3": 30, "vtt": 20}
-
-    for language, formats in track.manual_subtitles.items():
+    for language, formats in subtitles.items():
         if not isinstance(formats, list):
             continue
-        language_key = str(language).casefold()
-        language_score = 0
-        if preferred_language and (
-            language_key == preferred_language
-            or language_key.split("-", 1)[0] == preferred_language.split("-", 1)[0]
-        ):
-            language_score += 100
-        if language_key.endswith("-orig"):
-            language_score += 50
-
         for subtitle_format in formats:
             if not isinstance(subtitle_format, dict):
                 continue
@@ -1739,8 +2559,73 @@ def select_manual_subtitle(track: Track) -> tuple[str, str, str] | None:
             if extension not in format_scores or not isinstance(url, str) or not url:
                 continue
             candidates.append(
-                (language_score + format_scores[extension], str(language), extension, url)
+                (str(language), extension, url, format_scores[extension])
             )
+    return candidates
+
+
+def get_manual_subtitle_candidates(track: Track) -> list[tuple[str, str, str, int]]:
+    return get_subtitle_candidates(track.manual_subtitles)
+
+
+def select_manual_subtitle(track: Track) -> tuple[str, str, str] | None:
+    preferred_language = (track.subtitle_language or "").casefold()
+    candidates: list[tuple[int, str, str, str]] = []
+    for language, extension, url, format_score in get_manual_subtitle_candidates(track):
+        language_key = language.casefold()
+        language_score = 0
+        if preferred_language and (
+            language_key == preferred_language
+            or language_key.split("-", 1)[0] == preferred_language.split("-", 1)[0]
+        ):
+            language_score += 100
+        if language_key.endswith("-orig"):
+            language_score += 50
+        candidates.append(
+            (language_score + format_score, language, extension, url)
+        )
+
+    if not candidates:
+        return None
+    _, language, extension, url = max(candidates, key=lambda candidate: candidate[0])
+    return language, extension, url
+
+
+def select_korean_manual_subtitle(track: Track) -> tuple[str, str, str] | None:
+    candidates: list[tuple[int, str, str, str]] = []
+    for language, extension, url, format_score in get_manual_subtitle_candidates(track):
+        language_key = language.casefold().replace("_", "-")
+        language_parts = language_key.split("-")
+        if not language_parts or language_parts[0] != "ko":
+            continue
+        language_score = 20 if language_key in {"ko", "ko-kr"} else 0
+        candidates.append(
+            (language_score + format_score, language, extension, url)
+        )
+
+    if not candidates:
+        return None
+    _, language, extension, url = max(candidates, key=lambda candidate: candidate[0])
+    return language, extension, url
+
+
+def select_korean_automatic_subtitle(
+    track: Track,
+) -> tuple[str, str, str] | None:
+    candidates: list[tuple[int, str, str, str]] = []
+    for language, extension, url, format_score in get_subtitle_candidates(
+        track.korean_automatic_subtitles
+    ):
+        language_key = language.casefold().replace("_", "-")
+        if language_key.split("-", 1)[0] != "ko":
+            continue
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        translated_language = (query.get("tlang") or [""])[0].casefold()
+        if translated_language.split("-", 1)[0] != "ko":
+            continue
+        candidates.append(
+            (format_score, language, extension, url)
+        )
 
     if not candidates:
         return None
@@ -1769,13 +2654,15 @@ def request_youtube_subtitle(url: str, extension: str) -> str | None:
     return None
 
 
-async def get_youtube_manual_lyrics(track: Track) -> str | None:
-    if not YOUTUBE_LYRICS_FALLBACK or track.is_local:
+async def get_selected_youtube_subtitle(
+    track: Track,
+    selected: tuple[str, str, str] | None,
+    *,
+    purpose: str,
+) -> str | None:
+    if track.is_local or selected is None:
         return None
 
-    selected = select_manual_subtitle(track)
-    if selected is None:
-        return None
     language, extension, url = selected
 
     ensure_youtube_circuit_closed()
@@ -1803,8 +2690,63 @@ async def get_youtube_manual_lyrics(track: Track) -> str | None:
         ytdl_semaphore.release()
 
     if lyrics:
-        logger.info("YouTube manual subtitles selected for %s (%s)", track.title, language)
+        logger.info(
+            "YouTube subtitles selected for %s (%s, %s)",
+            track.title,
+            language,
+            purpose,
+        )
     return lyrics
+
+
+async def get_youtube_manual_lyrics(track: Track) -> str | None:
+    if not YOUTUBE_LYRICS_FALLBACK:
+        return None
+    return await get_selected_youtube_subtitle(
+        track,
+        select_manual_subtitle(track),
+        purpose="original lyrics",
+    )
+
+
+async def get_youtube_korean_lyrics(track: Track) -> tuple[str, str] | None:
+    candidates = (
+        (
+            select_korean_manual_subtitle(track),
+            "YouTube 제공 한국어 자막",
+            "manual Korean translation",
+        ),
+        (
+            select_korean_automatic_subtitle(track),
+            "YouTube 한국어 자동 번역 자막",
+            "automatic Korean translation",
+        ),
+    )
+    last_error: Exception | None = None
+    for selected, source, purpose in candidates:
+        if selected is None:
+            continue
+        try:
+            lyrics = await get_selected_youtube_subtitle(
+                track,
+                selected,
+                purpose=purpose,
+            )
+        except (YouTubeSubtitleError, YouTubeCircuitOpenError) as error:
+            last_error = error
+            logger.warning(
+                "YouTube %s lookup failed for %s: %s",
+                purpose,
+                track.title,
+                error,
+            )
+            continue
+        if lyrics:
+            return lyrics, source
+
+    if last_error is not None:
+        raise YouTubeSubtitleError(str(last_error)) from last_error
+    return None
 
 
 async def get_track_lyrics(track: Track) -> str | None:
@@ -1835,6 +2777,265 @@ async def get_track_lyrics(track: Track) -> str | None:
     return lyrics
 
 
+def lyrics_are_japanese(track: Track, lyrics: str) -> bool:
+    language = (track.subtitle_language or "").lower()
+    if language == "ja" or language.startswith("ja-"):
+        return True
+    return bool(JAPANESE_KANA_RE.search(lyrics) or JAPANESE_KANA_RE.search(track.title))
+
+
+def lyrics_are_primarily_korean(lyrics: str) -> bool:
+    letters = [character for character in lyrics if character.isalpha()]
+    if not letters:
+        return False
+    hangul_characters = sum(bool(HANGUL_RE.fullmatch(character)) for character in letters)
+    return hangul_characters / len(letters) >= 0.5
+
+
+def can_translate_lyrics(track: Track, lyrics: str) -> bool:
+    if not LYRICS_TRANSLATION_ENABLED:
+        return False
+
+    lyrics = lyrics.strip()
+    if lyrics and lyrics_are_primarily_korean(lyrics):
+        return False
+    if not lyrics:
+        language = (track.subtitle_language or "").casefold()
+        title = track.song_name or clean_track_title_preserving_case(track.title)
+        if (
+            language == "ko"
+            or language.startswith("ko-")
+            or lyrics_are_primarily_korean(title)
+        ):
+            return False
+
+    return bool(
+        (
+            NAMUWIKI_LYRICS_ENABLED
+            or select_korean_manual_subtitle(track)
+            or select_korean_automatic_subtitle(track)
+        )
+    )
+
+
+def can_generate_lyrics_reading(track: Track, lyrics: str) -> bool:
+    return bool(
+        LYRICS_READING_ENABLED
+        and sudachi_dictionary is not None
+        and lyrics.strip()
+        and lyrics_are_japanese(track, lyrics)
+    )
+
+
+def katakana_to_hiragana(value: str) -> str:
+    converted: list[str] = []
+    for character in value:
+        codepoint = ord(character)
+        if 0x30A1 <= codepoint <= 0x30F6:
+            converted.append(chr(codepoint - 0x60))
+        else:
+            converted.append(character)
+    return "".join(converted)
+
+
+def get_sudachi_tokenizer():
+    global SUDACHI_TOKENIZER
+    if sudachi_dictionary is None:
+        raise LyricsReadingError(
+            "SudachiPy and SudachiDict-core are not installed."
+        )
+    if SUDACHI_TOKENIZER is None:
+        SUDACHI_TOKENIZER = sudachi_dictionary.Dictionary().create()
+    return SUDACHI_TOKENIZER
+
+
+def find_explicit_reading_base_start(prefix: str, tokenizer) -> int | None:
+    marker_index = max(prefix.rfind("|"), prefix.rfind("｜"))
+    if marker_index >= 0:
+        marked_base = prefix[marker_index + 1 :]
+        if marked_base and JAPANESE_HAN_RE.search(marked_base):
+            return marker_index
+
+    if not prefix or not JAPANESE_HAN_RE.fullmatch(prefix[-1]):
+        return None
+
+    tokens = list(tokenizer.tokenize(prefix))
+    token_positions: list[tuple[int, int, str]] = []
+    position = 0
+    for token in tokens:
+        surface = token.surface()
+        start = position
+        position += len(surface)
+        token_positions.append((start, position, surface))
+
+    suffix_start = len(prefix)
+    for start, end, surface in reversed(token_positions[-4:]):
+        if end != suffix_start or not surface:
+            break
+        if surface.isspace() or all(
+            unicodedata.category(character).startswith("P") for character in surface
+        ):
+            break
+        suffix_start = start
+        if JAPANESE_HAN_RE.search(surface):
+            return suffix_start
+
+    fallback = re.search(
+        (
+            r"[\u3005\u3007\u303b\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+"
+            r"[\u3041-\u309f\u30a0-\u30ff\u30fc]{0,12}$"
+        ),
+        prefix,
+    )
+    return fallback.start() if fallback else None
+
+
+def replace_explicit_readings(line: str, tokenizer) -> str:
+    matches: list[tuple[int, int, str]] = []
+    for opening, closing in EXPLICIT_READING_BRACKETS:
+        pattern = re.compile(
+            re.escape(opening)
+            + r"(?P<reading>[^"
+            + re.escape(closing)
+            + r"]+)"
+            + re.escape(closing)
+        )
+        for match in pattern.finditer(line):
+            reading = match.group("reading").strip()
+            if reading and JAPANESE_READING_RE.fullmatch(reading):
+                matches.append((match.start(), match.end(), reading))
+
+    if not matches:
+        return line
+
+    output: list[str] = []
+    cursor = 0
+    for opening_start, annotation_end, reading in sorted(matches):
+        if opening_start < cursor:
+            continue
+        prefix = line[cursor:opening_start]
+        base_start = find_explicit_reading_base_start(prefix, tokenizer)
+        if base_start is None:
+            output.append(line[cursor:annotation_end])
+        else:
+            output.append(prefix[:base_start])
+            output.append(katakana_to_hiragana(reading))
+        cursor = annotation_end
+    output.append(line[cursor:])
+    return "".join(output)
+
+
+def token_to_hiragana(surface: str, reading: str) -> str:
+    if (
+        not reading
+        or re.search(r"[A-Za-z]", surface)
+        or surface.isspace()
+        or all(
+            unicodedata.category(character).startswith(("P", "S"))
+            for character in surface
+        )
+    ):
+        return surface
+    return katakana_to_hiragana(reading)
+
+
+def generate_hiragana_lyrics(lyrics: str) -> str:
+    with SUDACHI_TOKENIZER_LOCK:
+        tokenizer = get_sudachi_tokenizer()
+        converted_lines: list[str] = []
+        for line in lyrics.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = replace_explicit_readings(line, tokenizer)
+            converted_tokens: list[str] = []
+            for token in tokenizer.tokenize(line):
+                surface = token.surface()
+                reading = token.reading_form()
+                converted_tokens.append(token_to_hiragana(surface, reading))
+            converted_lines.append("".join(converted_tokens))
+    reading_text = "\n".join(converted_lines).strip()
+    if not reading_text:
+        raise LyricsReadingError("Sudachi returned empty reading text.")
+    return reading_text
+
+
+async def get_track_korean_translation(track: Track) -> str:
+    if track.lyrics_translation_loaded and track.lyrics_translation is not None:
+        return track.lyrics_translation
+
+    async with track.lyrics_translation_lock:
+        if track.lyrics_translation_loaded and track.lyrics_translation is not None:
+            return track.lyrics_translation
+
+        namuwiki_result: tuple[str, str, str] | None = None
+        try:
+            namuwiki_result = await asyncio.wait_for(
+                asyncio.to_thread(lookup_namuwiki_korean_lyrics, track),
+                timeout=(
+                    NAMUWIKI_REQUEST_TIMEOUT_SECONDS
+                    * NAMUWIKI_MAX_DOCUMENT_CANDIDATES
+                    * (2 if NAMUWIKI_API_TOKEN else 1)
+                    + NAMUWIKI_REQUEST_INTERVAL_SECONDS
+                    * NAMUWIKI_MAX_DOCUMENT_CANDIDATES
+                    * (2 if NAMUWIKI_API_TOKEN else 1)
+                    + 5
+                ),
+            )
+        except (asyncio.TimeoutError, NamuWikiLyricsError) as error:
+            logger.warning(
+                "NamuWiki Korean lyrics lookup failed for %s: %s",
+                track.title,
+                error,
+            )
+        except Exception:
+            logger.exception(
+                "Unexpected NamuWiki Korean lyrics failure for %s",
+                track.title,
+            )
+
+        if namuwiki_result is not None:
+            translation, source, source_url = namuwiki_result
+            track.lyrics_translation = translation
+            track.lyrics_translation_source = source
+            track.lyrics_translation_url = source_url
+            track.lyrics_translation_loaded = True
+            return translation
+
+        try:
+            youtube_result = await get_youtube_korean_lyrics(track)
+        except (YouTubeSubtitleError, YouTubeCircuitOpenError) as error:
+            raise LyricsTranslationError(str(error)) from error
+        if youtube_result is None:
+            raise LyricsTranslationError(
+                "No NamuWiki translation or Korean YouTube subtitles are available."
+            )
+
+        translation, source = youtube_result
+        track.lyrics_translation = translation
+        track.lyrics_translation_source = source
+        track.lyrics_translation_url = None
+        track.lyrics_translation_loaded = True
+        return translation
+
+
+async def get_track_hiragana_reading(track: Track) -> str:
+    if track.lyrics_reading_loaded and track.lyrics_reading is not None:
+        return track.lyrics_reading
+    if not track.lyrics:
+        raise LyricsReadingError("Original lyrics are not available.")
+
+    async with track.lyrics_reading_lock:
+        if track.lyrics_reading_loaded and track.lyrics_reading is not None:
+            return track.lyrics_reading
+        try:
+            reading = await asyncio.to_thread(generate_hiragana_lyrics, track.lyrics)
+        except LyricsReadingError:
+            raise
+        except Exception as error:
+            raise LyricsReadingError(str(error)) from error
+        track.lyrics_reading = reading
+        track.lyrics_reading_loaded = True
+        return reading
+
+
 def cancel_lyrics_publish(state: GuildMusicState) -> None:
     task = state.lyrics_task
     if task and not task.done():
@@ -1845,6 +3046,7 @@ def cancel_lyrics_publish(state: GuildMusicState) -> None:
 async def clear_lyrics_message(guild_id: int, state: GuildMusicState) -> None:
     message = state.lyrics_message
     state.lyrics_message = None
+    replace_lyrics_view(state, None)
     if message is not None:
         await delete_music_channel_message(guild_id, message)
 
@@ -1852,15 +3054,172 @@ async def clear_lyrics_message(guild_id: int, state: GuildMusicState) -> None:
 def schedule_lyrics_message_cleanup(guild_id: int, state: GuildMusicState) -> None:
     message = state.lyrics_message
     state.lyrics_message = None
+    replace_lyrics_view(state, None)
     if message is not None:
         asyncio.create_task(delete_music_channel_message(guild_id, message))
 
 
-def make_lyrics_file(lyrics: str) -> discord.File:
+def make_lyrics_file(lyrics: str, filename: str = "lyrics.txt") -> discord.File:
     return discord.File(
         io.BytesIO(lyrics.encode("utf-8")),
-        filename="lyrics.txt",
+        filename=filename,
     )
+
+
+def track_is_current(guild_id: int, track: Track) -> bool:
+    state = music_states.get(guild_id)
+    return state is not None and state.current is track
+
+
+def replace_lyrics_view(
+    state: GuildMusicState,
+    view: discord.ui.View | None,
+) -> None:
+    previous_view = state.lyrics_view
+    state.lyrics_view = view
+    if previous_view is not None and previous_view is not view:
+        previous_view.stop()
+
+
+async def send_private_lyrics_variant(
+    interaction: discord.Interaction,
+    track: Track,
+    *,
+    label: str,
+    text: str,
+    source: str,
+    filename: str,
+    source_url: str | None = None,
+) -> None:
+    if len(text) <= LYRICS_INLINE_LIMIT:
+        embed = make_lyrics_variant_embed(
+            track,
+            label,
+            text,
+            source,
+            source_url,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    embed = make_lyrics_variant_embed(
+        track,
+        label,
+        "내용이 길어 전체 내용을 파일로 첨부했어요.",
+        source,
+        source_url,
+    )
+    await interaction.followup.send(
+        embed=embed,
+        file=make_lyrics_file(text, filename),
+        ephemeral=True,
+    )
+
+
+class LyricsVariantView(discord.ui.View):
+    def __init__(self, guild_id: int, track: Track, lyrics: str):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.track = track
+
+        if can_translate_lyrics(track, lyrics):
+            translation_button = discord.ui.Button(
+                label="한국어 번역",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"lyrics:translation:{track.track_id}",
+            )
+            translation_button.callback = self.show_translation
+            self.add_item(translation_button)
+
+        if can_generate_lyrics_reading(track, lyrics):
+            reading_button = discord.ui.Button(
+                label="히라가나 독음",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"lyrics:reading:{track.track_id}",
+            )
+            reading_button.callback = self.show_reading
+            self.add_item(reading_button)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if track_is_current(self.guild_id, self.track):
+            return True
+        await interaction.response.send_message(
+            "이미 재생이 끝난 곡이에요.",
+            ephemeral=True,
+        )
+        return False
+
+    async def show_translation(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            translation = await get_track_korean_translation(self.track)
+        except LyricsTranslationError as error:
+            logger.warning(
+                "Lyrics translation failed for %s: %s",
+                self.track.title,
+                error,
+            )
+            await interaction.followup.send(
+                "한국어 번역을 가져오지 못했어요. 잠시 후 다시 시도해 주세요.",
+                ephemeral=True,
+            )
+            return
+
+        if not track_is_current(self.guild_id, self.track):
+            await interaction.followup.send(
+                "번역하는 동안 곡이 바뀌었어요.",
+                ephemeral=True,
+            )
+            return
+        await send_private_lyrics_variant(
+            interaction,
+            self.track,
+            label="한국어 번역",
+            text=translation,
+            source=self.track.lyrics_translation_source or "한국어 번역",
+            filename="lyrics-ko.txt",
+            source_url=self.track.lyrics_translation_url,
+        )
+
+    async def show_reading(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            reading = await get_track_hiragana_reading(self.track)
+        except LyricsReadingError as error:
+            logger.warning(
+                "Lyrics reading generation failed for %s: %s",
+                self.track.title,
+                error,
+            )
+            await interaction.followup.send(
+                "히라가나 독음을 만들지 못했어요.",
+                ephemeral=True,
+            )
+            return
+
+        if not track_is_current(self.guild_id, self.track):
+            await interaction.followup.send(
+                "독음을 만드는 동안 곡이 바뀌었어요.",
+                ephemeral=True,
+            )
+            return
+        await send_private_lyrics_variant(
+            interaction,
+            self.track,
+            label="히라가나 독음",
+            text=reading,
+            source="Sudachi · 자동 독음",
+            filename="lyrics-hiragana.txt",
+        )
+
+
+def make_lyrics_variant_view(
+    guild_id: int,
+    track: Track,
+    lyrics: str,
+) -> LyricsVariantView | None:
+    view = LyricsVariantView(guild_id, track, lyrics)
+    return view if view.children else None
 
 
 async def upsert_lyrics_message(
@@ -1870,6 +3229,7 @@ async def upsert_lyrics_message(
     description: str,
     *,
     attachment_lyrics: str | None = None,
+    view: discord.ui.View | None = None,
 ) -> discord.Message | None:
     channel = resolve_control_panel_channel(guild_id, state)
     if channel is None or state.current is not track:
@@ -1886,6 +3246,7 @@ async def upsert_lyrics_message(
         ):
             await delete_music_channel_message(guild_id, message)
             state.lyrics_message = None
+            replace_lyrics_view(state, None)
             message = None
 
     embed = make_lyrics_embed(track, description)
@@ -1900,9 +3261,11 @@ async def upsert_lyrics_message(
                 content=None,
                 embed=embed,
                 attachments=attachments,
+                view=view,
             )
         except discord.NotFound:
             state.lyrics_message = None
+            replace_lyrics_view(state, None)
             message = None
         except discord.Forbidden:
             logger.warning(
@@ -1920,6 +3283,7 @@ async def upsert_lyrics_message(
                     edited_message or message,
                 )
                 return None
+            replace_lyrics_view(state, view)
             state.lyrics_message = edited_message or message
             return state.lyrics_message
 
@@ -1929,6 +3293,8 @@ async def upsert_lyrics_message(
     }
     if attachment_lyrics is not None:
         send_options["file"] = make_lyrics_file(attachment_lyrics)
+    if view is not None:
+        send_options["view"] = view
     try:
         message = await channel.send(**send_options)
     except discord.Forbidden:
@@ -1941,6 +3307,7 @@ async def upsert_lyrics_message(
     if state.current is not track:
         await delete_music_channel_message(guild_id, message)
         return None
+    replace_lyrics_view(state, view)
     state.lyrics_message = message
     return message
 
@@ -1974,17 +3341,33 @@ async def publish_current_lyrics(guild_id: int, track: Track) -> None:
         if state.current is not track:
             return
         if not lyrics:
-            await upsert_lyrics_message(guild_id, state, track, "미제공")
-        elif len(lyrics) <= LYRICS_INLINE_LIMIT:
-            await upsert_lyrics_message(guild_id, state, track, lyrics)
-        else:
+            view = make_lyrics_variant_view(guild_id, track, "")
             await upsert_lyrics_message(
                 guild_id,
                 state,
                 track,
-                "가사가 길어 전체 원문을 첨부했어요.",
-                attachment_lyrics=lyrics,
+                "미제공",
+                view=view,
             )
+        else:
+            view = make_lyrics_variant_view(guild_id, track, lyrics)
+            if len(lyrics) <= LYRICS_INLINE_LIMIT:
+                await upsert_lyrics_message(
+                    guild_id,
+                    state,
+                    track,
+                    lyrics,
+                    view=view,
+                )
+            else:
+                await upsert_lyrics_message(
+                    guild_id,
+                    state,
+                    track,
+                    "가사가 길어 전체 원문을 첨부했어요.",
+                    attachment_lyrics=lyrics,
+                    view=view,
+                )
     except asyncio.CancelledError:
         raise
     finally:
@@ -2001,6 +3384,21 @@ def get_manual_subtitles(info: dict) -> dict[str, list[dict]]:
         str(language): [copy.deepcopy(item) for item in formats if isinstance(item, dict)]
         for language, formats in subtitles.items()
         if isinstance(formats, list)
+    }
+
+
+def get_korean_automatic_subtitles(info: dict) -> dict[str, list[dict]]:
+    subtitles = info.get("automatic_captions")
+    if not isinstance(subtitles, dict):
+        return {}
+
+    return {
+        str(language): [copy.deepcopy(item) for item in formats if isinstance(item, dict)]
+        for language, formats in subtitles.items()
+        if (
+            isinstance(formats, list)
+            and str(language).casefold().replace("_", "-").split("-", 1)[0] == "ko"
+        )
     }
 
 
@@ -2025,6 +3423,7 @@ def make_track_from_info(
         song_name=info.get("track") or info.get("alt_title"),
         uploader=info.get("uploader") or info.get("channel"),
         manual_subtitles=get_manual_subtitles(info),
+        korean_automatic_subtitles=get_korean_automatic_subtitles(info),
         subtitle_language=info.get("language") or info.get("original_language"),
         stream_resolved_at=(
             info.get("_music_bot_extracted_at", time.monotonic())
@@ -2173,6 +3572,7 @@ async def resolve_track_stream(track: Track) -> None:
     track.song_name = info.get("track") or info.get("alt_title") or track.song_name
     track.uploader = info.get("uploader") or info.get("channel") or track.uploader
     track.manual_subtitles = get_manual_subtitles(info)
+    track.korean_automatic_subtitles = get_korean_automatic_subtitles(info)
     track.subtitle_language = (
         info.get("language") or info.get("original_language") or track.subtitle_language
     )

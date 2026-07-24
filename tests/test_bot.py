@@ -630,7 +630,32 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
             ("ja", "vtt", "https://example.com/ja"),
         )
 
-    def test_track_keeps_manual_but_not_automatic_caption_metadata(self) -> None:
+    def test_korean_manual_subtitle_is_selected_independently(self) -> None:
+        track = make_track("captioned")
+        track.subtitle_language = "ja"
+        track.manual_subtitles = {
+            "ja": [{"ext": "json3", "url": "https://example.com/ja"}],
+            "en": [{"ext": "json3", "url": "https://example.com/en"}],
+            "ko-KR": [{"ext": "vtt", "url": "https://example.com/ko"}],
+        }
+
+        self.assertEqual(
+            bot.select_korean_manual_subtitle(track),
+            ("ko-KR", "vtt", "https://example.com/ko"),
+        )
+
+    def test_korean_manual_subtitle_does_not_use_other_languages(self) -> None:
+        track = make_track("captioned")
+        track.manual_subtitles = {
+            "ja": [{"ext": "json3", "url": "https://example.com/ja"}],
+            "en": [{"ext": "vtt", "url": "https://example.com/en"}],
+        }
+
+        self.assertIsNone(bot.select_korean_manual_subtitle(track))
+
+    def test_track_keeps_manual_and_only_korean_translated_caption_metadata(
+        self,
+    ) -> None:
         track = bot.make_track_from_info(
             {
                 "id": "captions001",
@@ -640,7 +665,13 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
                     "ja": [{"ext": "json3", "url": "https://example.com/manual"}]
                 },
                 "automatic_captions": {
-                    "en": [{"ext": "json3", "url": "https://example.com/auto"}]
+                    "en": [{"ext": "json3", "url": "https://example.com/auto-en"}],
+                    "ko": [
+                        {
+                            "ext": "json3",
+                            "url": "https://example.com/auto?lang=ja&tlang=ko",
+                        }
+                    ],
                 },
                 "language": "ja",
             },
@@ -649,7 +680,29 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(set(track.manual_subtitles), {"ja"})
+        self.assertEqual(set(track.korean_automatic_subtitles), {"ko"})
         self.assertEqual(track.subtitle_language, "ja")
+
+    def test_korean_automatic_subtitle_requires_tlang_ko(self) -> None:
+        track = make_track("captioned")
+        track.korean_automatic_subtitles = {
+            "ko": [
+                {"ext": "vtt", "url": "https://example.com/direct?lang=ko"},
+                {
+                    "ext": "json3",
+                    "url": "https://example.com/translated?lang=ja&tlang=ko",
+                },
+            ],
+        }
+
+        self.assertEqual(
+            bot.select_korean_automatic_subtitle(track),
+            (
+                "ko",
+                "json3",
+                "https://example.com/translated?lang=ja&tlang=ko",
+            ),
+        )
 
     async def test_lrclib_miss_falls_back_to_youtube_manual_subtitles(self) -> None:
         track = make_track("fallback")
@@ -682,6 +735,708 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lyrics, "lrclib lyrics")
         self.assertEqual(track.lyrics_source, "LRCLIB")
         youtube_lookup.assert_not_awaited()
+
+
+class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
+    class FakeToken:
+        def __init__(self, surface: str, reading: str | None = None):
+            self._surface = surface
+            self._reading = reading if reading is not None else surface
+
+        def surface(self) -> str:
+            return self._surface
+
+        def reading_form(self) -> str:
+            return self._reading
+
+    class FakeTokenizer:
+        def tokenize(self, text: str):
+            return [LyricsVariantTests.FakeToken(text)] if text else []
+
+    async def asyncTearDown(self) -> None:
+        bot.music_states.clear()
+
+    def test_japanese_and_korean_lyrics_are_detected_locally(self) -> None:
+        track = make_track("Japanese song")
+
+        self.assertTrue(bot.lyrics_are_japanese(track, "君の声が聞こえる"))
+        self.assertFalse(bot.lyrics_are_japanese(track, "I can hear your voice"))
+        self.assertTrue(bot.lyrics_are_primarily_korean("너의 목소리가 들려"))
+        self.assertFalse(bot.lyrics_are_primarily_korean("君の声が聞こえる"))
+
+    def test_explicit_readings_accept_common_bracket_styles(self) -> None:
+        tokenizer = self.FakeTokenizer()
+        examples = {
+            "運命(さだめ)": "さだめ",
+            "運命（さだめ）": "さだめ",
+            "運命[さだめ]": "さだめ",
+            "運命【さだめ】": "さだめ",
+            "運命《サダメ》": "さだめ",
+            "｜超電磁砲《レールガン》": "れーるがん",
+        }
+
+        for source, expected in examples.items():
+            with self.subTest(source=source):
+                self.assertEqual(
+                    bot.replace_explicit_readings(source, tokenizer),
+                    expected,
+                )
+
+    def test_non_kana_parentheses_are_not_treated_as_a_reading(self) -> None:
+        source = "運命(Oh yeah)"
+
+        self.assertEqual(
+            bot.replace_explicit_readings(source, self.FakeTokenizer()),
+            source,
+        )
+        self.assertEqual(
+            bot.replace_explicit_readings("愛してる(ああ)", self.FakeTokenizer()),
+            "愛してる(ああ)",
+        )
+        self.assertEqual(bot.token_to_hiragana("(", "キゴウ"), "(")
+        self.assertEqual(bot.token_to_hiragana("Oh", "オー"), "Oh")
+
+    def test_explicit_reading_overrides_dictionary_reading(self) -> None:
+        tokenizer = self.FakeTokenizer()
+
+        with patch.object(bot, "get_sudachi_tokenizer", return_value=tokenizer):
+            reading = bot.generate_hiragana_lyrics("未来(あした)")
+
+        self.assertEqual(reading, "あした")
+
+    def test_variant_view_only_shows_modes_available_for_the_track(self) -> None:
+        japanese_track = make_track("Japanese")
+        japanese_track.korean_automatic_subtitles = {
+            "ko": [
+                {
+                    "ext": "json3",
+                    "url": "https://example.com/translated?lang=ja&tlang=ko",
+                }
+            ],
+        }
+        korean_track = make_track("Korean")
+
+        with patch.object(bot, "sudachi_dictionary", MagicMock()):
+            japanese_view = bot.make_lyrics_variant_view(
+                100,
+                japanese_track,
+                "君の声が聞こえる",
+            )
+            korean_view = bot.make_lyrics_variant_view(
+                100,
+                korean_track,
+                "너의 목소리가 들려",
+            )
+
+        self.assertEqual(
+            {item.label for item in japanese_view.children},
+            {"한국어 번역", "히라가나 독음"},
+        )
+        self.assertIsNone(korean_view)
+
+    def test_translation_button_accepts_manual_korean_subtitles_without_api_key(
+        self,
+    ) -> None:
+        track = make_track("Japanese")
+        track.manual_subtitles = {
+            "ko": [{"ext": "json3", "url": "https://example.com/ko"}],
+        }
+
+        with patch.object(bot, "sudachi_dictionary", None):
+            view = bot.make_lyrics_variant_view(
+                100,
+                track,
+                "君の声が聞こえる",
+            )
+
+        self.assertIsNotNone(view)
+        self.assertEqual(
+            {item.label for item in view.children},
+            {"한국어 번역"},
+        )
+
+    def test_translation_button_is_hidden_without_youtube_korean_subtitles(
+        self,
+    ) -> None:
+        track = make_track("English")
+
+        with (
+            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", False),
+            patch.object(bot, "sudachi_dictionary", None),
+        ):
+            view = bot.make_lyrics_variant_view(
+                100,
+                track,
+                "I can hear your voice",
+            )
+
+        self.assertIsNone(view)
+
+    def test_translation_button_is_available_for_namuwiki_lookup(self) -> None:
+        track = make_track("Foreign song")
+
+        with (
+            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(bot, "sudachi_dictionary", None),
+        ):
+            view = bot.make_lyrics_variant_view(
+                100,
+                track,
+                "I can hear your voice",
+            )
+
+        self.assertIsNotNone(view)
+        self.assertEqual(
+            {item.label for item in view.children},
+            {"한국어 번역"},
+        )
+
+    def test_translation_button_is_available_when_original_lyrics_are_missing(
+        self,
+    ) -> None:
+        track = make_track("泥濘鳴鳴")
+        track.subtitle_language = "ja"
+
+        with (
+            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(bot, "sudachi_dictionary", None),
+        ):
+            view = bot.make_lyrics_variant_view(100, track, "")
+
+        self.assertIsNotNone(view)
+        self.assertEqual(
+            {item.label for item in view.children},
+            {"한국어 번역"},
+        )
+
+    def test_missing_korean_lyrics_do_not_offer_translation(self) -> None:
+        track = make_track("한국 노래")
+
+        with (
+            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(bot, "sudachi_dictionary", None),
+        ):
+            view = bot.make_lyrics_variant_view(100, track, "")
+
+        self.assertIsNone(view)
+
+    async def test_manual_korean_subtitles_are_used_before_auto_translation(
+        self,
+    ) -> None:
+        track = make_track("foreign")
+        track.lyrics = "Original lyrics"
+        track.lyrics_loaded = True
+        track.manual_subtitles = {
+            "ko": [{"ext": "json3", "url": "https://example.com/manual"}],
+        }
+        track.korean_automatic_subtitles = {
+            "ko": [
+                {
+                    "ext": "json3",
+                    "url": "https://example.com/auto?lang=ja&tlang=ko",
+                }
+            ],
+        }
+
+        with (
+            patch.object(
+                bot,
+                "lookup_namuwiki_korean_lyrics",
+                return_value=None,
+            ),
+            patch.object(
+                bot,
+                "get_selected_youtube_subtitle",
+                new=AsyncMock(return_value="사람이 작성한 한국어 자막"),
+            ) as subtitle_lookup,
+        ):
+            translation = await bot.get_track_korean_translation(track)
+
+        self.assertEqual(translation, "사람이 작성한 한국어 자막")
+        self.assertEqual(track.lyrics_translation_source, "YouTube 제공 한국어 자막")
+        subtitle_lookup.assert_awaited_once_with(
+            track,
+            ("ko", "json3", "https://example.com/manual"),
+            purpose="manual Korean translation",
+        )
+
+    async def test_auto_translation_follows_manual_subtitle_failure(self) -> None:
+        track = make_track("foreign")
+        track.lyrics = "Original lyrics"
+        track.lyrics_loaded = True
+        track.manual_subtitles = {
+            "ko": [{"ext": "json3", "url": "https://example.com/manual"}],
+        }
+        track.korean_automatic_subtitles = {
+            "ko": [
+                {
+                    "ext": "json3",
+                    "url": "https://example.com/auto?lang=ja&tlang=ko",
+                }
+            ],
+        }
+
+        with (
+            patch.object(
+                bot,
+                "lookup_namuwiki_korean_lyrics",
+                return_value=None,
+            ),
+            patch.object(
+                bot,
+                "get_selected_youtube_subtitle",
+                new=AsyncMock(
+                    side_effect=[
+                        bot.YouTubeSubtitleError("expired"),
+                        "자동 번역 가사",
+                    ]
+                ),
+            ) as subtitle_lookup,
+        ):
+            translation = await bot.get_track_korean_translation(track)
+
+        self.assertEqual(translation, "자동 번역 가사")
+        self.assertEqual(
+            track.lyrics_translation_source,
+            "YouTube 한국어 자동 번역 자막",
+        )
+        self.assertEqual(subtitle_lookup.await_count, 2)
+
+    async def test_translation_button_uses_private_followup_and_track_cache(self) -> None:
+        guild_id = 101
+        track = make_track("foreign")
+        track.lyrics = "Original lyrics"
+        track.lyrics_loaded = True
+        state = bot.get_state(guild_id)
+        state.current = track
+        interaction = MagicMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        view = bot.LyricsVariantView.__new__(bot.LyricsVariantView)
+        view.guild_id = guild_id
+        view.track = track
+
+        with (
+            patch.object(
+                bot,
+                "lookup_namuwiki_korean_lyrics",
+                return_value=None,
+            ),
+            patch.object(
+                bot,
+                "get_youtube_korean_lyrics",
+                new=AsyncMock(
+                    return_value=("번역된 가사", "YouTube 한국어 자동 번역 자막")
+                ),
+            ) as request_translation,
+        ):
+            await view.show_translation(interaction)
+            await view.show_translation(interaction)
+
+        interaction.response.defer.assert_awaited_with(ephemeral=True, thinking=True)
+        self.assertEqual(interaction.followup.send.await_count, 2)
+        self.assertTrue(
+            all(
+                call.kwargs["ephemeral"]
+                for call in interaction.followup.send.await_args_list
+            )
+        )
+        request_translation.assert_awaited_once_with(track)
+
+
+class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
+    HTML_FIXTURE = """
+    <html>
+      <body>
+        <table class="wiki-table">
+          <tbody>
+            <tr>
+              <th>일본어 원문</th>
+              <th>일본어 독음</th>
+              <th>한국어 번역<sup>[1]</sup></th>
+            </tr>
+            <tr>
+              <td>泥濘 鳴鳴</td>
+              <td>でいねい めいめい</td>
+              <td><div>진창에서 울리는 노랫소리</div></td>
+            </tr>
+            <tr>
+              <td>礼を持って</td>
+              <td>れいをもって</td>
+              <td>예를 갖추어 다시 걸어가</td>
+            </tr>
+          </tbody>
+        </table>
+      </body>
+    </html>
+    """
+    NAMUMARK_FIXTURE = """
+    ||<tablewidth=100%><rowbgcolor=#222> '''일본어 원문''' || '''일본어 독음''' || '''한국어 번역''' ||
+    || 泥濘 鳴鳴 || でいねい めいめい || 진창에서 울리는 노랫소리 ||
+    || 礼を持って || れいをもって || 예를 갖추어 다시 걸어가 ||
+    """
+    EXPECTED_TRANSLATION = (
+        "진창에서 울리는 노랫소리\n"
+        "예를 갖추어 다시 걸어가"
+    )
+    DOCUMENT = "泥濘鳴鳴"
+    PAGE_URL = (
+        "https://namu.wiki/w/"
+        "%E6%B3%A5%E6%BF%98%E9%B3%B4%E9%B3%B4"
+    )
+
+    def test_rendered_html_extracts_only_the_korean_column(self) -> None:
+        self.assertEqual(
+            bot.extract_korean_translation_from_html(self.HTML_FIXTURE),
+            self.EXPECTED_TRANSLATION,
+        )
+
+    def test_namumark_extracts_only_the_korean_column(self) -> None:
+        self.assertEqual(
+            bot.extract_korean_translation_from_namumark(
+                self.NAMUMARK_FIXTURE
+            ),
+            self.EXPECTED_TRANSLATION,
+        )
+
+    def test_headerless_interleaved_html_uses_translation_not_reading(
+        self,
+    ) -> None:
+        source = """
+        <table>
+          <tr><th>합창</th></tr>
+          <tr><td>
+            持ち合った<br>
+            모치앗타<br>
+            서로가 가진 건<br>
+            それぞれ<br>
+            소레조레<br>
+            제각각 달랐지만<br>
+            視線は違えど<br>
+            시센와 치가에도<br>
+            바라보는 곳은 달라도<br>
+            掛け合わせるわ 今<br>
+            카케아와세루와 이마<br>
+            지금 서로의 마음을 포개
+          </td></tr>
+        </table>
+        """
+
+        self.assertEqual(
+            bot.extract_korean_translation_from_html(source),
+            (
+                "서로가 가진 건\n"
+                "제각각 달랐지만\n"
+                "바라보는 곳은 달라도\n"
+                "지금 서로의 마음을 포개"
+            ),
+        )
+
+    def test_interleaved_html_across_rows_uses_translation_not_reading(
+        self,
+    ) -> None:
+        source = """
+        <table>
+          <tr><th>勇者</th></tr>
+          <tr><td>[ 가사 보기 ]</td></tr>
+          <tr><td>持ち合った</td></tr>
+          <tr><td>모치앗타</td></tr>
+          <tr><td>서로가 가진 건</td></tr>
+          <tr><td>それぞれ</td></tr>
+          <tr><td>소레조레</td></tr>
+          <tr><td>제각각 달랐지만</td></tr>
+          <tr><td>視線は違えど</td></tr>
+          <tr><td>시센와 치가에도</td></tr>
+          <tr><td>바라보는 곳은 달라도</td></tr>
+          <tr><td>掛け合わせるわ 今</td></tr>
+          <tr><td>카케아와세루와 이마</td></tr>
+          <tr><td>지금 서로의 마음을 포개</td></tr>
+        </table>
+        """
+
+        self.assertEqual(
+            bot.extract_korean_translation_from_html(source),
+            (
+                "서로가 가진 건\n"
+                "제각각 달랐지만\n"
+                "바라보는 곳은 달라도\n"
+                "지금 서로의 마음을 포개"
+            ),
+        )
+
+    def test_multiline_namumark_cell_extracts_interleaved_translation(
+        self,
+    ) -> None:
+        source = """
+        ||<tablewidth=100%> {{{#!wiki style="text-align: center"
+        持ち合った
+        모치앗타
+        서로가 가진 건
+        それぞれ
+        소레조레
+        제각각 달랐지만
+        視線は違えど
+        시센와 치가에도
+        바라보는 곳은 달라도
+        掛け合わせるわ 今
+        카케아와세루와 이마
+        지금 서로의 마음을 포개
+        }}} ||
+        """
+
+        self.assertEqual(
+            bot.extract_korean_translation_from_namumark(source),
+            (
+                "서로가 가진 건\n"
+                "제각각 달랐지만\n"
+                "바라보는 곳은 달라도\n"
+                "지금 서로의 마음을 포개"
+            ),
+        )
+
+    def test_headerless_readings_without_translation_are_rejected(
+        self,
+    ) -> None:
+        source = """
+        <table><tr><td>
+          持ち合った<br>모치앗타<br>
+          それぞれ<br>소레조레<br>
+          視線は違えど<br>시센와 치가에도<br>
+          掛け合わせるわ 今<br>카케아와세루와 이마
+        </td></tr></table>
+        """
+
+        self.assertIsNone(
+            bot.extract_korean_translation_from_html(source)
+        )
+
+    def test_short_metadata_translation_is_not_mistaken_for_lyrics(self) -> None:
+        source = """
+        <table>
+          <tr><th>항목</th><th>번역</th></tr>
+          <tr><td>제목</td><td>진창 울음</td></tr>
+        </table>
+        """
+
+        self.assertIsNone(
+            bot.extract_korean_translation_from_html(source)
+        )
+
+    def test_repeated_lyrics_lines_are_preserved(self) -> None:
+        source = """
+        <table>
+          <tr><th>원문</th><th>한국어 번역</th></tr>
+          <tr><td>repeat</td><td>같은 후렴을 다시 불러</td></tr>
+          <tr><td>repeat</td><td>같은 후렴을 다시 불러</td></tr>
+        </table>
+        """
+
+        self.assertEqual(
+            bot.extract_korean_translation_from_html(source),
+            "같은 후렴을 다시 불러\n같은 후렴을 다시 불러",
+        )
+
+    def test_exact_song_title_is_the_first_document_candidate(self) -> None:
+        track = make_track(self.DOCUMENT)
+
+        candidates = bot.get_namuwiki_document_candidates(track)
+
+        self.assertEqual(candidates[0], self.DOCUMENT)
+
+    def test_document_candidate_keeps_case_while_removing_video_label(
+        self,
+    ) -> None:
+        track = make_track("SUNFADED (Official Audio)")
+
+        candidates = bot.get_namuwiki_document_candidates(track)
+
+        self.assertEqual(candidates[0], "SUNFADED")
+
+    def test_artist_prefix_and_video_label_are_removed_from_candidate(
+        self,
+    ) -> None:
+        track = make_track("CoMETIK - 泥濘鳴鳴 (Official MV)")
+
+        candidates = bot.get_namuwiki_document_candidates(track)
+
+        self.assertEqual(candidates[0], self.DOCUMENT)
+
+    def test_unknown_leading_video_tag_has_clean_title_fallback(self) -> None:
+        track = make_track(f"【シャニソン】{self.DOCUMENT}")
+
+        candidates = bot.get_namuwiki_document_candidates(track)
+
+        self.assertEqual(candidates[:2], [f"【シャニソン】{self.DOCUMENT}", self.DOCUMENT])
+
+    def test_unicode_override_url_is_canonicalized(self) -> None:
+        document, page_url = bot.split_namuwiki_candidate(
+            f"https://namu.wiki/w/{self.DOCUMENT}?from=test#lyrics"
+        )
+
+        self.assertEqual(document, self.DOCUMENT)
+        self.assertEqual(page_url, self.PAGE_URL)
+
+    def test_public_html_request_returns_page_source_and_final_url(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = self.HTML_FIXTURE.encode("utf-8")
+        response.geturl.return_value = self.PAGE_URL
+
+        with (
+            patch.object(bot, "NAMUWIKI_REQUEST_INTERVAL_SECONDS", 0),
+            patch.object(
+                bot.urllib.request,
+                "urlopen",
+                return_value=response,
+            ) as urlopen,
+        ):
+            result = bot.request_namuwiki_html(self.PAGE_URL)
+
+        self.assertEqual(result, (self.HTML_FIXTURE, self.PAGE_URL))
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, self.PAGE_URL)
+        self.assertIn("text/html", request.get_header("Accept"))
+
+    def test_api_request_reads_namumark_text_with_bearer_token(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps(
+            {"exists": True, "text": self.NAMUMARK_FIXTURE}
+        ).encode("utf-8")
+
+        with (
+            patch.object(bot, "NAMUWIKI_API_TOKEN", "test-token"),
+            patch.object(bot, "NAMUWIKI_REQUEST_INTERVAL_SECONDS", 0),
+            patch.object(
+                bot.urllib.request,
+                "urlopen",
+                return_value=response,
+            ) as urlopen,
+        ):
+            source = bot.request_namuwiki_api_source(self.DOCUMENT)
+
+        self.assertEqual(source, self.NAMUMARK_FIXTURE)
+        request = urlopen.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/edit/" + self.PAGE_URL.rsplit("/", 1)[1]))
+        self.assertEqual(
+            request.get_header("Authorization"),
+            "Bearer test-token",
+        )
+
+    def test_exact_namuwiki_page_uses_rendered_html_without_api_token(
+        self,
+    ) -> None:
+        track = make_track(self.DOCUMENT)
+        with (
+            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(bot, "NAMUWIKI_API_TOKEN", None),
+            patch.object(
+                bot,
+                "request_namuwiki_html",
+                return_value=(self.HTML_FIXTURE, self.PAGE_URL),
+            ) as html_lookup,
+        ):
+            result = bot.lookup_namuwiki_korean_lyrics(track)
+
+        self.assertEqual(
+            result,
+            (
+                self.EXPECTED_TRANSLATION,
+                "나무위키 · 한국어 번역",
+                self.PAGE_URL,
+            ),
+        )
+        html_lookup.assert_called_once_with(self.PAGE_URL)
+
+    def test_api_namumark_is_preferred_when_token_is_configured(self) -> None:
+        track = make_track(self.DOCUMENT)
+        with (
+            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(bot, "NAMUWIKI_API_TOKEN", "test-token"),
+            patch.object(
+                bot,
+                "request_namuwiki_api_source",
+                return_value=self.NAMUMARK_FIXTURE,
+            ) as api_lookup,
+            patch.object(bot, "request_namuwiki_html") as html_lookup,
+        ):
+            result = bot.lookup_namuwiki_korean_lyrics(track)
+
+        self.assertEqual(result[0], self.EXPECTED_TRANSLATION)
+        self.assertEqual(result[2], self.PAGE_URL)
+        api_lookup.assert_called_once_with(self.DOCUMENT)
+        html_lookup.assert_not_called()
+
+    async def test_namuwiki_translation_is_cached_before_youtube_fallback(
+        self,
+    ) -> None:
+        track = make_track(self.DOCUMENT)
+        namuwiki_result = (
+            self.EXPECTED_TRANSLATION,
+            "나무위키 · 한국어 번역",
+            self.PAGE_URL,
+        )
+
+        with (
+            patch.object(
+                bot,
+                "lookup_namuwiki_korean_lyrics",
+                return_value=namuwiki_result,
+            ) as namuwiki_lookup,
+            patch.object(
+                bot,
+                "get_youtube_korean_lyrics",
+                new=AsyncMock(),
+            ) as youtube_lookup,
+        ):
+            first = await bot.get_track_korean_translation(track)
+            second = await bot.get_track_korean_translation(track)
+
+        self.assertEqual(first, self.EXPECTED_TRANSLATION)
+        self.assertEqual(second, self.EXPECTED_TRANSLATION)
+        self.assertEqual(track.lyrics_translation_url, self.PAGE_URL)
+        namuwiki_lookup.assert_called_once_with(track)
+        youtube_lookup.assert_not_awaited()
+
+    async def test_unexpected_namuwiki_failure_still_uses_youtube(
+        self,
+    ) -> None:
+        track = make_track(self.DOCUMENT)
+        track.lyrics = "泥濘 鳴鳴"
+        track.lyrics_loaded = True
+
+        with (
+            patch.object(
+                bot,
+                "lookup_namuwiki_korean_lyrics",
+                side_effect=ValueError("unexpected response"),
+            ),
+            patch.object(
+                bot,
+                "get_youtube_korean_lyrics",
+                new=AsyncMock(
+                    return_value=("유튜브 번역 가사입니다", "YouTube 제공 한국어 자막")
+                ),
+            ) as youtube_lookup,
+        ):
+            translation = await bot.get_track_korean_translation(track)
+
+        self.assertEqual(translation, "유튜브 번역 가사입니다")
+        youtube_lookup.assert_awaited_once_with(track)
+
+    def test_translation_embed_links_to_the_source_document(self) -> None:
+        track = make_track(self.DOCUMENT)
+
+        embed = bot.make_lyrics_variant_embed(
+            track,
+            "한국어 번역",
+            self.EXPECTED_TRANSLATION,
+            "나무위키 · 한국어 번역",
+            self.PAGE_URL,
+        )
+
+        self.assertEqual(embed.url, self.PAGE_URL)
+        self.assertEqual(embed.footer.text, "나무위키 · 한국어 번역")
 
 
 class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
@@ -746,6 +1501,11 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
         message.edit.assert_awaited_once()
         final_embed = message.edit.await_args.kwargs["embed"]
         self.assertEqual(final_embed.description, "미제공")
+        final_view = message.edit.await_args.kwargs["view"]
+        self.assertEqual(
+            {item.label for item in final_view.children},
+            {"한국어 번역"},
+        )
         self.assertIs(state.lyrics_message, message)
 
     async def test_long_lyrics_replace_attachment_with_full_utf8_text(self) -> None:
@@ -776,12 +1536,16 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
         state = bot.get_state(guild_id)
         state.current = make_track("current")
         state.lyrics_message = message
+        lyrics_view = MagicMock()
+        state.lyrics_view = lyrics_view
 
         bot.stop_playback(state, guild_id)
         await asyncio.sleep(0)
 
         message.delete.assert_awaited_once()
+        lyrics_view.stop.assert_called_once_with()
         self.assertIsNone(state.lyrics_message)
+        self.assertIsNone(state.lyrics_view)
 
     async def test_empty_queue_deletes_the_lyrics_message(self) -> None:
         guild_id = 604

@@ -1,2 +1,4 @@
 discord.py[voice]>=2.4,<3
 yt-dlp[default]>=2025.11.12
+SudachiPy>=0.6.10,<0.7
+SudachiDict-core>=20250129
