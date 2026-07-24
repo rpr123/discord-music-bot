@@ -20,10 +20,232 @@ def make_track(title: str) -> bot.Track:
 
 class SearchRoutingTests(unittest.TestCase):
     def test_song_and_auto_seed_use_the_same_youtube_search(self) -> None:
-        expected = "ytsearch1:sunfaded music"
+        expected = f"ytsearch{bot.YOUTUBE_SEARCH_CANDIDATES}:sunfaded"
 
         self.assertEqual(bot.resolve_query("sunfaded"), expected)
         self.assertEqual(bot.resolve_query("sunfaded", None), expected)
+
+    def test_full_song_is_preferred_over_game_and_short_versions(self) -> None:
+        entries = [
+            {
+                "id": "I-CZXVMPiPg",
+                "title": "【シャニソン】コメティック「泥濘鳴鳴」3DMV（4K対応）",
+                "duration": 148,
+                "channel": "アイドルマスターチャンネル",
+            },
+            {
+                "id": "x5dIe0FKY_U",
+                "title": (
+                    "泥濘鳴鳴(Muddy Cries) / コメティック (CoMETIK) / "
+                    "歌詞 Color coded lyrics"
+                ),
+                "duration": 233,
+                "channel": "iluvsmurfs",
+            },
+            {
+                "id": "3fwoSr7hxZM",
+                "title": "泥濘鳴鳴(斑鳩ルカver)",
+                "duration": 235,
+                "channel": "CoMETIK SOLO COLLECTION",
+            },
+            {
+                "id": "LkbTHyLUO4k",
+                "title": "【シャニソン】Short Ver. コメティック「泥濘鳴鳴」3DMV",
+                "duration": 95,
+                "channel": "アイドルマスターチャンネル",
+            },
+        ]
+
+        selected = bot.select_youtube_search_result("でいねいめいめい", entries)
+
+        self.assertEqual(selected["id"], "x5dIe0FKY_U")
+
+    def test_title_relevance_beats_an_unrelated_longer_result(self) -> None:
+        entries = [
+            {
+                "id": "quick-song1",
+                "title": "Artist - Quick Song (Official Audio)",
+                "duration": 155,
+            },
+            {
+                "id": "other-song1",
+                "title": "Artist - Different Song (Full Version)",
+                "duration": 240,
+            },
+        ]
+
+        selected = bot.select_youtube_search_result("Artist Quick Song", entries)
+
+        self.assertEqual(selected["id"], "quick-song1")
+
+    def test_explicit_game_mv_request_is_respected(self) -> None:
+        entries = [
+            {
+                "id": "I-CZXVMPiPg",
+                "title": "【シャニソン】コメティック「泥濘鳴鳴」3DMV（4K対応）",
+                "duration": 148,
+            },
+            {
+                "id": "x5dIe0FKY_U",
+                "title": "泥濘鳴鳴 / コメティック / 歌詞 Color coded lyrics",
+                "duration": 233,
+            },
+        ]
+
+        selected = bot.select_youtube_search_result("泥濘鳴鳴 game mv", entries)
+
+        self.assertEqual(selected["id"], "I-CZXVMPiPg")
+
+    def test_youtube_music_song_result_preserves_catalog_metadata(self) -> None:
+        entry = bot.youtube_music_result_to_entry(
+            {
+                "resultType": "song",
+                "videoId": "CuRIuFRD1zI",
+                "title": "泥濘鳴鳴",
+                "artists": [{"name": "CoMETIK"}],
+                "album": {"name": "THE IDOLM@STER SHINY COLORS ECHOES 08"},
+                "duration_seconds": 235,
+                "thumbnails": [{"url": "https://example.com/cover.jpg"}],
+            }
+        )
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["id"], "CuRIuFRD1zI")
+        self.assertEqual(entry["track"], "泥濘鳴鳴")
+        self.assertEqual(entry["artist"], "CoMETIK")
+        self.assertEqual(entry["duration"], 235)
+        self.assertEqual(
+            entry["webpage_url"],
+            "https://www.youtube.com/watch?v=CuRIuFRD1zI",
+        )
+
+    def test_youtube_music_ignores_non_song_results(self) -> None:
+        result = bot.youtube_music_result_to_entry(
+            {
+                "resultType": "episode",
+                "videoId": "abcdefghijk",
+                "title": "Unrelated podcast",
+            }
+        )
+
+        self.assertIsNone(result)
+
+    def test_top_album_supplies_artist_hint(self) -> None:
+        results = [
+            {
+                "category": "Top result",
+                "resultType": "album",
+                "title": "THE IDOLM@STER SHINY COLORS ECHOES 08",
+                "artists": [{"name": "CoMETIK"}],
+            },
+            {
+                "resultType": "album",
+                "title": "Unrelated karaoke",
+                "artists": [{"name": "Karaoke Artist"}],
+            },
+        ]
+
+        self.assertEqual(
+            bot.get_youtube_music_artist_hint("でいねいめいめい", results),
+            "CoMETIK",
+        )
+
+    def test_same_title_from_multiple_artists_skips_catalog_shortcut(self) -> None:
+        results = [
+            {
+                "resultType": "song",
+                "videoId": "keOnleW2eak",
+                "title": "らしさ",
+                "artists": [{"name": "Official髭男dism"}],
+                "duration_seconds": 313,
+            },
+            {
+                "resultType": "song",
+                "videoId": "abcdefghijk",
+                "title": "らしさ",
+                "artists": [{"name": "SUPER BEAVER"}],
+                "duration_seconds": 269,
+            },
+        ]
+
+        self.assertIsNone(
+            bot.select_youtube_music_song_result("らしさ", results)
+        )
+        self.assertIsNone(bot.get_youtube_music_artist_hint("らしさ", results))
+
+    def test_romanized_query_prefers_official_mv_over_full_fan_upload(self) -> None:
+        entries = [
+            {
+                "id": "BCMKhsXcdJI",
+                "title": "OFFICIAL HIGE DANDISM - Rashisa [Official Audio]",
+                "duration": 303,
+                "channel": "OFFICIAL HIGE DANDISM",
+            },
+            {
+                "id": "keOnleW2eak",
+                "title": "OFFICIAL HIGE DANDISM - Rashisa [Official Video]",
+                "duration": 313,
+                "channel": "OFFICIAL HIGE DANDISM",
+            },
+            {
+                "id": "MizuH2nfwaI",
+                "title": (
+                    "100 Meters - Theme Song FULL \"Rashisa\" by "
+                    "Official HIGE DANdism (Lyrics)"
+                ),
+                "duration": 313,
+                "channel": "Jamong",
+            },
+        ]
+
+        selected = bot.select_youtube_search_result("rashisa", entries)
+
+        self.assertEqual(selected["id"], "keOnleW2eak")
+
+    def test_enriched_search_prefers_bare_catalog_title(self) -> None:
+        entries = [
+            {
+                "id": "CuRIuFRD1zI",
+                "title": "泥濘鳴鳴",
+                "duration": 235,
+                "channel": "コメティック",
+            },
+            {
+                "id": "I-CZXVMPiPg",
+                "title": "【シャニソン】コメティック「泥濘鳴鳴」3DMV",
+                "duration": 148,
+                "channel": "アイドルマスターチャンネル",
+            },
+            {
+                "id": "x5dIe0FKY_U",
+                "title": (
+                    "泥濘鳴鳴(Muddy Cries) / コメティック (CoMETIK) / "
+                    "歌詞 Color coded lyrics"
+                ),
+                "duration": 233,
+                "channel": "iluvsmurfs",
+            },
+        ]
+        preferred_title = bot.infer_youtube_search_song_title(
+            entries[0],
+            "CoMETIK",
+        )
+
+        selected = bot.select_youtube_search_result(
+            "でいねいめいめい CoMETIK",
+            entries,
+            preferred_artist="CoMETIK",
+            preferred_title=preferred_title,
+        )
+
+        self.assertEqual(preferred_title, "泥濘鳴鳴")
+        self.assertEqual(selected["id"], "CuRIuFRD1zI")
+
+    def test_explicit_versions_skip_youtube_music_catalog(self) -> None:
+        self.assertFalse(bot.should_use_youtube_music_search("泥濘鳴鳴 game mv"))
+        self.assertFalse(bot.should_use_youtube_music_search("泥濘鳴鳴 cover"))
+        self.assertFalse(bot.should_use_youtube_music_search("泥濘鳴鳴 off vocal"))
+        self.assertTrue(bot.should_use_youtube_music_search("泥濘鳴鳴"))
 
     def test_album_and_playlist_use_youtube_playlist_search(self) -> None:
         album_url = bot.resolve_query("NewJeans Get Up", "album")
@@ -65,6 +287,176 @@ class SearchRoutingTests(unittest.TestCase):
         self.assertEqual(
             bot.get_playlist_result_url(result),
             "https://www.youtube.com/playlist?list=PL1234567890ABCDEFG",
+        )
+
+
+class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_text_search_uses_flat_candidates_and_selector(self) -> None:
+        entries = [
+            {"id": "first-track", "title": "Game Version", "duration": 120},
+            {"id": "second-track", "title": "Full Version", "duration": 240},
+        ]
+        extract = AsyncMock(return_value={"entries": entries})
+
+        with (
+            patch.object(
+                bot,
+                "search_youtube_music",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch.object(bot, "extract_ytdl_info", extract),
+            patch.object(
+                bot,
+                "select_youtube_search_result",
+                return_value=entries[1],
+            ) as select,
+        ):
+            result = await bot.extract_first_info(
+                "sample song",
+                f"ytsearch{bot.YOUTUBE_SEARCH_CANDIDATES}:sample song",
+            )
+
+        self.assertIs(result, entries[1])
+        extract.assert_awaited_once_with(
+            bot.YTDL_SEARCH_OPTIONS,
+            f"ytsearch{bot.YOUTUBE_SEARCH_CANDIDATES}:sample song",
+            "YouTube search",
+        )
+        select.assert_called_once_with("sample song", entries)
+
+    async def test_catalog_song_is_resolved_directly(self) -> None:
+        music_results = [
+            {
+                "resultType": "song",
+                "videoId": "CuRIuFRD1zI",
+                "title": "泥濘鳴鳴",
+                "artists": [{"name": "CoMETIK"}],
+                "duration_seconds": 235,
+            }
+        ]
+        resolved = {
+            "id": "CuRIuFRD1zI",
+            "title": "泥濘鳴鳴",
+            "webpage_url": "https://www.youtube.com/watch?v=CuRIuFRD1zI",
+            "artist": "CoMETIK",
+        }
+        extract = AsyncMock(return_value=resolved)
+
+        with (
+            patch.object(
+                bot,
+                "search_youtube_music",
+                new=AsyncMock(return_value=music_results),
+            ),
+            patch.object(bot, "extract_ytdl_info", extract),
+        ):
+            result = await bot.extract_first_info(
+                "でいねいめいめい",
+                f"ytsearch{bot.YOUTUBE_SEARCH_CANDIDATES}:"
+                "でいねいめいめい",
+            )
+
+        self.assertIs(result, resolved)
+        extract.assert_awaited_once_with(
+            bot.YTDL_OPTIONS,
+            "https://www.youtube.com/watch?v=CuRIuFRD1zI",
+            "YouTube Music catalog song resolve",
+        )
+
+    async def test_top_album_artist_enriches_youtube_fallback(self) -> None:
+        music_results = [
+            {
+                "category": "Top result",
+                "resultType": "album",
+                "title": "THE IDOLM@STER SHINY COLORS ECHOES 08",
+                "artists": [{"name": "CoMETIK"}],
+            }
+        ]
+        entries = [
+            {
+                "id": "CuRIuFRD1zI",
+                "title": "泥濘鳴鳴",
+                "duration": 235,
+                "channel": "コメティック",
+            },
+            {
+                "id": "I-CZXVMPiPg",
+                "title": "【シャニソン】コメティック「泥濘鳴鳴」3DMV",
+                "duration": 148,
+                "channel": "アイドルマスターチャンネル",
+            },
+        ]
+        extract = AsyncMock(return_value={"entries": entries})
+
+        with (
+            patch.object(
+                bot,
+                "search_youtube_music",
+                new=AsyncMock(return_value=music_results),
+            ),
+            patch.object(bot, "extract_ytdl_info", extract),
+        ):
+            result = await bot.extract_first_info(
+                "でいねいめいめい",
+                f"ytsearch{bot.YOUTUBE_SEARCH_CANDIDATES}:"
+                "でいねいめいめい",
+            )
+
+        self.assertEqual(result["id"], "CuRIuFRD1zI")
+        extract.assert_awaited_once_with(
+            bot.YTDL_SEARCH_OPTIONS,
+            f"ytsearch{bot.YOUTUBE_SEARCH_CANDIDATES}:"
+            "でいねいめいめい CoMETIK",
+            "YouTube search",
+        )
+
+    async def test_direct_url_keeps_full_extraction_options(self) -> None:
+        url = "https://www.youtube.com/watch?v=abcdefghijk"
+        info = {"id": "abcdefghijk", "title": "Direct song"}
+        extract = AsyncMock(return_value=info)
+        music_search = AsyncMock()
+
+        with (
+            patch.object(bot, "extract_ytdl_info", extract),
+            patch.object(bot, "search_youtube_music", new=music_search),
+        ):
+            result = await bot.extract_first_info(url, url)
+
+        self.assertIs(result, info)
+        music_search.assert_not_awaited()
+        extract.assert_awaited_once_with(
+            bot.YTDL_OPTIONS,
+            url,
+            "YouTube search",
+        )
+
+    async def test_text_track_defers_stream_resolution_until_playback(self) -> None:
+        info = {
+            "id": "abcdefghijk",
+            "title": "Selected song",
+            "duration": 180,
+            "webpage_url": "https://www.youtube.com/watch?v=abcdefghijk",
+        }
+
+        with (
+            patch.object(
+                bot,
+                "extract_first_info",
+                new=AsyncMock(return_value=info),
+            ),
+            patch.object(
+                bot,
+                "resolve_track_stream",
+                new=AsyncMock(),
+            ) as resolve_stream,
+        ):
+            track = await bot.extract_track("selected song", "tester")
+
+        resolve_stream.assert_not_awaited()
+        self.assertIsNone(track.stream_url)
+        self.assertEqual(
+            track.source_url,
+            "https://www.youtube.com/watch?v=abcdefghijk",
         )
 
 
@@ -120,6 +512,86 @@ class DiscordHttpResilienceTests(unittest.IsolatedAsyncioTestCase):
             await bot.delete_music_request_message(message)
 
         self.assertIn("HTTP 500", "\n".join(logs.output))
+
+
+class QueueFeedbackLatencyTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self) -> None:
+        bot.music_states.clear()
+
+    async def test_queue_feedback_precedes_stream_preparation(self) -> None:
+        class Requester:
+            display_name = "tester"
+            id = 123
+
+        class Voice:
+            def is_playing(self) -> bool:
+                return False
+
+            def is_paused(self) -> bool:
+                return False
+
+        guild_id = 654
+        state = bot.get_state(guild_id)
+        state.voice = Voice()
+        track = make_track("queued")
+        track.stream_url = None
+        initial_response = MagicMock()
+        initial_response.edit = AsyncMock()
+        channel = MagicMock()
+        playback_gate = asyncio.Event()
+
+        async def delayed_playback(
+            requested_guild_id: int,
+            announce: bool = True,
+        ) -> None:
+            self.assertEqual(requested_guild_id, guild_id)
+            self.assertFalse(announce)
+            await playback_gate.wait()
+            state.queue.clear()
+            state.current = track
+
+        with (
+            patch.object(
+                bot,
+                "extract_track",
+                new=AsyncMock(return_value=track),
+            ),
+            patch.object(bot, "play_next", new=delayed_playback),
+            patch.object(
+                bot,
+                "delete_message_later",
+                new=AsyncMock(),
+            ),
+            patch.object(
+                bot,
+                "update_control_panel",
+                new=AsyncMock(),
+            ),
+        ):
+            enqueue_task = asyncio.create_task(
+                bot.enqueue_tracks(
+                    guild_id,
+                    channel,
+                    Requester(),
+                    "queued",
+                    initial_response=initial_response,
+                )
+            )
+            for _ in range(5):
+                await asyncio.sleep(0)
+                if initial_response.edit.await_count:
+                    break
+
+            initial_response.edit.assert_awaited_once()
+            self.assertIsNotNone(
+                initial_response.edit.await_args.kwargs["embed"]
+            )
+            self.assertFalse(enqueue_task.done())
+
+            playback_gate.set()
+            result = await enqueue_task
+
+        self.assertTrue(result)
 
 
 class AutoRequestParsingTests(unittest.TestCase):
@@ -511,6 +983,33 @@ class LyricsLookupTests(unittest.TestCase):
             [("exact song", "artist"), ("exact song", None)],
         )
 
+    def test_romanized_official_title_matches_native_lrclib_record(self) -> None:
+        track = bot.Track(
+            title="OFFICIAL HIGE DANDISM - Rashisa [Official Video]",
+            webpage_url="https://www.youtube.com/watch?v=keOnleW2eak",
+            requester="tester",
+            source_url="https://www.youtube.com/watch?v=keOnleW2eak",
+            uploader="OFFICIAL HIGE DANDISM",
+            duration=313,
+        )
+        record = {
+            "trackName": "らしさ - Rashisa",
+            "artistName": "Official髭男dism",
+            "duration": 313,
+            "instrumental": False,
+            "plainLyrics": "Japanese lyrics fixture",
+        }
+
+        with patch.object(
+            bot,
+            "request_lyrics_records",
+            return_value=[record],
+        ) as request:
+            lyrics = bot.lookup_track_lyrics(track)
+
+        self.assertEqual(lyrics, "Japanese lyrics fixture")
+        request.assert_called_once_with("rashisa", "official hige dandism")
+
     def test_native_script_beats_nearby_romanized_duplicate(self) -> None:
         romanized_record = {
             "trackName": "Sparkle - movie ver.",
@@ -653,7 +1152,7 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(bot.select_korean_manual_subtitle(track))
 
-    def test_track_keeps_manual_and_only_korean_translated_caption_metadata(
+    def test_track_keeps_manual_but_ignores_automatic_caption_metadata(
         self,
     ) -> None:
         track = bot.make_track_from_info(
@@ -680,29 +1179,8 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(set(track.manual_subtitles), {"ja"})
-        self.assertEqual(set(track.korean_automatic_subtitles), {"ko"})
+        self.assertFalse(hasattr(track, "korean_automatic_subtitles"))
         self.assertEqual(track.subtitle_language, "ja")
-
-    def test_korean_automatic_subtitle_requires_tlang_ko(self) -> None:
-        track = make_track("captioned")
-        track.korean_automatic_subtitles = {
-            "ko": [
-                {"ext": "vtt", "url": "https://example.com/direct?lang=ko"},
-                {
-                    "ext": "json3",
-                    "url": "https://example.com/translated?lang=ja&tlang=ko",
-                },
-            ],
-        }
-
-        self.assertEqual(
-            bot.select_korean_automatic_subtitle(track),
-            (
-                "ko",
-                "json3",
-                "https://example.com/translated?lang=ja&tlang=ko",
-            ),
-        )
 
     async def test_lrclib_miss_falls_back_to_youtube_manual_subtitles(self) -> None:
         track = make_track("fallback")
@@ -754,6 +1232,10 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
             return [LyricsVariantTests.FakeToken(text)] if text else []
 
     async def asyncTearDown(self) -> None:
+        for state in bot.music_states.values():
+            bot.schedule_private_lyrics_cleanup(state)
+            bot.cancel_queue_message_cleanups(state)
+        await asyncio.sleep(0)
         bot.music_states.clear()
 
     def test_japanese_and_korean_lyrics_are_detected_locally(self) -> None:
@@ -806,17 +1288,12 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
 
     def test_variant_view_only_shows_modes_available_for_the_track(self) -> None:
         japanese_track = make_track("Japanese")
-        japanese_track.korean_automatic_subtitles = {
-            "ko": [
-                {
-                    "ext": "json3",
-                    "url": "https://example.com/translated?lang=ja&tlang=ko",
-                }
-            ],
-        }
         korean_track = make_track("Korean")
 
-        with patch.object(bot, "sudachi_dictionary", MagicMock()):
+        with (
+            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(bot, "sudachi_dictionary", MagicMock()),
+        ):
             japanese_view = bot.make_lyrics_variant_view(
                 100,
                 japanese_track,
@@ -830,11 +1307,11 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             {item.label for item in japanese_view.children},
-            {"한국어 번역", "히라가나 독음"},
+            {"나무위키 가사", "히라가나 독음"},
         )
         self.assertIsNone(korean_view)
 
-    def test_translation_button_accepts_manual_korean_subtitles_without_api_key(
+    def test_korean_lyrics_button_accepts_manual_subtitles_without_api_key(
         self,
     ) -> None:
         track = make_track("Japanese")
@@ -842,7 +1319,10 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
             "ko": [{"ext": "json3", "url": "https://example.com/ko"}],
         }
 
-        with patch.object(bot, "sudachi_dictionary", None):
+        with (
+            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", False),
+            patch.object(bot, "sudachi_dictionary", None),
+        ):
             view = bot.make_lyrics_variant_view(
                 100,
                 track,
@@ -852,10 +1332,10 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(view)
         self.assertEqual(
             {item.label for item in view.children},
-            {"한국어 번역"},
+            {"한국어 자막"},
         )
 
-    def test_translation_button_is_hidden_without_youtube_korean_subtitles(
+    def test_korean_lyrics_button_is_hidden_without_available_source(
         self,
     ) -> None:
         track = make_track("English")
@@ -872,7 +1352,7 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(view)
 
-    def test_translation_button_is_available_for_namuwiki_lookup(self) -> None:
+    def test_korean_lyrics_button_is_available_for_namuwiki_lookup(self) -> None:
         track = make_track("Foreign song")
 
         with (
@@ -888,10 +1368,22 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(view)
         self.assertEqual(
             {item.label for item in view.children},
-            {"한국어 번역"},
+            {"나무위키 가사"},
         )
 
-    def test_translation_button_is_available_when_original_lyrics_are_missing(
+    def test_confirmed_namuwiki_miss_hides_the_korean_lyrics_button(
+        self,
+    ) -> None:
+        track = make_track("Foreign song")
+        track.namuwiki_lyrics_checked = True
+
+        with (
+            patch.object(bot, "LYRICS_TRANSLATION_ENABLED", True),
+            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
+        ):
+            self.assertFalse(bot.can_show_korean_lyrics(track, "foreign lyrics"))
+
+    def test_korean_lyrics_button_is_available_when_original_lyrics_are_missing(
         self,
     ) -> None:
         track = make_track("泥濘鳴鳴")
@@ -906,10 +1398,55 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(view)
         self.assertEqual(
             {item.label for item in view.children},
-            {"한국어 번역"},
+            {"나무위키 가사"},
         )
 
-    def test_missing_korean_lyrics_do_not_offer_translation(self) -> None:
+    def test_namuwiki_reading_adds_hiragana_button_without_original_lyrics(
+        self,
+    ) -> None:
+        track = make_track("泥濘鳴鳴")
+        track.korean_lyrics = (
+            "泥濘 鳴鳴\n"
+            "でいねい めいめい\n"
+            "진창에서 울리는 노랫소리\n\n"
+            "礼を持って\n"
+            "れいをもって\n"
+            "예를 갖추어 다시 걸어가"
+        )
+        track.korean_lyrics_loaded = True
+        track.korean_lyrics_url = "https://namu.wiki/w/example"
+
+        with patch.object(bot, "sudachi_dictionary", None):
+            view = bot.make_lyrics_variant_view(100, track, "")
+
+        self.assertIsNotNone(view)
+        self.assertEqual(
+            {item.label for item in view.children},
+            {"나무위키 가사", "히라가나 독음"},
+        )
+
+    async def test_namuwiki_hiragana_reading_is_used_without_sudachi(
+        self,
+    ) -> None:
+        track = make_track("泥濘鳴鳴")
+        track.korean_lyrics = (
+            "泥濘 鳴鳴\n"
+            "デイネイ メイメイ\n"
+            "진창에서 울리는 노랫소리\n\n"
+            "礼を持って\n"
+            "れいをもって\n"
+            "예를 갖추어 다시 걸어가"
+        )
+        track.korean_lyrics_url = "https://namu.wiki/w/example"
+
+        with patch.object(bot, "sudachi_dictionary", None):
+            reading = await bot.get_track_hiragana_reading(track)
+
+        self.assertEqual(reading, "でいねい めいめい\nれいをもって")
+        self.assertEqual(track.lyrics_reading_source, "나무위키 · 일본어 독음")
+        self.assertEqual(track.lyrics_reading_url, track.korean_lyrics_url)
+
+    def test_missing_korean_lyrics_do_not_offer_korean_variant(self) -> None:
         track = make_track("한국 노래")
 
         with (
@@ -920,7 +1457,7 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(view)
 
-    async def test_manual_korean_subtitles_are_used_before_auto_translation(
+    async def test_manual_korean_subtitles_are_used_when_namuwiki_misses(
         self,
     ) -> None:
         track = make_track("foreign")
@@ -929,19 +1466,11 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
         track.manual_subtitles = {
             "ko": [{"ext": "json3", "url": "https://example.com/manual"}],
         }
-        track.korean_automatic_subtitles = {
-            "ko": [
-                {
-                    "ext": "json3",
-                    "url": "https://example.com/auto?lang=ja&tlang=ko",
-                }
-            ],
-        }
 
         with (
             patch.object(
                 bot,
-                "lookup_namuwiki_korean_lyrics",
+                "lookup_namuwiki_lyrics",
                 return_value=None,
             ),
             patch.object(
@@ -950,59 +1479,54 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value="사람이 작성한 한국어 자막"),
             ) as subtitle_lookup,
         ):
-            translation = await bot.get_track_korean_translation(track)
+            lyrics = await bot.get_track_korean_lyrics(track)
 
-        self.assertEqual(translation, "사람이 작성한 한국어 자막")
-        self.assertEqual(track.lyrics_translation_source, "YouTube 제공 한국어 자막")
+        self.assertEqual(lyrics, "사람이 작성한 한국어 자막")
+        self.assertEqual(track.korean_lyrics_source, "YouTube 제공 한국어 자막")
         subtitle_lookup.assert_awaited_once_with(
             track,
             ("ko", "json3", "https://example.com/manual"),
-            purpose="manual Korean translation",
+            purpose="manual Korean lyrics",
         )
 
-    async def test_auto_translation_follows_manual_subtitle_failure(self) -> None:
-        track = make_track("foreign")
-        track.lyrics = "Original lyrics"
-        track.lyrics_loaded = True
-        track.manual_subtitles = {
-            "ko": [{"ext": "json3", "url": "https://example.com/manual"}],
-        }
-        track.korean_automatic_subtitles = {
-            "ko": [
-                {
-                    "ext": "json3",
-                    "url": "https://example.com/auto?lang=ja&tlang=ko",
-                }
-            ],
-        }
+    async def test_automatic_captions_are_never_used_for_korean_lyrics(
+        self,
+    ) -> None:
+        track = bot.make_track_from_info(
+            {
+                "id": "machine001",
+                "title": "Foreign song",
+                "webpage_url": "https://www.youtube.com/watch?v=machine001",
+                "automatic_captions": {
+                    "ko": [
+                        {
+                            "ext": "json3",
+                            "url": "https://example.com/auto?lang=ja&tlang=ko",
+                        }
+                    ],
+                },
+                "language": "ja",
+            },
+            "tester",
+            "https://www.youtube.com/watch?v=machine001",
+        )
 
         with (
-            patch.object(
-                bot,
-                "lookup_namuwiki_korean_lyrics",
-                return_value=None,
-            ),
+            patch.object(bot, "lookup_namuwiki_lyrics", return_value=None),
             patch.object(
                 bot,
                 "get_selected_youtube_subtitle",
-                new=AsyncMock(
-                    side_effect=[
-                        bot.YouTubeSubtitleError("expired"),
-                        "자동 번역 가사",
-                    ]
-                ),
+                new=AsyncMock(),
             ) as subtitle_lookup,
         ):
-            translation = await bot.get_track_korean_translation(track)
+            with self.assertRaises(bot.KoreanLyricsError):
+                await bot.get_track_korean_lyrics(track)
 
-        self.assertEqual(translation, "자동 번역 가사")
-        self.assertEqual(
-            track.lyrics_translation_source,
-            "YouTube 한국어 자동 번역 자막",
-        )
-        self.assertEqual(subtitle_lookup.await_count, 2)
+        subtitle_lookup.assert_not_awaited()
 
-    async def test_translation_button_uses_private_followup_and_track_cache(self) -> None:
+    async def test_korean_lyrics_button_uses_private_followup_and_track_cache(
+        self,
+    ) -> None:
         guild_id = 101
         track = make_track("foreign")
         track.lyrics = "Original lyrics"
@@ -1011,7 +1535,13 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
         state.current = track
         interaction = MagicMock()
         interaction.response.defer = AsyncMock()
-        interaction.followup.send = AsyncMock()
+        first_message = MagicMock()
+        first_message.delete = AsyncMock()
+        second_message = MagicMock()
+        second_message.delete = AsyncMock()
+        interaction.followup.send = AsyncMock(
+            side_effect=[first_message, second_message]
+        )
         view = bot.LyricsVariantView.__new__(bot.LyricsVariantView)
         view.guild_id = guild_id
         view.track = track
@@ -1019,29 +1549,61 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 bot,
-                "lookup_namuwiki_korean_lyrics",
+                "lookup_namuwiki_lyrics",
                 return_value=None,
             ),
             patch.object(
                 bot,
                 "get_youtube_korean_lyrics",
                 new=AsyncMock(
-                    return_value=("번역된 가사", "YouTube 한국어 자동 번역 자막")
+                    return_value=("사람이 작성한 한국어 자막", "YouTube 제공 한국어 자막")
                 ),
-            ) as request_translation,
+            ) as request_lyrics,
         ):
-            await view.show_translation(interaction)
-            await view.show_translation(interaction)
+            await view.show_korean_lyrics(interaction)
+            await view.show_korean_lyrics(interaction)
 
         interaction.response.defer.assert_awaited_with(ephemeral=True, thinking=True)
         self.assertEqual(interaction.followup.send.await_count, 2)
         self.assertTrue(
             all(
-                call.kwargs["ephemeral"]
+                call.kwargs["ephemeral"] and call.kwargs["wait"]
                 for call in interaction.followup.send.await_args_list
             )
         )
-        request_translation.assert_awaited_once_with(track)
+        request_lyrics.assert_awaited_once_with(track)
+        first_message.delete.assert_not_awaited()
+        second_message.delete.assert_not_awaited()
+        self.assertEqual(
+            state.private_lyrics_messages[track.track_id],
+            [first_message, second_message],
+        )
+
+        bot.schedule_private_lyrics_cleanup(state, track.track_id)
+        await asyncio.sleep(0)
+
+        first_message.delete.assert_awaited_once_with()
+        second_message.delete.assert_awaited_once_with()
+        self.assertNotIn(track.track_id, state.private_lyrics_messages)
+
+    async def test_late_private_lyrics_result_is_deleted_after_track_change(
+        self,
+    ) -> None:
+        guild_id = 102
+        finished_track = make_track("finished")
+        state = bot.get_state(guild_id)
+        state.current = make_track("next")
+        message = MagicMock()
+        message.delete = AsyncMock()
+
+        await bot.register_private_lyrics_message(
+            guild_id,
+            finished_track,
+            message,
+        )
+
+        message.delete.assert_awaited_once_with()
+        self.assertFalse(state.private_lyrics_messages)
 
 
 class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
@@ -1075,8 +1637,12 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
     || 泥濘 鳴鳴 || でいねい めいめい || 진창에서 울리는 노랫소리 ||
     || 礼を持って || れいをもって || 예를 갖추어 다시 걸어가 ||
     """
-    EXPECTED_TRANSLATION = (
-        "진창에서 울리는 노랫소리\n"
+    EXPECTED_LYRICS = (
+        "泥濘 鳴鳴\n"
+        "でいねい めいめい\n"
+        "진창에서 울리는 노랫소리\n\n"
+        "礼を持って\n"
+        "れいをもって\n"
         "예를 갖추어 다시 걸어가"
     )
     DOCUMENT = "泥濘鳴鳴"
@@ -1085,21 +1651,21 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         "%E6%B3%A5%E6%BF%98%E9%B3%B4%E9%B3%B4"
     )
 
-    def test_rendered_html_extracts_only_the_korean_column(self) -> None:
+    def test_rendered_html_preserves_source_reading_and_translation(self) -> None:
         self.assertEqual(
-            bot.extract_korean_translation_from_html(self.HTML_FIXTURE),
-            self.EXPECTED_TRANSLATION,
+            bot.extract_namuwiki_lyrics_from_html(self.HTML_FIXTURE),
+            self.EXPECTED_LYRICS,
         )
 
-    def test_namumark_extracts_only_the_korean_column(self) -> None:
+    def test_namumark_preserves_source_reading_and_translation(self) -> None:
         self.assertEqual(
-            bot.extract_korean_translation_from_namumark(
+            bot.extract_namuwiki_lyrics_from_namumark(
                 self.NAMUMARK_FIXTURE
             ),
-            self.EXPECTED_TRANSLATION,
+            self.EXPECTED_LYRICS,
         )
 
-    def test_headerless_interleaved_html_uses_translation_not_reading(
+    def test_headerless_interleaved_html_preserves_complete_groups(
         self,
     ) -> None:
         source = """
@@ -1123,16 +1689,27 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         """
 
         self.assertEqual(
-            bot.extract_korean_translation_from_html(source),
+            bot.extract_namuwiki_lyrics_from_html(source),
             (
+                "持ち合った\n"
+                "모치앗타\n"
                 "서로가 가진 건\n"
+                "\n"
+                "それぞれ\n"
+                "소레조레\n"
                 "제각각 달랐지만\n"
+                "\n"
+                "視線は違えど\n"
+                "시센와 치가에도\n"
                 "바라보는 곳은 달라도\n"
+                "\n"
+                "掛け合わせるわ 今\n"
+                "카케아와세루와 이마\n"
                 "지금 서로의 마음을 포개"
             ),
         )
 
-    def test_interleaved_html_across_rows_uses_translation_not_reading(
+    def test_interleaved_html_across_rows_preserves_complete_groups(
         self,
     ) -> None:
         source = """
@@ -1155,16 +1732,27 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         """
 
         self.assertEqual(
-            bot.extract_korean_translation_from_html(source),
+            bot.extract_namuwiki_lyrics_from_html(source),
             (
+                "持ち合った\n"
+                "모치앗타\n"
                 "서로가 가진 건\n"
+                "\n"
+                "それぞれ\n"
+                "소레조레\n"
                 "제각각 달랐지만\n"
+                "\n"
+                "視線は違えど\n"
+                "시센와 치가에도\n"
                 "바라보는 곳은 달라도\n"
+                "\n"
+                "掛け合わせるわ 今\n"
+                "카케아와세루와 이마\n"
                 "지금 서로의 마음을 포개"
             ),
         )
 
-    def test_multiline_namumark_cell_extracts_interleaved_translation(
+    def test_multiline_namumark_cell_preserves_complete_groups(
         self,
     ) -> None:
         source = """
@@ -1185,11 +1773,22 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         """
 
         self.assertEqual(
-            bot.extract_korean_translation_from_namumark(source),
+            bot.extract_namuwiki_lyrics_from_namumark(source),
             (
+                "持ち合った\n"
+                "모치앗타\n"
                 "서로가 가진 건\n"
+                "\n"
+                "それぞれ\n"
+                "소레조레\n"
                 "제각각 달랐지만\n"
+                "\n"
+                "視線は違えど\n"
+                "시센와 치가에도\n"
                 "바라보는 곳은 달라도\n"
+                "\n"
+                "掛け合わせるわ 今\n"
+                "카케아와세루와 이마\n"
                 "지금 서로의 마음을 포개"
             ),
         )
@@ -1207,7 +1806,7 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         """
 
         self.assertIsNone(
-            bot.extract_korean_translation_from_html(source)
+            bot.extract_namuwiki_lyrics_from_html(source)
         )
 
     def test_short_metadata_translation_is_not_mistaken_for_lyrics(self) -> None:
@@ -1219,7 +1818,25 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         """
 
         self.assertIsNone(
-            bot.extract_korean_translation_from_html(source)
+            bot.extract_namuwiki_lyrics_from_html(source)
+        )
+
+    def test_long_bilingual_metadata_is_not_mistaken_for_lyrics(self) -> None:
+        source = """
+        <table>
+          <tr><th>원문</th><th>한국어 번역</th></tr>
+          <tr>
+            <td>Official description for the song and its release.</td>
+            <td>
+              이 문서는 곡의 발매 정보와 제작 배경을 설명하는 문서이며
+              실제 가사 내용은 수록되어 있지 않습니다.
+            </td>
+          </tr>
+        </table>
+        """
+
+        self.assertIsNone(
+            bot.extract_namuwiki_lyrics_from_html(source)
         )
 
     def test_repeated_lyrics_lines_are_preserved(self) -> None:
@@ -1232,8 +1849,13 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         """
 
         self.assertEqual(
-            bot.extract_korean_translation_from_html(source),
-            "같은 후렴을 다시 불러\n같은 후렴을 다시 불러",
+            bot.extract_namuwiki_lyrics_from_html(source),
+            (
+                "repeat\n"
+                "같은 후렴을 다시 불러\n\n"
+                "repeat\n"
+                "같은 후렴을 다시 불러"
+            ),
         )
 
     def test_exact_song_title_is_the_first_document_candidate(self) -> None:
@@ -1336,16 +1958,48 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
                 return_value=(self.HTML_FIXTURE, self.PAGE_URL),
             ) as html_lookup,
         ):
-            result = bot.lookup_namuwiki_korean_lyrics(track)
+            result = bot.lookup_namuwiki_lyrics(track)
 
         self.assertEqual(
             result,
             (
-                self.EXPECTED_TRANSLATION,
-                "나무위키 · 한국어 번역",
+                self.EXPECTED_LYRICS,
+                "나무위키 · 원문·독음·번역",
                 self.PAGE_URL,
             ),
         )
+        html_lookup.assert_called_once_with(self.PAGE_URL)
+
+    def test_existing_namuwiki_page_without_lyrics_returns_none(self) -> None:
+        track = make_track(self.DOCUMENT)
+        page_without_lyrics = """
+        <html>
+          <body>
+            <table>
+              <tr><th>원문</th><th>한국어 번역</th></tr>
+              <tr>
+                <td>Official description for the song and its release.</td>
+                <td>
+                  이 문서는 곡의 발매 정보와 제작 배경을 설명하는 문서이며
+                  실제 가사 내용은 수록되어 있지 않습니다.
+                </td>
+              </tr>
+            </table>
+          </body>
+        </html>
+        """
+        with (
+            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(bot, "NAMUWIKI_API_TOKEN", None),
+            patch.object(
+                bot,
+                "request_namuwiki_html",
+                return_value=(page_without_lyrics, self.PAGE_URL),
+            ) as html_lookup,
+        ):
+            result = bot.lookup_namuwiki_lyrics(track)
+
+        self.assertIsNone(result)
         html_lookup.assert_called_once_with(self.PAGE_URL)
 
     def test_api_namumark_is_preferred_when_token_is_configured(self) -> None:
@@ -1360,27 +2014,27 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
             ) as api_lookup,
             patch.object(bot, "request_namuwiki_html") as html_lookup,
         ):
-            result = bot.lookup_namuwiki_korean_lyrics(track)
+            result = bot.lookup_namuwiki_lyrics(track)
 
-        self.assertEqual(result[0], self.EXPECTED_TRANSLATION)
+        self.assertEqual(result[0], self.EXPECTED_LYRICS)
         self.assertEqual(result[2], self.PAGE_URL)
         api_lookup.assert_called_once_with(self.DOCUMENT)
         html_lookup.assert_not_called()
 
-    async def test_namuwiki_translation_is_cached_before_youtube_fallback(
+    async def test_namuwiki_lyrics_are_cached_before_youtube_fallback(
         self,
     ) -> None:
         track = make_track(self.DOCUMENT)
         namuwiki_result = (
-            self.EXPECTED_TRANSLATION,
-            "나무위키 · 한국어 번역",
+            self.EXPECTED_LYRICS,
+            "나무위키 · 원문·독음·번역",
             self.PAGE_URL,
         )
 
         with (
             patch.object(
                 bot,
-                "lookup_namuwiki_korean_lyrics",
+                "lookup_namuwiki_lyrics",
                 return_value=namuwiki_result,
             ) as namuwiki_lookup,
             patch.object(
@@ -1389,12 +2043,12 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(),
             ) as youtube_lookup,
         ):
-            first = await bot.get_track_korean_translation(track)
-            second = await bot.get_track_korean_translation(track)
+            first = await bot.get_track_korean_lyrics(track)
+            second = await bot.get_track_korean_lyrics(track)
 
-        self.assertEqual(first, self.EXPECTED_TRANSLATION)
-        self.assertEqual(second, self.EXPECTED_TRANSLATION)
-        self.assertEqual(track.lyrics_translation_url, self.PAGE_URL)
+        self.assertEqual(first, self.EXPECTED_LYRICS)
+        self.assertEqual(second, self.EXPECTED_LYRICS)
+        self.assertEqual(track.korean_lyrics_url, self.PAGE_URL)
         namuwiki_lookup.assert_called_once_with(track)
         youtube_lookup.assert_not_awaited()
 
@@ -1408,7 +2062,7 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 bot,
-                "lookup_namuwiki_korean_lyrics",
+                "lookup_namuwiki_lyrics",
                 side_effect=ValueError("unexpected response"),
             ),
             patch.object(
@@ -1419,30 +2073,32 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ) as youtube_lookup,
         ):
-            translation = await bot.get_track_korean_translation(track)
+            lyrics = await bot.get_track_korean_lyrics(track)
 
-        self.assertEqual(translation, "유튜브 번역 가사입니다")
+        self.assertEqual(lyrics, "유튜브 번역 가사입니다")
         youtube_lookup.assert_awaited_once_with(track)
 
-    def test_translation_embed_links_to_the_source_document(self) -> None:
+    def test_korean_lyrics_embed_links_to_the_source_document(self) -> None:
         track = make_track(self.DOCUMENT)
 
         embed = bot.make_lyrics_variant_embed(
             track,
-            "한국어 번역",
-            self.EXPECTED_TRANSLATION,
-            "나무위키 · 한국어 번역",
+            "나무위키 가사",
+            self.EXPECTED_LYRICS,
+            "나무위키 · 원문·독음·번역",
             self.PAGE_URL,
         )
 
         self.assertEqual(embed.url, self.PAGE_URL)
-        self.assertEqual(embed.footer.text, "나무위키 · 한국어 번역")
+        self.assertEqual(embed.footer.text, "나무위키 · 원문·독음·번역")
 
 
 class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         for state in bot.music_states.values():
             bot.cancel_lyrics_publish(state)
+            bot.schedule_private_lyrics_cleanup(state)
+            bot.cancel_queue_message_cleanups(state)
         await asyncio.sleep(0)
         bot.music_states.clear()
         bot.configured_music_channels.clear()
@@ -1494,19 +2150,135 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
         track = make_track("missing")
         state.current = track
 
-        with patch.object(bot, "get_track_lyrics", new=AsyncMock(return_value=None)):
+        async def confirm_missing_namuwiki(target: bot.Track) -> str | None:
+            target.namuwiki_lyrics_checked = True
+            return None
+
+        with (
+            patch.object(
+                bot,
+                "get_track_lyrics",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                bot,
+                "get_track_namuwiki_lyrics",
+                new=AsyncMock(side_effect=confirm_missing_namuwiki),
+            ) as namuwiki_lookup,
+        ):
             await bot.publish_current_lyrics(guild_id, track)
 
         channel.send.assert_awaited_once()
-        message.edit.assert_awaited_once()
+        self.assertEqual(message.edit.await_count, 2)
         final_embed = message.edit.await_args.kwargs["embed"]
         self.assertEqual(final_embed.description, "미제공")
         final_view = message.edit.await_args.kwargs["view"]
-        self.assertEqual(
-            {item.label for item in final_view.children},
-            {"한국어 번역"},
-        )
+        self.assertIsNone(final_view)
         self.assertIs(state.lyrics_message, message)
+        namuwiki_lookup.assert_awaited_once_with(track)
+        self.assertIsNone(state.namuwiki_notice_message)
+
+    async def test_missing_original_lyrics_publish_a_namuwiki_notice(
+        self,
+    ) -> None:
+        guild_id = 606
+        channel, lyrics_message = self.make_channel_and_message()
+        namuwiki_message = MagicMock()
+        namuwiki_message.id = 702
+        namuwiki_message.channel = channel
+        namuwiki_message.edit = AsyncMock(return_value=namuwiki_message)
+        namuwiki_message.delete = AsyncMock()
+        channel.send.side_effect = [lyrics_message, namuwiki_message]
+
+        state = bot.get_state(guild_id)
+        state.announcement_channel = channel
+        track = make_track("namuwiki fallback")
+        state.current = track
+
+        async def find_namuwiki(target: bot.Track) -> str:
+            target.korean_lyrics_source = "나무위키 · 원문·독음·번역"
+            target.korean_lyrics_url = "https://namu.wiki/w/example"
+            return "원문\n독음\n번역"
+
+        with (
+            patch.object(
+                bot,
+                "get_track_lyrics",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                bot,
+                "get_track_namuwiki_lyrics",
+                new=AsyncMock(side_effect=find_namuwiki),
+            ) as namuwiki_lookup,
+        ):
+            await bot.publish_current_lyrics(guild_id, track)
+
+        self.assertEqual(channel.send.await_count, 2)
+        namuwiki_lookup.assert_awaited_once_with(track)
+        namuwiki_embed = channel.send.await_args_list[1].kwargs["embed"]
+        self.assertIn("나무위키 가사 발견", namuwiki_embed.title)
+        self.assertEqual(
+            namuwiki_embed.description,
+            "원문 가사는 찾지 못했지만, "
+            "나무위키에는 원문·독음·번역 가사가 있어요.",
+        )
+        self.assertNotIn("원문\n독음\n번역", namuwiki_embed.description)
+        self.assertEqual(namuwiki_embed.url, "https://namu.wiki/w/example")
+        self.assertNotIn("file", channel.send.await_args_list[1].kwargs)
+        self.assertIs(state.namuwiki_notice_message, namuwiki_message)
+
+    async def test_available_original_lyrics_do_not_publish_namuwiki_notice(
+        self,
+    ) -> None:
+        guild_id = 607
+        channel, _ = self.make_channel_and_message()
+        state = bot.get_state(guild_id)
+        state.announcement_channel = channel
+        track = make_track("original lyrics available")
+        state.current = track
+
+        with (
+            patch.object(
+                bot,
+                "get_track_lyrics",
+                new=AsyncMock(return_value="lrclib lyrics"),
+            ),
+            patch.object(
+                bot,
+                "get_track_namuwiki_lyrics",
+                new=AsyncMock(),
+            ) as namuwiki_lookup,
+        ):
+            await bot.publish_current_lyrics(guild_id, track)
+
+        channel.send.assert_awaited_once()
+        namuwiki_lookup.assert_not_awaited()
+        self.assertIsNone(state.namuwiki_notice_message)
+
+    async def test_new_track_removes_the_previous_namuwiki_notice(self) -> None:
+        guild_id = 609
+        channel, lyrics_message = self.make_channel_and_message()
+        previous_namuwiki_message = MagicMock()
+        previous_namuwiki_message.channel = channel
+        previous_namuwiki_message.delete = AsyncMock()
+
+        state = bot.get_state(guild_id)
+        state.announcement_channel = channel
+        state.lyrics_message = lyrics_message
+        state.namuwiki_notice_message = previous_namuwiki_message
+        track = make_track("next track")
+        state.current = track
+
+        with patch.object(
+            bot,
+            "get_track_lyrics",
+            new=AsyncMock(return_value="next lyrics"),
+        ):
+            await bot.publish_current_lyrics(guild_id, track)
+
+        previous_namuwiki_message.delete.assert_awaited_once()
+        self.assertIsNone(state.namuwiki_notice_message)
 
     async def test_long_lyrics_replace_attachment_with_full_utf8_text(self) -> None:
         guild_id = 602
@@ -1532,10 +2304,19 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stop_deletes_the_lyrics_message(self) -> None:
         guild_id = 603
-        _, message = self.make_channel_and_message()
+        channel, message = self.make_channel_and_message()
+        namuwiki_message = MagicMock()
+        namuwiki_message.channel = channel
+        namuwiki_message.delete = AsyncMock()
         state = bot.get_state(guild_id)
         state.current = make_track("current")
+        private_lyrics_message = MagicMock()
+        private_lyrics_message.delete = AsyncMock()
+        state.private_lyrics_messages[state.current.track_id] = [
+            private_lyrics_message
+        ]
         state.lyrics_message = message
+        state.namuwiki_notice_message = namuwiki_message
         lyrics_view = MagicMock()
         state.lyrics_view = lyrics_view
 
@@ -1543,15 +2324,23 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         message.delete.assert_awaited_once()
+        namuwiki_message.delete.assert_awaited_once()
+        private_lyrics_message.delete.assert_awaited_once_with()
         lyrics_view.stop.assert_called_once_with()
         self.assertIsNone(state.lyrics_message)
+        self.assertIsNone(state.namuwiki_notice_message)
         self.assertIsNone(state.lyrics_view)
+        self.assertFalse(state.private_lyrics_messages)
 
     async def test_empty_queue_deletes_the_lyrics_message(self) -> None:
         guild_id = 604
-        _, message = self.make_channel_and_message()
+        channel, message = self.make_channel_and_message()
+        namuwiki_message = MagicMock()
+        namuwiki_message.channel = channel
+        namuwiki_message.delete = AsyncMock()
         state = bot.get_state(guild_id)
         state.lyrics_message = message
+        state.namuwiki_notice_message = namuwiki_message
 
         with (
             patch.object(bot, "ffmpeg_is_available", return_value=True),
@@ -1560,8 +2349,10 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
             await bot.play_next(guild_id)
 
         message.delete.assert_awaited_once()
+        namuwiki_message.delete.assert_awaited_once()
         show_idle.assert_awaited_once_with(guild_id, state)
         self.assertIsNone(state.lyrics_message)
+        self.assertIsNone(state.namuwiki_notice_message)
 
 
 class CommandSurfaceTests(unittest.TestCase):
@@ -1586,6 +2377,90 @@ class CommandSurfaceTests(unittest.TestCase):
                 "leave",
             },
         )
+
+
+class EphemeralResponseTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self) -> None:
+        for state in bot.music_states.values():
+            bot.cancel_queue_message_cleanups(state)
+            bot.schedule_private_lyrics_cleanup(state)
+        await asyncio.sleep(0)
+        bot.music_states.clear()
+
+    async def test_standard_private_response_uses_common_expiry(self) -> None:
+        interaction = MagicMock()
+        interaction.response.send_message = AsyncMock()
+
+        await bot.send_ephemeral_response(interaction, "완료")
+
+        interaction.response.send_message.assert_awaited_once_with(
+            "완료",
+            ephemeral=True,
+            delete_after=bot.EPHEMERAL_RESPONSE_DELETE_SECONDS,
+        )
+
+    async def test_private_followup_schedules_common_expiry(self) -> None:
+        interaction = MagicMock()
+        message = MagicMock()
+        message.delete = AsyncMock()
+        interaction.followup.send = AsyncMock(return_value=message)
+
+        result = await bot.send_ephemeral_followup(interaction, "완료")
+
+        self.assertIs(result, message)
+        interaction.followup.send.assert_awaited_once_with(
+            "완료",
+            ephemeral=True,
+            wait=True,
+        )
+        message.delete.assert_awaited_once_with(
+            delay=bot.EPHEMERAL_RESPONSE_DELETE_SECONDS
+        )
+
+    async def test_queue_response_starts_with_common_expiry(self) -> None:
+        guild_id = 701
+        interaction = MagicMock()
+        interaction.response.send_message = AsyncMock()
+        message = MagicMock()
+        message.id = 702
+        interaction.original_response = AsyncMock(return_value=message)
+
+        with patch.object(bot, "schedule_queue_message_cleanup") as schedule_cleanup:
+            await bot.send_queue_management_response(
+                interaction,
+                guild_id,
+                content="대기열",
+            )
+
+        interaction.response.send_message.assert_awaited_once_with(
+            "대기열",
+            ephemeral=True,
+        )
+        schedule_cleanup.assert_called_once_with(
+            bot.get_state(guild_id),
+            message,
+            bot.EPHEMERAL_RESPONSE_DELETE_SECONDS,
+        )
+
+    async def test_rescheduling_queue_cleanup_replaces_previous_timer(
+        self,
+    ) -> None:
+        state = bot.GuildMusicState()
+        message = MagicMock()
+        message.id = 703
+        message.delete = AsyncMock()
+
+        first_task = bot.schedule_queue_message_cleanup(state, message, 60)
+        second_task = bot.schedule_queue_message_cleanup(state, message, 0)
+        self.assertIsNotNone(first_task)
+        self.assertIsNotNone(second_task)
+
+        await second_task
+        await asyncio.sleep(0)
+
+        self.assertTrue(first_task.cancelled())
+        message.delete.assert_awaited_once_with()
+        self.assertNotIn(message.id, state.queue_cleanup_tasks)
 
 
 class MusicChannelConfigTests(unittest.TestCase):
@@ -2171,6 +3046,97 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(bot.is_youtube_block_error(RuntimeError("Video unavailable")))
 
 
+class YouTubeMusicProtectionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        bot.youtube_music_cache.clear()
+        bot.youtube_music_client = None
+        bot.youtube_music_last_request_started_at = 0.0
+        bot.ytdl_last_request_started_at = 0.0
+        bot.youtube_circuit_open_until = 0.0
+        bot.youtube_circuit_reason = None
+
+    async def asyncTearDown(self) -> None:
+        bot.youtube_music_cache.clear()
+        bot.youtube_music_client = None
+        bot.youtube_music_last_request_started_at = 0.0
+        bot.ytdl_last_request_started_at = 0.0
+        bot.youtube_circuit_open_until = 0.0
+        bot.youtube_circuit_reason = None
+
+    async def test_repeated_music_query_uses_cache(self) -> None:
+        payload = [
+            {
+                "resultType": "song",
+                "videoId": "CuRIuFRD1zI",
+                "title": "泥濘鳴鳴",
+            }
+        ]
+        to_thread = AsyncMock(return_value=payload)
+
+        with (
+            patch.object(bot.asyncio, "to_thread", new=to_thread),
+            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
+            patch.object(bot, "YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS", 0.0),
+            patch.object(bot, "YTDL_CACHE_TTL_SECONDS", 600),
+        ):
+            first = await bot.search_youtube_music("でいねいめいめい")
+            first[0]["title"] = "caller mutation"
+            second = await bot.search_youtube_music("でいねいめいめい")
+
+        to_thread.assert_awaited_once()
+        self.assertEqual(second[0]["title"], "泥濘鳴鳴")
+
+    async def test_empty_music_results_are_cached(self) -> None:
+        to_thread = AsyncMock(return_value=[])
+
+        with (
+            patch.object(bot.asyncio, "to_thread", new=to_thread),
+            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
+            patch.object(bot, "YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS", 0.0),
+            patch.object(bot, "YTDL_CACHE_TTL_SECONDS", 600),
+        ):
+            first = await bot.search_youtube_music("missing song")
+            second = await bot.search_youtube_music("missing song")
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        to_thread.assert_awaited_once()
+
+    async def test_disabled_music_search_does_not_start_worker(self) -> None:
+        to_thread = AsyncMock()
+
+        with (
+            patch.object(bot.asyncio, "to_thread", new=to_thread),
+            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", False),
+        ):
+            results = await bot.search_youtube_music("sample")
+
+        self.assertEqual(results, [])
+        to_thread.assert_not_awaited()
+
+    async def test_music_search_uses_its_own_rate_limiter(self) -> None:
+        to_thread = AsyncMock(return_value=[])
+
+        with (
+            patch.object(bot.asyncio, "to_thread", new=to_thread),
+            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
+            patch.object(
+                bot,
+                "wait_for_youtube_music_interval",
+                new=AsyncMock(),
+            ) as music_wait,
+            patch.object(
+                bot,
+                "wait_for_ytdl_interval",
+                new=AsyncMock(),
+            ) as ytdl_wait,
+        ):
+            await bot.search_youtube_music("independent limiter")
+
+        music_wait.assert_awaited_once_with()
+        ytdl_wait.assert_not_awaited()
+
+
 class LocalMusicTestModeTests(unittest.IsolatedAsyncioTestCase):
     async def test_local_audio_mode_never_calls_ytdl(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2255,6 +3221,9 @@ class QueueTests(unittest.TestCase):
 
 class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
+        for state in bot.music_states.values():
+            bot.cancel_queue_message_cleanups(state)
+        await asyncio.sleep(0)
         bot.music_states.clear()
 
     async def test_view_has_two_selects_and_disabled_confirm_button(self) -> None:
@@ -2283,8 +3252,16 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         view.confirm_button.disabled = False
         interaction = MagicMock()
         interaction.response.edit_message = AsyncMock()
+        interaction.message = MagicMock()
+        interaction.message.id = 989
 
-        with patch.object(bot, "schedule_autoplay_refill") as schedule_refill:
+        with (
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+            patch.object(
+                bot,
+                "schedule_queue_message_cleanup",
+            ) as schedule_cleanup,
+        ):
             await view.confirm_button.callback(interaction)
 
         self.assertEqual(len(state.queue), 11)
@@ -2295,6 +3272,40 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("5~13번", kwargs["content"])
         self.assertIn("9곡", kwargs["content"])
         self.assertIsNone(kwargs["view"])
+        schedule_cleanup.assert_called_once_with(
+            state,
+            interaction.message,
+            bot.QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
+        )
+
+    async def test_single_delete_resets_queue_message_expiry(self) -> None:
+        guild_id = 990
+        first = make_track("first")
+        second = make_track("second")
+        state = bot.get_state(guild_id)
+        state.queue.extend([first, second])
+        select = bot.QueueRemoveSelect(guild_id)
+        select._values = [first.track_id]
+        interaction = MagicMock()
+        interaction.response.edit_message = AsyncMock()
+        interaction.message = MagicMock()
+        interaction.message.id = 991
+
+        with (
+            patch.object(bot, "schedule_autoplay_refill"),
+            patch.object(
+                bot,
+                "schedule_queue_message_cleanup",
+            ) as schedule_cleanup,
+        ):
+            await select.callback(interaction)
+
+        self.assertEqual(list(state.queue), [second])
+        schedule_cleanup.assert_called_once_with(
+            state,
+            interaction.message,
+            bot.QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
+        )
 
 
 class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
@@ -2302,6 +3313,8 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         for state in bot.music_states.values():
             bot.cancel_autoplay_refill(state)
             bot.cancel_lyrics_publish(state)
+            bot.schedule_private_lyrics_cleanup(state)
+            bot.cancel_queue_message_cleanups(state)
             if state.advance_task and not state.advance_task.done():
                 state.advance_task.cancel()
         await asyncio.sleep(0)
@@ -2372,6 +3385,58 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(bot.normalize_track_key(first), state.recent_track_keys)
         schedule_refill.assert_called_once_with(guild_id)
         schedule_lyrics.assert_called_once_with(guild_id, first)
+
+    async def test_track_end_deletes_its_private_lyrics_messages(self) -> None:
+        class FakeVoice:
+            def __init__(self) -> None:
+                self.playing = False
+                self.after = None
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            def play(self, source: object, *, after: object) -> None:
+                self.playing = True
+                self.after = after
+
+        guild_id = 457
+        track = make_track("finished")
+        voice = FakeVoice()
+        private_message = MagicMock()
+        private_message.delete = AsyncMock()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        state.queue.append(track)
+        state.private_lyrics_messages[track.track_id] = [private_message]
+        fake_bot = MagicMock()
+        fake_bot.loop = asyncio.get_running_loop()
+
+        with (
+            patch.object(bot, "ffmpeg_is_available", return_value=True),
+            patch.object(bot, "resolve_track_stream", new=AsyncMock()),
+            patch.object(bot.discord, "FFmpegPCMAudio", return_value=object()),
+            patch.object(bot.discord, "PCMVolumeTransformer", return_value=object()),
+            patch.object(bot, "schedule_autoplay_refill"),
+            patch.object(bot, "schedule_lyrics_publish"),
+            patch.object(bot, "schedule_play_next") as schedule_next,
+            patch.object(bot, "bot", fake_bot),
+        ):
+            await bot.play_next(guild_id, announce=False)
+            self.assertIsNotNone(voice.after)
+            voice.after(None)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        private_message.delete.assert_awaited_once_with()
+        self.assertFalse(state.private_lyrics_messages)
+        self.assertIsNone(state.current)
+        schedule_next.assert_called_once_with(guild_id)
 
     async def test_fresh_stream_url_is_reused(self) -> None:
         track = make_track("fresh")

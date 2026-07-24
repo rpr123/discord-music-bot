@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import html
 import io
 import json
@@ -23,12 +24,15 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Deque
+from typing import Callable, Deque
 
 import discord
+import requests
 import yt_dlp
 from discord import app_commands
 from discord.ext import commands
+from ytmusicapi import YTMusic
+from ytmusicapi.auth.oauth import OAuthCredentials
 
 try:
     from sudachipy import dictionary as sudachi_dictionary
@@ -153,6 +157,12 @@ def parse_string_map_env(name: str) -> dict[str, str]:
 
 MAX_BULK_TRACKS = parse_positive_int_env("MAX_BULK_TRACKS", 50)
 MUSIC_FEEDBACK_DELETE_SECONDS = parse_positive_int_env("MUSIC_FEEDBACK_DELETE_SECONDS", 10)
+EPHEMERAL_RESPONSE_DELETE_SECONDS = parse_positive_int_env(
+    "EPHEMERAL_RESPONSE_DELETE_SECONDS", 15
+)
+QUEUE_DELETE_RESPONSE_DELETE_SECONDS = parse_positive_int_env(
+    "QUEUE_DELETE_RESPONSE_DELETE_SECONDS", 30
+)
 DEFAULT_AUTO_TRACKS = parse_positive_int_env("DEFAULT_AUTO_TRACKS", 8)
 MAX_AUTO_TRACKS = parse_positive_int_env("MAX_AUTO_TRACKS", 25)
 BOT_VOLUME = parse_volume_env("BOT_VOLUME", 0.2)
@@ -216,6 +226,33 @@ STREAM_URL_MAX_AGE_SECONDS = parse_positive_int_env("STREAM_URL_MAX_AGE_SECONDS"
 YTDL_MIN_INTERVAL_SECONDS = parse_nonnegative_float_env("YTDL_MIN_INTERVAL_SECONDS", 6.0)
 YTDL_CACHE_TTL_SECONDS = parse_positive_int_env("YTDL_CACHE_TTL_SECONDS", 600)
 YTDL_CACHE_MAX_ENTRIES = parse_positive_int_env("YTDL_CACHE_MAX_ENTRIES", 128)
+YOUTUBE_SEARCH_CANDIDATES = min(
+    parse_positive_int_env("YOUTUBE_SEARCH_CANDIDATES", 10),
+    20,
+)
+YOUTUBE_MUSIC_SEARCH_ENABLED = os.getenv(
+    "YOUTUBE_MUSIC_SEARCH_ENABLED", "true"
+).lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS = parse_nonnegative_float_env(
+    "YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS", 1.0
+)
+YOUTUBE_MUSIC_AUTH_FILE = os.getenv("YOUTUBE_MUSIC_AUTH_FILE", "").strip() or None
+YOUTUBE_MUSIC_OAUTH_CLIENT_ID = (
+    os.getenv("YOUTUBE_MUSIC_OAUTH_CLIENT_ID", "").strip() or None
+)
+YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET = (
+    os.getenv("YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET", "").strip() or None
+)
+YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS = parse_positive_int_env(
+    "YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS", 5
+)
+YOUTUBE_MUSIC_LANGUAGE = os.getenv("YOUTUBE_MUSIC_LANGUAGE", "en").strip() or "en"
+YOUTUBE_MUSIC_LOCATION = os.getenv("YOUTUBE_MUSIC_LOCATION", "").strip()
 YOUTUBE_CIRCUIT_BREAKER_SECONDS = parse_positive_int_env(
     "YOUTUBE_CIRCUIT_BREAKER_SECONDS", 1800
 )
@@ -246,6 +283,12 @@ YTDL_OPTIONS = {
     "extract_flat": False,
 }
 
+YTDL_SEARCH_OPTIONS = {
+    **YTDL_BASE_OPTIONS,
+    "noplaylist": True,
+    "extract_flat": "in_playlist",
+}
+
 YTDL_PLAYLIST_OPTIONS = {
     **YTDL_BASE_OPTIONS,
     "noplaylist": False,
@@ -266,6 +309,12 @@ ytdl_cache: OrderedDict[tuple[str, str], tuple[float, dict]] = OrderedDict()
 ytdl_last_request_started_at = 0.0
 youtube_circuit_open_until = 0.0
 youtube_circuit_reason: str | None = None
+youtube_music_client: YTMusic | None = None
+youtube_music_client_lock = threading.Lock()
+youtube_music_rate_lock = asyncio.Lock()
+youtube_music_last_request_started_at = 0.0
+youtube_music_cache_lock = asyncio.Lock()
+youtube_music_cache: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
 music_test_track_counter = itertools.count(1)
 
 YOUTUBE_BLOCK_ERROR_MARKERS = (
@@ -381,6 +430,16 @@ async def wait_for_ytdl_interval() -> None:
         ytdl_last_request_started_at = time.monotonic()
 
 
+async def wait_for_youtube_music_interval() -> None:
+    global youtube_music_last_request_started_at
+    async with youtube_music_rate_lock:
+        elapsed = time.monotonic() - youtube_music_last_request_started_at
+        delay = max(0.0, YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS - elapsed)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        youtube_music_last_request_started_at = time.monotonic()
+
+
 async def extract_ytdl_info(
     options: dict,
     query: str,
@@ -457,6 +516,160 @@ async def extract_ytdl_info(
         await cache_ytdl_info(cache_key, info)
     logger.info("yt-dlp done: %s", label)
     return info
+
+
+def get_youtube_music_client() -> YTMusic:
+    global youtube_music_client
+    with youtube_music_client_lock:
+        if youtube_music_client is not None:
+            return youtube_music_client
+
+        auth_path: str | None = None
+        if YOUTUBE_MUSIC_AUTH_FILE:
+            resolved_auth_path = resolve_project_path(YOUTUBE_MUSIC_AUTH_FILE)
+            if not resolved_auth_path.is_file():
+                raise FileNotFoundError(
+                    f"YouTube Music auth file was not found: {resolved_auth_path}"
+                )
+            auth_path = str(resolved_auth_path)
+
+        session = requests.Session()
+        session.request = functools.partial(
+            session.request,
+            timeout=YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS,
+        )
+        oauth_credentials: OAuthCredentials | None = None
+        if YOUTUBE_MUSIC_OAUTH_CLIENT_ID or YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET:
+            if not (
+                YOUTUBE_MUSIC_OAUTH_CLIENT_ID
+                and YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET
+            ):
+                raise ValueError(
+                    "YOUTUBE_MUSIC_OAUTH_CLIENT_ID and "
+                    "YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET must be set together."
+                )
+            oauth_credentials = OAuthCredentials(
+                client_id=YOUTUBE_MUSIC_OAUTH_CLIENT_ID,
+                client_secret=YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET,
+                session=session,
+            )
+        youtube_music_client = YTMusic(
+            auth=auth_path,
+            requests_session=session,
+            language=YOUTUBE_MUSIC_LANGUAGE,
+            location=YOUTUBE_MUSIC_LOCATION,
+            oauth_credentials=oauth_credentials,
+        )
+        return youtube_music_client
+
+
+def get_youtube_music_cache_key(query: str) -> str:
+    return unicodedata.normalize("NFKC", query).casefold().strip()
+
+
+async def get_cached_youtube_music_results(query: str) -> list[dict] | None:
+    if YTDL_CACHE_TTL_SECONDS <= 0:
+        return None
+
+    cache_key = get_youtube_music_cache_key(query)
+    async with youtube_music_cache_lock:
+        cached = youtube_music_cache.get(cache_key)
+        if cached is None:
+            return None
+        cached_at, results = cached
+        if time.monotonic() - cached_at >= YTDL_CACHE_TTL_SECONDS:
+            youtube_music_cache.pop(cache_key, None)
+            return None
+        youtube_music_cache.move_to_end(cache_key)
+        return copy.deepcopy(results)
+
+
+async def cache_youtube_music_results(query: str, results: list[dict]) -> None:
+    if YTDL_CACHE_TTL_SECONDS <= 0:
+        return
+
+    cache_key = get_youtube_music_cache_key(query)
+    async with youtube_music_cache_lock:
+        youtube_music_cache[cache_key] = (
+            time.monotonic(),
+            copy.deepcopy(results),
+        )
+        youtube_music_cache.move_to_end(cache_key)
+        while len(youtube_music_cache) > YTDL_CACHE_MAX_ENTRIES:
+            youtube_music_cache.popitem(last=False)
+
+
+async def search_youtube_music(query: str) -> list[dict]:
+    if not YOUTUBE_MUSIC_SEARCH_ENABLED:
+        return []
+
+    cached = await get_cached_youtube_music_results(query)
+    if cached is not None:
+        logger.info("YouTube Music cache hit: %s", query)
+        return cached
+
+    ensure_youtube_circuit_closed()
+    logger.info("YouTube Music search start: %s", query)
+
+    def search() -> list[dict]:
+        results = get_youtube_music_client().search(
+            query,
+            limit=YOUTUBE_SEARCH_CANDIDATES,
+        )
+        return [result for result in results if isinstance(result, dict)]
+
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    try:
+        await asyncio.wait_for(
+            ytdl_semaphore.acquire(),
+            timeout=YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("YouTube Music search queue timed out: %s", query)
+        raise
+
+    try:
+        ensure_youtube_circuit_closed()
+        await wait_for_youtube_music_interval()
+    except BaseException:
+        ytdl_semaphore.release()
+        raise
+
+    worker = asyncio.create_task(asyncio.to_thread(search))
+
+    def search_finished(task: asyncio.Task[list[dict]]) -> None:
+        ytdl_semaphore.release()
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            trip_youtube_circuit(error)
+
+    worker.add_done_callback(search_finished)
+    remaining_timeout = max(
+        0.1,
+        YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS - (loop.time() - started_at),
+    )
+    try:
+        results = await asyncio.wait_for(
+            asyncio.shield(worker),
+            timeout=remaining_timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "YouTube Music search timed out after %s seconds: %s",
+            YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS,
+            query,
+        )
+        raise
+    except Exception as error:
+        trip_youtube_circuit(error)
+        raise
+
+    await cache_youtube_music_results(query, results)
+    logger.info("YouTube Music search done: %s result(s)", len(results))
+    return results
 
 
 def ffmpeg_is_available() -> bool:
@@ -554,13 +767,16 @@ class Track:
     lyrics: str | None = None
     lyrics_loaded: bool = False
     lyrics_source: str | None = None
-    lyrics_translation: str | None = None
-    lyrics_translation_loaded: bool = False
-    lyrics_translation_source: str | None = None
-    lyrics_translation_url: str | None = None
+    korean_lyrics: str | None = None
+    korean_lyrics_loaded: bool = False
+    korean_lyrics_source: str | None = None
+    korean_lyrics_url: str | None = None
+    namuwiki_lyrics_checked: bool = False
     lyrics_reading: str | None = None
     lyrics_reading_loaded: bool = False
-    lyrics_translation_lock: asyncio.Lock = field(
+    lyrics_reading_source: str | None = None
+    lyrics_reading_url: str | None = None
+    korean_lyrics_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock,
         repr=False,
     )
@@ -569,7 +785,6 @@ class Track:
         repr=False,
     )
     manual_subtitles: dict[str, list[dict]] = field(default_factory=dict)
-    korean_automatic_subtitles: dict[str, list[dict]] = field(default_factory=dict)
     subtitle_language: str | None = None
     track_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
@@ -597,7 +812,12 @@ class GuildMusicState:
     autoplay_task: asyncio.Task[None] | None = None
     lyrics_task: asyncio.Task[None] | None = None
     lyrics_message: discord.Message | None = None
+    namuwiki_notice_message: discord.Message | None = None
     lyrics_view: discord.ui.View | None = None
+    private_lyrics_messages: dict[str, list[discord.WebhookMessage]] = field(
+        default_factory=dict
+    )
+    queue_cleanup_tasks: dict[int, asyncio.Task[None]] = field(default_factory=dict)
     empty_channel_task: asyncio.Task[None] | None = None
     playback_generation: int = 0
 
@@ -620,6 +840,171 @@ def get_state(guild_id: int) -> GuildMusicState:
             autoplay_enabled=configured_autoplay_enabled.get(guild_id, False)
         )
     return music_states[guild_id]
+
+
+async def send_ephemeral_response(
+    interaction: discord.Interaction,
+    content: str | None = None,
+    *,
+    embed: discord.Embed | None = None,
+    view: discord.ui.View | None = None,
+    delete_after: float = EPHEMERAL_RESPONSE_DELETE_SECONDS,
+) -> None:
+    options: dict[str, object] = {
+        "ephemeral": True,
+        "delete_after": delete_after,
+    }
+    if embed is not None:
+        options["embed"] = embed
+    if view is not None:
+        options["view"] = view
+    await interaction.response.send_message(content, **options)
+
+
+async def send_ephemeral_followup(
+    interaction: discord.Interaction,
+    content: str | None = None,
+    *,
+    embed: discord.Embed | None = None,
+    file: discord.File | None = None,
+    view: discord.ui.View | None = None,
+    delete_after: float | None = EPHEMERAL_RESPONSE_DELETE_SECONDS,
+) -> discord.WebhookMessage | None:
+    options: dict[str, object] = {
+        "ephemeral": True,
+        "wait": True,
+    }
+    if embed is not None:
+        options["embed"] = embed
+    if file is not None:
+        options["file"] = file
+    if view is not None:
+        options["view"] = view
+    message = await interaction.followup.send(content, **options)
+    if message is not None and delete_after is not None:
+        await message.delete(delay=delete_after)
+    return message
+
+
+async def delete_private_interaction_message(
+    message: discord.WebhookMessage,
+) -> None:
+    try:
+        await message.delete()
+    except discord.NotFound:
+        pass
+    except discord.HTTPException as error:
+        log_discord_http_error("deleting a private interaction message", error)
+
+
+async def register_private_lyrics_message(
+    guild_id: int,
+    track: Track,
+    message: discord.WebhookMessage,
+) -> None:
+    state = get_state(guild_id)
+    if state.current is not track:
+        await delete_private_interaction_message(message)
+        return
+    state.private_lyrics_messages.setdefault(track.track_id, []).append(message)
+
+
+def schedule_private_lyrics_cleanup(
+    state: GuildMusicState,
+    track_id: str | None = None,
+) -> None:
+    if track_id is None:
+        messages = [
+            message
+            for tracked_messages in state.private_lyrics_messages.values()
+            for message in tracked_messages
+        ]
+        state.private_lyrics_messages.clear()
+    else:
+        messages = state.private_lyrics_messages.pop(track_id, [])
+
+    for message in messages:
+        asyncio.create_task(delete_private_interaction_message(message))
+
+
+async def delete_queue_message_after(
+    state: GuildMusicState,
+    message_id: int,
+    message: discord.InteractionMessage,
+    delay_seconds: float,
+) -> None:
+    current_task = asyncio.current_task()
+    try:
+        await asyncio.sleep(delay_seconds)
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as error:
+            log_discord_http_error("deleting a private queue message", error)
+    finally:
+        if state.queue_cleanup_tasks.get(message_id) is current_task:
+            state.queue_cleanup_tasks.pop(message_id, None)
+
+
+def schedule_queue_message_cleanup(
+    state: GuildMusicState,
+    message: discord.InteractionMessage | None,
+    delay_seconds: float,
+) -> asyncio.Task[None] | None:
+    if message is None:
+        return None
+    message_id = getattr(message, "id", None)
+    if not isinstance(message_id, int):
+        return None
+
+    previous_task = state.queue_cleanup_tasks.pop(message_id, None)
+    if previous_task is not None and not previous_task.done():
+        previous_task.cancel()
+
+    task = asyncio.create_task(
+        delete_queue_message_after(
+            state,
+            message_id,
+            message,
+            delay_seconds,
+        )
+    )
+    state.queue_cleanup_tasks[message_id] = task
+    return task
+
+
+def cancel_queue_message_cleanups(state: GuildMusicState) -> None:
+    for task in state.queue_cleanup_tasks.values():
+        if not task.done():
+            task.cancel()
+    state.queue_cleanup_tasks.clear()
+
+
+async def send_queue_management_response(
+    interaction: discord.Interaction,
+    guild_id: int,
+    *,
+    content: str | None = None,
+    embed: discord.Embed | None = None,
+    view: discord.ui.View | None = None,
+) -> None:
+    options: dict[str, object] = {"ephemeral": True}
+    if embed is not None:
+        options["embed"] = embed
+    if view is not None:
+        options["view"] = view
+    await interaction.response.send_message(content, **options)
+    try:
+        message = await interaction.original_response()
+    except discord.HTTPException as error:
+        log_discord_http_error("fetching a private queue message", error)
+        return
+    schedule_queue_message_cleanup(
+        get_state(guild_id),
+        message,
+        EPHEMERAL_RESPONSE_DELETE_SECONDS,
+    )
 
 
 def load_music_channel_config() -> None:
@@ -1015,6 +1400,11 @@ class QueueRemoveSelect(discord.ui.Select):
             embed=make_queue_embed(state),
             view=QueueManageView(self.guild_id) if state.queue else None,
         )
+        schedule_queue_message_cleanup(
+            state,
+            interaction.message,
+            QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
+        )
 
 
 class QueueManageView(discord.ui.View):
@@ -1155,6 +1545,11 @@ class QueueRangeDeleteView(discord.ui.View):
             embed=make_queue_embed(state),
             view=None,
         )
+        schedule_queue_message_cleanup(
+            state,
+            interaction.message,
+            QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
+        )
 
 
 class MusicControlView(discord.ui.View):
@@ -1193,9 +1588,9 @@ class MusicControlView(discord.ui.View):
             if member_channel is not None:
                 return True
 
-            await interaction.response.send_message(
+            await send_ephemeral_response(
+                interaction,
                 "먼저 음성 채널에 들어가 주세요.",
-                ephemeral=True,
             )
             return False
 
@@ -1219,7 +1614,7 @@ class MusicControlView(discord.ui.View):
     async def pause_resume(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
         if state.voice is None:
-            await interaction.response.send_message("봇이 음성 채널에 없어요.", ephemeral=True)
+            await send_ephemeral_response(interaction, "봇이 음성 채널에 없어요.")
             return
 
         if state.voice.is_paused():
@@ -1227,7 +1622,7 @@ class MusicControlView(discord.ui.View):
         elif state.voice.is_playing():
             state.voice.pause()
         else:
-            await interaction.response.send_message("지금 재생 중인 곡이 없어요.", ephemeral=True)
+            await send_ephemeral_response(interaction, "지금 재생 중인 곡이 없어요.")
             return
 
         await self.edit_panel(interaction)
@@ -1238,10 +1633,10 @@ class MusicControlView(discord.ui.View):
         if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
             state.skip_requested = True
             state.voice.stop()
-            await interaction.response.send_message("다음 곡으로 넘어갈게요.", ephemeral=True)
+            await send_ephemeral_response(interaction, "다음 곡으로 넘어갈게요.")
             return
 
-        await interaction.response.send_message("스킵할 곡이 없어요.", ephemeral=True)
+        await send_ephemeral_response(interaction, "스킵할 곡이 없어요.")
 
     @discord.ui.button(label="정지", emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
     async def stop(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1267,10 +1662,11 @@ class MusicControlView(discord.ui.View):
     @discord.ui.button(label="대기열 삭제", emoji="📋", style=discord.ButtonStyle.secondary, row=1)
     async def queue(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
-        await interaction.response.send_message(
+        await send_queue_management_response(
+            interaction,
+            self.guild_id,
             embed=make_queue_embed(state),
             view=QueueManageView(self.guild_id) if state.queue else None,
-            ephemeral=True,
         )
 
     @discord.ui.button(label="구간 삭제", emoji="✂️", style=discord.ButtonStyle.secondary, row=1)
@@ -1281,7 +1677,9 @@ class MusicControlView(discord.ui.View):
     ) -> None:
         state = self.get_state()
         view = QueueRangeDeleteView(self.guild_id) if state.queue else None
-        await interaction.response.send_message(
+        await send_queue_management_response(
+            interaction,
+            self.guild_id,
             content=(
                 view.make_selection_content(state)
                 if view
@@ -1289,7 +1687,6 @@ class MusicControlView(discord.ui.View):
             ),
             embed=make_queue_embed(state),
             view=view,
-            ephemeral=True,
         )
 
     @discord.ui.button(
@@ -1314,8 +1711,491 @@ class MusicControlView(discord.ui.View):
         await self.edit_panel(interaction)
 
 
-def build_youtube_search_query(query: str) -> str:
-    return f"ytsearch1:{query} music"
+FULL_VERSION_SEARCH_RE = re.compile(
+    r"\b(?:full(?:\s*(?:ver(?:sion)?|size|song))?|complete\s*version|long\s*version)\b"
+    r"|フル(?:サイズ|バージョン|ver\.?)?|完全版|完整版"
+    r"|풀\s*버전|풀버전|완곡",
+    flags=re.IGNORECASE,
+)
+SHORT_VERSION_SEARCH_RE = re.compile(
+    r"\b(?:short(?:\s*ver(?:sion)?)?|tv\s*(?:size|ver(?:sion)?)"
+    r"|anime\s*(?:size|ver(?:sion)?)|game\s*(?:size|ver(?:sion)?)"
+    r"|preview|teaser|sample|one\s*chorus|1\s*chorus)\b"
+    r"|ショート(?:ver\.?)?|TVサイズ|テレビサイズ|アニメサイズ"
+    r"|ゲームサイズ|ワンコーラス|試聴(?:版)?"
+    r"|숏\s*버전|숏버전|TV\s*판|애니\s*버전|게임\s*버전"
+    r"|미리듣기|1절\s*버전",
+    flags=re.IGNORECASE,
+)
+GAME_VIDEO_SEARCH_RE = re.compile(
+    r"\b(?:2d|3d)\s*m\s*/?\s*v\b|\bgame\s*(?:mv|movie|play)\b"
+    r"|\b(?:op|ed)\s*(?:movie|animation)\b|\bcreditless\b"
+    r"|ノンクレジット|ゲーム(?:MV|映像)|プレイ動画|譜面"
+    r"|오프닝\s*영상|엔딩\s*영상|게임\s*(?:MV|영상)|플레이\s*영상",
+    flags=re.IGNORECASE,
+)
+ALTERNATE_VERSION_SEARCH_RE = re.compile(
+    r"\b(?:cover|remix|live|instrumental|karaoke|acoustic|sped\s*up"
+    r"|off\s*vocal|slowed(?:\s*down)?|nightcore|solo)\b"
+    r"|ver(?:sion)?\.?(?=\s|[)\]}>】」』）]|$)"
+    r"|カバー|歌ってみた|リミックス|ライブ|インスト|カラオケ"
+    r"|オフボーカル|アコースティック|ソロ"
+    r"|커버|리믹스|라이브|연주|노래방|오프\s*보컬|솔로",
+    flags=re.IGNORECASE,
+)
+LONG_FORM_SEARCH_RE = re.compile(
+    r"\b(?:extended|loop|hour|medley|compilation|playlist)\b"
+    r"|耐久|作業用|メドレー|모음|메들리|반복",
+    flags=re.IGNORECASE,
+)
+OFFICIAL_MEDIA_SEARCH_RE = re.compile(
+    r"\b(?:official|music\s*video|m\s*/?\s*v|official\s*audio"
+    r"|lyric(?:s|\s*video)?)\b"
+    r"|公式|ミュージックビデオ|オーディオ|歌詞"
+    r"|공식|뮤직비디오|오디오|가사",
+    flags=re.IGNORECASE,
+)
+OFFICIAL_VIDEO_SEARCH_RE = re.compile(
+    r"\bofficial\s*(?:music\s*)?(?:video|m\s*/?\s*v)\b"
+    r"|公式\s*(?:ミュージックビデオ|m\s*/?\s*v)"
+    r"|공식\s*(?:뮤직비디오|m\s*/?\s*v)",
+    flags=re.IGNORECASE,
+)
+OFFICIAL_AUDIO_SEARCH_RE = re.compile(
+    r"\bofficial\s*audio\b|公式\s*(?:オーディオ|音源)|공식\s*(?:오디오|음원)",
+    flags=re.IGNORECASE,
+)
+OFFICIAL_CHANNEL_RE = re.compile(
+    r"\bofficial\b|\bvevo\b|(?:^|\s)-\s*topic$|公式|공식",
+    flags=re.IGNORECASE,
+)
+YOUTUBE_SEARCH_NOISE_TOKENS = frozenset(
+    {
+        "music",
+        "song",
+        "official",
+        "audio",
+        "video",
+        "lyrics",
+        "lyric",
+        "mv",
+        "노래",
+        "음악",
+        "가사",
+        "공식",
+    }
+)
+
+
+def should_use_youtube_music_search(query: str) -> bool:
+    return not any(
+        pattern.search(query)
+        for pattern in (
+            SHORT_VERSION_SEARCH_RE,
+            GAME_VIDEO_SEARCH_RE,
+            ALTERNATE_VERSION_SEARCH_RE,
+            LONG_FORM_SEARCH_RE,
+        )
+    )
+
+
+def get_youtube_music_artist_names(result: dict) -> list[str]:
+    artists = result.get("artists")
+    if isinstance(artists, list):
+        names = [
+            str(artist.get("name")).strip()
+            for artist in artists
+            if isinstance(artist, dict) and artist.get("name")
+        ]
+        if names:
+            return names
+
+    artist = result.get("artist")
+    if isinstance(artist, str) and artist.strip():
+        return [artist.strip()]
+    return []
+
+
+def youtube_music_result_to_entry(result: dict) -> dict | None:
+    video_id = result.get("videoId")
+    title = result.get("title")
+    if (
+        result.get("resultType") != "song"
+        or not isinstance(video_id, str)
+        or not re.fullmatch(r"[\w-]{11}", video_id)
+        or not isinstance(title, str)
+        or not title.strip()
+    ):
+        return None
+
+    artists = get_youtube_music_artist_names(result)
+    artist = ", ".join(artists) or None
+    album = result.get("album")
+    album_name = album.get("name") if isinstance(album, dict) else None
+    thumbnails = result.get("thumbnails")
+    thumbnail = None
+    if isinstance(thumbnails, list):
+        for item in reversed(thumbnails):
+            if isinstance(item, dict) and item.get("url"):
+                thumbnail = item["url"]
+                break
+
+    webpage_url = f"https://www.youtube.com/watch?v={video_id}"
+    return {
+        "id": video_id,
+        "url": webpage_url,
+        "webpage_url": webpage_url,
+        "title": title.strip(),
+        "track": title.strip(),
+        "artist": artist,
+        "creator": artist,
+        "channel": artist,
+        "album": album_name,
+        "duration": result.get("duration_seconds"),
+        "thumbnail": thumbnail,
+        "_music_bot_youtube_music": True,
+    }
+
+
+def youtube_music_entries_are_ambiguous(
+    query: str,
+    entries: list[dict],
+) -> bool:
+    normalized_query = normalize_identity_component(clean_track_title(query))
+    if not normalized_query:
+        return False
+
+    exact_title_artists = {
+        normalize_artist_name(str(entry.get("artist") or entry.get("creator") or ""))
+        for entry in entries
+        if normalize_identity_component(
+            clean_track_title(str(entry.get("track") or entry.get("title") or ""))
+        )
+        == normalized_query
+        and (entry.get("artist") or entry.get("creator"))
+    }
+    return len(exact_title_artists) > 1
+
+
+def select_youtube_music_song_result(query: str, results: list[dict]) -> dict | None:
+    entries = [
+        entry
+        for result in results
+        if (entry := youtube_music_result_to_entry(result)) is not None
+    ]
+    if not entries:
+        return None
+    if youtube_music_entries_are_ambiguous(query, entries):
+        logger.info(
+            "YouTube Music returned multiple artists for title-only query %s; "
+            "using YouTube ranking instead",
+            query,
+        )
+        return None
+
+    selected = select_youtube_search_result(query, entries)
+    logger.info(
+        "YouTube Music selected catalog song for %s: %s (%s)",
+        query,
+        selected.get("title"),
+        selected.get("id"),
+    )
+    return selected
+
+
+def get_youtube_music_artist_hint(query: str, results: list[dict]) -> str | None:
+    song_entries = [
+        entry
+        for result in results
+        if (entry := youtube_music_result_to_entry(result)) is not None
+    ]
+    if youtube_music_entries_are_ambiguous(query, song_entries):
+        return None
+
+    normalized_query = normalize_identity_component(query)
+    for index, result in enumerate(results[:3]):
+        if result.get("resultType") not in {"album", "song"}:
+            continue
+        if index > 0 and str(result.get("category") or "").casefold() != "top result":
+            continue
+
+        artists = get_youtube_music_artist_names(result)
+        if not artists:
+            continue
+        artist = artists[0]
+        normalized_artist = normalize_artist_name(artist)
+        if (
+            not normalized_artist
+            or normalized_artist in normalized_query
+            or len(artist) > 120
+        ):
+            return None
+        return artist
+    return None
+
+
+def build_youtube_search_query(
+    query: str,
+    artist_hint: str | None = None,
+) -> str:
+    search_text = query
+    if artist_hint:
+        search_text = f"{query} {artist_hint}"
+    return f"ytsearch{YOUTUBE_SEARCH_CANDIDATES}:{search_text}"
+
+
+def is_youtube_search_query(query: str) -> bool:
+    return bool(re.match(r"^ytsearch(?:\d+)?:", query, flags=re.IGNORECASE))
+
+
+def get_youtube_search_tokens(value: str) -> set[str]:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return {
+        token
+        for token in re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+        if len(token) >= 2 and token not in YOUTUBE_SEARCH_NOISE_TOKENS
+    }
+
+
+def get_search_result_duration(entry: dict) -> float | None:
+    duration = entry.get("duration")
+    if isinstance(duration, (int, float)) and duration > 0:
+        return float(duration)
+    return None
+
+
+def infer_youtube_search_song_title(
+    entry: dict,
+    preferred_artist: str | None = None,
+) -> str | None:
+    track = entry.get("track")
+    if isinstance(track, str) and track.strip():
+        return clean_track_title_preserving_case(track)
+
+    raw_title = entry.get("title")
+    if not isinstance(raw_title, str) or not raw_title.strip():
+        return None
+
+    quoted_match = re.search(r"[「『](?P<title>[^」』]+)[」』]", raw_title)
+    if quoted_match:
+        candidate = quoted_match.group("title")
+    else:
+        slash_parts = re.split(r"\s*/\s*", raw_title, maxsplit=1)
+        if len(slash_parts) == 2:
+            candidate = slash_parts[0]
+        else:
+            candidate = raw_title
+            dash_parts = re.split(
+                r"\s+(?:-|–|—|\|)\s+",
+                raw_title,
+                maxsplit=1,
+            )
+            if len(dash_parts) == 2 and preferred_artist:
+                normalized_artist = normalize_artist_name(preferred_artist)
+                if normalize_artist_name(dash_parts[0]) == normalized_artist:
+                    candidate = dash_parts[1]
+                elif normalize_artist_name(dash_parts[1]) == normalized_artist:
+                    candidate = dash_parts[0]
+
+    candidate = strip_edge_title_tags(candidate)
+    return clean_track_title_preserving_case(candidate) or None
+
+
+def is_likely_official_youtube_upload(entry: dict) -> bool:
+    raw_title = str(entry.get("title") or "")
+    channel = str(entry.get("channel") or entry.get("uploader") or "")
+    if not channel:
+        return False
+    if OFFICIAL_CHANNEL_RE.search(channel):
+        return True
+
+    title_parts = re.split(
+        r"\s+(?:-|–|—|\|)\s+",
+        raw_title,
+        maxsplit=1,
+    )
+    if len(title_parts) != 2:
+        quoted_match = re.match(r"^\s*(?P<artist>.+?)[「『]", raw_title)
+        if quoted_match is None:
+            return False
+        title_artist = quoted_match.group("artist")
+    else:
+        title_artist = title_parts[0]
+
+    normalized_title_artist = normalize_artist_name(title_artist)
+    normalized_channel = normalize_artist_name(channel)
+    if not normalized_title_artist or not normalized_channel:
+        return False
+    if normalized_title_artist == normalized_channel:
+        return True
+    return (
+        min(len(normalized_title_artist), len(normalized_channel)) >= 4
+        and (
+            normalized_title_artist in normalized_channel
+            or normalized_channel in normalized_title_artist
+        )
+    )
+
+
+def score_youtube_search_result(
+    entry: dict,
+    query: str,
+    result_index: int,
+    preferred_artist: str | None = None,
+    preferred_title: str | None = None,
+) -> int:
+    title = str(entry.get("title") or "")
+    artist = str(entry.get("artist") or entry.get("creator") or "")
+    uploader = str(entry.get("channel") or entry.get("uploader") or "")
+    searchable = " ".join((title, artist, uploader)).strip()
+    normalized_query = normalize_identity_component(query)
+    normalized_searchable = normalize_identity_component(searchable)
+    query_tokens = get_youtube_search_tokens(query)
+    candidate_tokens = get_youtube_search_tokens(searchable)
+
+    score = max(0, 30 - result_index * 3)
+    if normalized_query and normalized_query in normalized_searchable:
+        score += 100
+    if query_tokens:
+        overlap = len(query_tokens & candidate_tokens) / len(query_tokens)
+        score += round(overlap * 80)
+
+    query_requests_short = bool(SHORT_VERSION_SEARCH_RE.search(query))
+    query_requests_game_video = bool(GAME_VIDEO_SEARCH_RE.search(query))
+    query_requests_alternate = bool(ALTERNATE_VERSION_SEARCH_RE.search(query))
+    query_requests_long_form = bool(LONG_FORM_SEARCH_RE.search(query))
+    query_requests_official_video = bool(OFFICIAL_VIDEO_SEARCH_RE.search(query))
+    query_requests_official_audio = bool(OFFICIAL_AUDIO_SEARCH_RE.search(query))
+    query_requests_short_form = query_requests_short or query_requests_game_video
+
+    duration = get_search_result_duration(entry)
+    if duration is None:
+        score -= 5
+    elif duration < 45:
+        score -= 140
+    elif duration < 90:
+        score += -20 if query_requests_short_form else -90
+    elif duration < 150:
+        score += 15 if query_requests_short_form else -50
+    elif duration < 180:
+        score += 10 if query_requests_short_form else -20
+    elif duration <= 420:
+        score += 30
+    elif duration <= 600:
+        score += 10
+    elif duration > 900:
+        score -= 90
+    else:
+        score -= 20
+
+    if FULL_VERSION_SEARCH_RE.search(searchable):
+        score += 35
+    if SHORT_VERSION_SEARCH_RE.search(searchable):
+        score += 70 if query_requests_short else -120
+    if GAME_VIDEO_SEARCH_RE.search(searchable):
+        if query_requests_game_video:
+            score += 50
+        elif duration is None or duration < 210:
+            score -= 70
+        else:
+            score -= 20
+    if (
+        ALTERNATE_VERSION_SEARCH_RE.search(searchable)
+        and not FULL_VERSION_SEARCH_RE.search(searchable)
+    ):
+        score += 40 if query_requests_alternate else -45
+    if LONG_FORM_SEARCH_RE.search(searchable):
+        score += 40 if query_requests_long_form else -80
+    if OFFICIAL_MEDIA_SEARCH_RE.search(searchable) and (
+        duration is None or 150 <= duration <= 600
+    ):
+        score += 8
+    if OFFICIAL_VIDEO_SEARCH_RE.search(searchable):
+        score += 55 if query_requests_official_video else 18
+    if OFFICIAL_AUDIO_SEARCH_RE.search(searchable):
+        score += 55 if query_requests_official_audio else 6
+    if is_likely_official_youtube_upload(entry):
+        score += 40
+    if preferred_artist:
+        candidate_artist = artist or uploader
+        if candidate_artist:
+            normalized_preferred_artist = normalize_artist_name(preferred_artist)
+            normalized_candidate_artist = normalize_artist_name(candidate_artist)
+            if normalized_candidate_artist == normalized_preferred_artist:
+                score += 60
+    if preferred_title:
+        normalized_preferred_title = normalize_identity_component(preferred_title)
+        normalized_raw_title = normalize_identity_component(title)
+        inferred_title = infer_youtube_search_song_title(
+            entry,
+            preferred_artist,
+        )
+        normalized_inferred_title = (
+            normalize_identity_component(inferred_title)
+            if inferred_title
+            else ""
+        )
+        if normalized_raw_title == normalized_preferred_title:
+            score += 120
+        elif normalized_inferred_title == normalized_preferred_title:
+            score += 50
+        elif (
+            normalized_preferred_title
+            and normalized_preferred_title in normalized_raw_title
+        ):
+            score += 25
+
+    if entry.get("is_live") or entry.get("live_status") in {
+        "is_live",
+        "is_upcoming",
+        "post_live",
+    }:
+        score -= 200
+    return score
+
+
+def select_youtube_search_result(
+    query: str,
+    entries: list[dict],
+    preferred_artist: str | None = None,
+    preferred_title: str | None = None,
+) -> dict:
+    candidates = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict) and (entry.get("id") or entry.get("url"))
+    ]
+    if not candidates:
+        raise ValueError(f"No playable search results were found for '{query}'.")
+
+    ranked = [
+        (
+            score_youtube_search_result(
+                entry,
+                query,
+                index,
+                preferred_artist,
+                preferred_title,
+            ),
+            -index,
+            entry,
+        )
+        for index, entry in enumerate(candidates)
+    ]
+    score, negative_index, selected = max(
+        ranked,
+        key=lambda candidate: candidate[:2],
+    )
+    logger.info(
+        "YouTube search selected result %s/%s for %s: %s (%s, score %s)",
+        -negative_index + 1,
+        len(candidates),
+        query,
+        selected.get("title") or "Untitled track",
+        format_duration(selected.get("duration")),
+        score,
+    )
+    return selected
 
 
 def build_youtube_playlist_search_url(query: str, search_kind: str) -> str:
@@ -1347,8 +2227,60 @@ async def extract_first_info(
     query: str,
     resolved_query: str,
 ) -> dict:
+    is_search = is_youtube_search_query(resolved_query)
+    options = YTDL_SEARCH_OPTIONS if is_search else YTDL_OPTIONS
+    search_query = resolved_query
+    selection_query = query
+    artist_hint: str | None = None
+
+    if is_search and should_use_youtube_music_search(query):
+        music_results: list[dict] = []
+        try:
+            music_results = await search_youtube_music(query)
+        except YouTubeCircuitOpenError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning(
+                "YouTube Music search timed out. Falling back to YouTube: %s",
+                query,
+            )
+        except Exception as error:
+            logger.warning(
+                "YouTube Music search failed. Falling back to YouTube for %s: %s",
+                query,
+                error,
+            )
+
+        music_entry = select_youtube_music_song_result(query, music_results)
+        if music_entry is not None:
+            try:
+                return await extract_ytdl_info(
+                    YTDL_OPTIONS,
+                    music_entry["webpage_url"],
+                    "YouTube Music catalog song resolve",
+                )
+            except YouTubeCircuitOpenError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    "YouTube Music catalog song could not be resolved. "
+                    "Falling back to YouTube for %s: %s",
+                    query,
+                    error,
+                )
+
+        artist_hint = get_youtube_music_artist_hint(query, music_results)
+        if artist_hint:
+            search_query = build_youtube_search_query(query, artist_hint)
+            selection_query = f"{query} {artist_hint}"
+            logger.info(
+                "YouTube Music enriched search for %s with artist %s",
+                query,
+                artist_hint,
+            )
+
     try:
-        info = await extract_ytdl_info(YTDL_OPTIONS, resolved_query, "YouTube search")
+        info = await extract_ytdl_info(options, search_query, "YouTube search")
     except asyncio.TimeoutError:
         raise ValueError(f"Timed out while searching for '{query}'.") from None
 
@@ -1357,6 +2289,22 @@ async def extract_first_info(
 
     entries = [entry for entry in info["entries"] if entry]
     if entries:
+        if is_search:
+            if artist_hint:
+                preferred_title = infer_youtube_search_song_title(
+                    entries[0],
+                    artist_hint,
+                )
+                return select_youtube_search_result(
+                    selection_query,
+                    entries,
+                    preferred_artist=artist_hint,
+                    preferred_title=preferred_title,
+                )
+            return select_youtube_search_result(
+                selection_query,
+                entries,
+            )
         return entries[0]
 
     raise ValueError(f"No playable search results were found for '{query}'.")
@@ -1546,7 +2494,7 @@ class YouTubeSubtitleError(RuntimeError):
     pass
 
 
-class LyricsTranslationError(RuntimeError):
+class KoreanLyricsError(RuntimeError):
     pass
 
 
@@ -1761,6 +2709,31 @@ def namuwiki_translation_header_score(value: str) -> int:
     return 0
 
 
+def namuwiki_source_header_score(value: str) -> int:
+    key = re.sub(r"[\W_]+", "", value, flags=re.UNICODE)
+    if "일본어원문" in key or "원어원문" in key:
+        return 100
+    if key == "원문":
+        return 90
+    if key in {"일본어", "일어", "원어"}:
+        return 70
+    return 0
+
+
+def namuwiki_reading_header_score(value: str) -> int:
+    key = re.sub(r"[\W_]+", "", value, flags=re.UNICODE)
+    if any(
+        marker in key
+        for marker in ("일본어독음", "한글독음", "한국어독음")
+    ):
+        return 100
+    if "독음" in key:
+        return 90
+    if key in {"발음", "요미가나", "읽는법"}:
+        return 70
+    return 0
+
+
 def is_valid_korean_translation(value: str) -> bool:
     hangul_count = sum(
         bool(HANGUL_RE.fullmatch(character))
@@ -1772,37 +2745,70 @@ def is_valid_korean_translation(value: str) -> bool:
     )
 
 
-def extract_interleaved_korean_lines(
+def is_usable_namuwiki_lyrics(value: str) -> bool:
+    groups = [
+        group.strip()
+        for group in re.split(r"\n\s*\n", value)
+        if group.strip()
+    ]
+    nonempty_lines = [
+        line.strip()
+        for group in groups
+        for line in group.splitlines()
+        if line.strip()
+    ]
+    if len(groups) < 2 and len(nonempty_lines) < 6:
+        return False
+
+    foreign_letter_count = sum(
+        character.isalpha() and not HANGUL_RE.fullmatch(character)
+        for character in value
+    )
+    return foreign_letter_count >= 2 and is_valid_korean_translation(value)
+
+
+def extract_interleaved_namuwiki_groups(
     value: str,
-) -> tuple[list[str], int, int]:
+) -> tuple[list[str], list[str], int]:
+    groups: list[str] = []
     translated_lines: list[str] = []
     source_line_count = 0
-    translated_group_count = 0
+    current_source: str | None = None
     current_hangul_lines: list[str] | None = None
 
     def finish_group() -> None:
-        nonlocal translated_group_count
-        if current_hangul_lines and len(current_hangul_lines) >= 2:
+        if (
+            current_source
+            and current_hangul_lines
+            and len(current_hangul_lines) >= 2
+        ):
+            groups.append(
+                "\n".join((current_source, *current_hangul_lines))
+            )
             translated_lines.append(current_hangul_lines[-1])
-            translated_group_count += 1
 
     for line in normalize_namuwiki_table_text(value).splitlines():
         has_hangul = bool(HANGUL_RE.search(line))
         has_japanese = bool(
             JAPANESE_KANA_RE.search(line) or JAPANESE_HAN_RE.search(line)
         )
-        if has_japanese and not has_hangul:
+        latin_letter_count = sum(
+            character.isascii() and character.isalpha()
+            for character in line
+        )
+        if not has_hangul and (has_japanese or latin_letter_count >= 2):
             finish_group()
             source_line_count += 1
+            current_source = line
             current_hangul_lines = []
         elif current_hangul_lines is not None and has_hangul:
             current_hangul_lines.append(line)
 
     finish_group()
-    return translated_lines, source_line_count, translated_group_count
+    return groups, translated_lines, source_line_count
 
 
-def extract_interleaved_korean_translation(
+def extract_interleaved_namuwiki_lyrics(
     rows: list[list[str]],
 ) -> str | None:
     table_text = "\n".join(
@@ -1811,76 +2817,148 @@ def extract_interleaved_korean_translation(
         for cell in row
     )
     (
+        groups,
         translated_lines,
         source_line_count,
-        translated_group_count,
-    ) = extract_interleaved_korean_lines(table_text)
+    ) = extract_interleaved_namuwiki_groups(table_text)
 
     translation = "\n".join(translated_lines).strip()
     if (
         source_line_count < 3
-        or len(translated_lines) < 3
-        or translated_group_count == 0
+        or len(groups) < 3
         or not is_valid_korean_translation(translation)
     ):
         return None
-    return translation
+    return "\n\n".join(groups)
 
 
-def extract_korean_translation_from_tables(
+def best_namuwiki_header_column(
+    row: list[str],
+    scorer: Callable[[str], int],
+    excluded: set[int],
+) -> int | None:
+    candidates = [
+        (scorer(header), column_index)
+        for column_index, header in enumerate(row)
+        if column_index not in excluded and scorer(header) > 0
+    ]
+    return max(candidates)[1] if candidates else None
+
+
+def extract_namuwiki_lyrics_from_tables(
     tables: list[list[list[str]]],
 ) -> str | None:
-    candidates: list[tuple[int, int, int, str]] = []
+    candidates: list[tuple[int, int, int, int, str]] = []
     for rows in tables:
         for header_row_index, row in enumerate(rows):
-            for column_index, header in enumerate(row):
+            for translation_index, header in enumerate(row):
                 header_score = namuwiki_translation_header_score(header)
                 if header_score == 0:
                     continue
 
+                source_index = best_namuwiki_header_column(
+                    row,
+                    namuwiki_source_header_score,
+                    {translation_index},
+                )
+                excluded = {translation_index}
+                if source_index is not None:
+                    excluded.add(source_index)
+                reading_index = best_namuwiki_header_column(
+                    row,
+                    namuwiki_reading_header_score,
+                    excluded,
+                )
+
+                groups: list[str] = []
                 translated_cells: list[str] = []
+                complete_group_count = 0
                 for candidate_row in rows[header_row_index + 1 :]:
                     if any(
                         namuwiki_translation_header_score(cell) >= header_score
                         for cell in candidate_row
                     ):
                         break
-                    if column_index >= len(candidate_row):
+                    if translation_index >= len(candidate_row):
                         continue
-                    cell = normalize_namuwiki_table_text(candidate_row[column_index])
-                    if not cell or namuwiki_translation_header_score(cell):
+                    translation = normalize_namuwiki_table_text(
+                        candidate_row[translation_index]
+                    )
+                    if (
+                        not translation
+                        or namuwiki_translation_header_score(translation)
+                    ):
                         continue
-                    translated_cells.append(cell)
+
+                    group_lines: list[str] = []
+                    source = ""
+                    reading = ""
+                    if (
+                        source_index is not None
+                        and source_index < len(candidate_row)
+                    ):
+                        source = normalize_namuwiki_table_text(
+                            candidate_row[source_index]
+                        )
+                        if source:
+                            group_lines.append(source)
+                    if (
+                        reading_index is not None
+                        and reading_index < len(candidate_row)
+                    ):
+                        reading = normalize_namuwiki_table_text(
+                            candidate_row[reading_index]
+                        )
+                        if reading:
+                            group_lines.append(reading)
+                    group_lines.append(translation)
+                    groups.append("\n".join(group_lines))
+                    translated_cells.append(translation)
+                    if source and reading:
+                        complete_group_count += 1
 
                 translation = "\n".join(translated_cells).strip()
                 if not translation or not is_valid_korean_translation(translation):
                     continue
+                lyrics = "\n\n".join(groups)
                 hangul_count = sum(
                     bool(HANGUL_RE.fullmatch(character))
                     for character in translation
                 )
                 candidates.append(
-                    (hangul_count, header_score, len(translation), translation)
+                    (
+                        hangul_count,
+                        complete_group_count,
+                        header_score,
+                        len(lyrics),
+                        lyrics,
+                    )
                 )
 
-        interleaved_translation = extract_interleaved_korean_translation(rows)
-        if interleaved_translation:
+        interleaved_lyrics = extract_interleaved_namuwiki_lyrics(rows)
+        if interleaved_lyrics:
+            groups, translated_lines, _ = extract_interleaved_namuwiki_groups(
+                interleaved_lyrics
+            )
+            translation = "\n".join(translated_lines)
             hangul_count = sum(
                 bool(HANGUL_RE.fullmatch(character))
-                for character in interleaved_translation
+                for character in translation
             )
             candidates.append(
                 (
                     hangul_count,
+                    len(groups),
                     50,
-                    len(interleaved_translation),
-                    interleaved_translation,
+                    len(interleaved_lyrics),
+                    interleaved_lyrics,
                 )
             )
 
     if not candidates:
         return None
-    return max(candidates, key=lambda candidate: candidate[:3])[3]
+    lyrics = max(candidates, key=lambda candidate: candidate[:4])[4]
+    return lyrics if is_usable_namuwiki_lyrics(lyrics) else None
 
 
 NAMUMARK_STYLE_PREFIX_RE = re.compile(r"^(?:\s*<[^>\n]*>)+")
@@ -1959,18 +3037,18 @@ def parse_namumark_tables(source: str) -> list[list[list[str]]]:
     return tables
 
 
-def extract_korean_translation_from_namumark(source: str) -> str | None:
-    return extract_korean_translation_from_tables(parse_namumark_tables(source))
+def extract_namuwiki_lyrics_from_namumark(source: str) -> str | None:
+    return extract_namuwiki_lyrics_from_tables(parse_namumark_tables(source))
 
 
-def extract_korean_translation_from_html(source: str) -> str | None:
+def extract_namuwiki_lyrics_from_html(source: str) -> str | None:
     parser = NamuWikiHTMLTableParser()
     try:
         parser.feed(source)
         parser.close()
     except Exception as error:
         raise NamuWikiLyricsError(f"Could not parse NamuWiki HTML: {error}") from error
-    return extract_korean_translation_from_tables(parser.tables)
+    return extract_namuwiki_lyrics_from_tables(parser.tables)
 
 
 def get_namuwiki_override(track: Track) -> str | None:
@@ -2175,7 +3253,7 @@ def request_namuwiki_html(page_url: str) -> tuple[str, str] | None:
     return source, final_url
 
 
-def lookup_namuwiki_korean_lyrics(
+def lookup_namuwiki_lyrics(
     track: Track,
 ) -> tuple[str, str, str] | None:
     if not NAMUWIKI_LYRICS_ENABLED or track.is_local:
@@ -2206,7 +3284,7 @@ def lookup_namuwiki_korean_lyrics(
             else:
                 if namumark:
                     try:
-                        translation = extract_korean_translation_from_namumark(
+                        lyrics = extract_namuwiki_lyrics_from_namumark(
                             namumark
                         )
                     except Exception as error:
@@ -2216,9 +3294,9 @@ def lookup_namuwiki_korean_lyrics(
                             document,
                             error,
                         )
-                        translation = None
-                    if translation:
-                        return translation, "나무위키 · 한국어 번역", page_url
+                        lyrics = None
+                    if lyrics:
+                        return lyrics, "나무위키 · 원문·독음·번역", page_url
 
         try:
             html_result = request_namuwiki_html(page_url)
@@ -2235,7 +3313,7 @@ def lookup_namuwiki_korean_lyrics(
 
         page_source, final_url = html_result
         try:
-            translation = extract_korean_translation_from_html(page_source)
+            lyrics = extract_namuwiki_lyrics_from_html(page_source)
         except NamuWikiLyricsError as error:
             logger.warning(
                 "NamuWiki HTML parsing failed for %s (%s): %s",
@@ -2244,17 +3322,17 @@ def lookup_namuwiki_korean_lyrics(
                 error,
             )
             continue
-        if translation:
+        if lyrics:
             logger.info(
-                "NamuWiki Korean lyrics selected for %s (%s)",
+                "NamuWiki lyrics selected for %s (%s)",
                 track.title,
                 document,
             )
-            return translation, "나무위키 · 한국어 번역", final_url
+            return lyrics, "나무위키 · 원문·독음·번역", final_url
 
     if candidates:
         logger.info(
-            "No NamuWiki Korean lyrics found for %s (candidates: %s)",
+            "No NamuWiki lyrics found for %s (candidates: %s)",
             track.title,
             ", ".join(candidates),
         )
@@ -2315,6 +3393,19 @@ def normalize_lyrics_match_text(value: str) -> str:
     return normalize_identity_component(clean_track_title(value))
 
 
+def get_lyrics_title_aliases(value: str) -> set[str]:
+    cleaned_value = clean_track_title(value)
+    aliases = {normalize_identity_component(cleaned_value)}
+    aliases.update(
+        normalize_identity_component(part)
+        for part in re.split(
+            r"\s+(?:-|–|—|\||/)\s+",
+            cleaned_value,
+        )
+    )
+    return {alias for alias in aliases if alias}
+
+
 def lyrics_native_script_ratio(record: dict) -> float:
     lyrics = extract_original_lyrics(record) or ""
     letters = [character for character in lyrics if character.isalpha()]
@@ -2342,7 +3433,11 @@ def lyrics_record_score(
     if not expected_title or not candidate_title:
         return None
 
-    title_is_exact = candidate_title == expected_title
+    expected_aliases = get_lyrics_title_aliases(track_name)
+    candidate_aliases = get_lyrics_title_aliases(
+        str(record.get("trackName") or "")
+    )
+    title_is_exact = bool(expected_aliases & candidate_aliases)
     if title_is_exact:
         score = 100
     elif (
@@ -2609,30 +3704,6 @@ def select_korean_manual_subtitle(track: Track) -> tuple[str, str, str] | None:
     return language, extension, url
 
 
-def select_korean_automatic_subtitle(
-    track: Track,
-) -> tuple[str, str, str] | None:
-    candidates: list[tuple[int, str, str, str]] = []
-    for language, extension, url, format_score in get_subtitle_candidates(
-        track.korean_automatic_subtitles
-    ):
-        language_key = language.casefold().replace("_", "-")
-        if language_key.split("-", 1)[0] != "ko":
-            continue
-        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-        translated_language = (query.get("tlang") or [""])[0].casefold()
-        if translated_language.split("-", 1)[0] != "ko":
-            continue
-        candidates.append(
-            (format_score, language, extension, url)
-        )
-
-    if not candidates:
-        return None
-    _, language, extension, url = max(candidates, key=lambda candidate: candidate[0])
-    return language, extension, url
-
-
 def request_youtube_subtitle(url: str, extension: str) -> str | None:
     request = urllib.request.Request(
         url,
@@ -2710,43 +3781,17 @@ async def get_youtube_manual_lyrics(track: Track) -> str | None:
 
 
 async def get_youtube_korean_lyrics(track: Track) -> tuple[str, str] | None:
-    candidates = (
-        (
-            select_korean_manual_subtitle(track),
-            "YouTube 제공 한국어 자막",
-            "manual Korean translation",
-        ),
-        (
-            select_korean_automatic_subtitle(track),
-            "YouTube 한국어 자동 번역 자막",
-            "automatic Korean translation",
-        ),
+    selected = select_korean_manual_subtitle(track)
+    if selected is None:
+        return None
+    lyrics = await get_selected_youtube_subtitle(
+        track,
+        selected,
+        purpose="manual Korean lyrics",
     )
-    last_error: Exception | None = None
-    for selected, source, purpose in candidates:
-        if selected is None:
-            continue
-        try:
-            lyrics = await get_selected_youtube_subtitle(
-                track,
-                selected,
-                purpose=purpose,
-            )
-        except (YouTubeSubtitleError, YouTubeCircuitOpenError) as error:
-            last_error = error
-            logger.warning(
-                "YouTube %s lookup failed for %s: %s",
-                purpose,
-                track.title,
-                error,
-            )
-            continue
-        if lyrics:
-            return lyrics, source
-
-    if last_error is not None:
-        raise YouTubeSubtitleError(str(last_error)) from last_error
-    return None
+    if not lyrics:
+        return None
+    return lyrics, "YouTube 제공 한국어 자막"
 
 
 async def get_track_lyrics(track: Track) -> str | None:
@@ -2792,7 +3837,7 @@ def lyrics_are_primarily_korean(lyrics: str) -> bool:
     return hangul_characters / len(letters) >= 0.5
 
 
-def can_translate_lyrics(track: Track, lyrics: str) -> bool:
+def can_show_korean_lyrics(track: Track, lyrics: str) -> bool:
     if not LYRICS_TRANSLATION_ENABLED:
         return False
 
@@ -2809,21 +3854,96 @@ def can_translate_lyrics(track: Track, lyrics: str) -> bool:
         ):
             return False
 
-    return bool(
-        (
-            NAMUWIKI_LYRICS_ENABLED
-            or select_korean_manual_subtitle(track)
-            or select_korean_automatic_subtitle(track)
+    namuwiki_may_have_lyrics = NAMUWIKI_LYRICS_ENABLED and (
+        not track.namuwiki_lyrics_checked
+        or (
+            track.korean_lyrics_loaded
+            and track.korean_lyrics is not None
+            and track.korean_lyrics_url is not None
         )
     )
+    return bool(namuwiki_may_have_lyrics or select_korean_manual_subtitle(track))
+
+
+def get_korean_lyrics_label(track: Track) -> str:
+    if track.korean_lyrics_url or (
+        NAMUWIKI_LYRICS_ENABLED and not track.namuwiki_lyrics_checked
+    ):
+        return "나무위키 가사"
+    return "한국어 자막"
+
+
+def split_namuwiki_lyrics_groups(value: str) -> list[list[str]]:
+    return [
+        [line.strip() for line in group.splitlines() if line.strip()]
+        for group in re.split(r"\n\s*\n", value)
+        if group.strip()
+    ]
+
+
+def extract_namuwiki_original_lyrics(value: str) -> str | None:
+    source_lines = [
+        lines[0]
+        for lines in split_namuwiki_lyrics_groups(value)
+        if len(lines) >= 2
+        and (
+            JAPANESE_KANA_RE.search(lines[0])
+            or JAPANESE_HAN_RE.search(lines[0])
+        )
+    ]
+    return "\n".join(source_lines) if source_lines else None
+
+
+def extract_namuwiki_hiragana_reading(value: str) -> str | None:
+    groups = split_namuwiki_lyrics_groups(value)
+    japanese_groups = [
+        lines
+        for lines in groups
+        if len(lines) >= 3
+        and (
+            JAPANESE_KANA_RE.search(lines[0])
+            or JAPANESE_HAN_RE.search(lines[0])
+        )
+    ]
+    if not japanese_groups:
+        return None
+
+    readings: list[str] = []
+    for lines in japanese_groups:
+        reading = next(
+            (
+                line
+                for line in lines[1:-1]
+                if JAPANESE_KANA_RE.search(line) and not HANGUL_RE.search(line)
+            ),
+            None,
+        )
+        if reading is None:
+            return None
+        readings.append(katakana_to_hiragana(reading))
+    return "\n".join(readings)
+
+
+def get_hiragana_reading_source_lyrics(track: Track, lyrics: str) -> str | None:
+    if lyrics.strip() and lyrics_are_japanese(track, lyrics):
+        return lyrics
+    if track.korean_lyrics and track.korean_lyrics_url:
+        return extract_namuwiki_original_lyrics(track.korean_lyrics)
+    return None
 
 
 def can_generate_lyrics_reading(track: Track, lyrics: str) -> bool:
+    if not LYRICS_READING_ENABLED:
+        return False
+    if (
+        track.korean_lyrics
+        and track.korean_lyrics_url
+        and extract_namuwiki_hiragana_reading(track.korean_lyrics)
+    ):
+        return True
     return bool(
-        LYRICS_READING_ENABLED
-        and sudachi_dictionary is not None
-        and lyrics.strip()
-        and lyrics_are_japanese(track, lyrics)
+        sudachi_dictionary is not None
+        and get_hiragana_reading_source_lyrics(track, lyrics)
     )
 
 
@@ -2957,18 +4077,33 @@ def generate_hiragana_lyrics(lyrics: str) -> str:
     return reading_text
 
 
-async def get_track_korean_translation(track: Track) -> str:
-    if track.lyrics_translation_loaded and track.lyrics_translation is not None:
-        return track.lyrics_translation
+async def get_track_namuwiki_lyrics(track: Track) -> str | None:
+    if track.korean_lyrics_loaded:
+        return (
+            track.korean_lyrics
+            if track.korean_lyrics is not None and track.korean_lyrics_url is not None
+            else None
+        )
+    if track.namuwiki_lyrics_checked:
+        return None
 
-    async with track.lyrics_translation_lock:
-        if track.lyrics_translation_loaded and track.lyrics_translation is not None:
-            return track.lyrics_translation
+    async with track.korean_lyrics_lock:
+        if track.korean_lyrics_loaded:
+            return (
+                track.korean_lyrics
+                if (
+                    track.korean_lyrics is not None
+                    and track.korean_lyrics_url is not None
+                )
+                else None
+            )
+        if track.namuwiki_lyrics_checked:
+            return None
 
         namuwiki_result: tuple[str, str, str] | None = None
         try:
             namuwiki_result = await asyncio.wait_for(
-                asyncio.to_thread(lookup_namuwiki_korean_lyrics, track),
+                asyncio.to_thread(lookup_namuwiki_lyrics, track),
                 timeout=(
                     NAMUWIKI_REQUEST_TIMEOUT_SECONDS
                     * NAMUWIKI_MAX_DOCUMENT_CANDIDATES
@@ -2981,58 +4116,97 @@ async def get_track_korean_translation(track: Track) -> str:
             )
         except (asyncio.TimeoutError, NamuWikiLyricsError) as error:
             logger.warning(
-                "NamuWiki Korean lyrics lookup failed for %s: %s",
+                "NamuWiki lyrics lookup failed for %s: %s",
                 track.title,
                 error,
             )
         except Exception:
             logger.exception(
-                "Unexpected NamuWiki Korean lyrics failure for %s",
+                "Unexpected NamuWiki lyrics failure for %s",
                 track.title,
             )
+            return None
 
+        track.namuwiki_lyrics_checked = True
         if namuwiki_result is not None:
-            translation, source, source_url = namuwiki_result
-            track.lyrics_translation = translation
-            track.lyrics_translation_source = source
-            track.lyrics_translation_url = source_url
-            track.lyrics_translation_loaded = True
-            return translation
+            lyrics, source, source_url = namuwiki_result
+            track.korean_lyrics = lyrics
+            track.korean_lyrics_source = source
+            track.korean_lyrics_url = source_url
+            track.korean_lyrics_loaded = True
+            return lyrics
+        return None
 
+
+async def get_track_korean_lyrics(track: Track) -> str:
+    if track.korean_lyrics_loaded and track.korean_lyrics is not None:
+        return track.korean_lyrics
+
+    namuwiki_lyrics = await get_track_namuwiki_lyrics(track)
+    if namuwiki_lyrics is not None:
+        return namuwiki_lyrics
+
+    async with track.korean_lyrics_lock:
+        if track.korean_lyrics_loaded and track.korean_lyrics is not None:
+            return track.korean_lyrics
         try:
             youtube_result = await get_youtube_korean_lyrics(track)
         except (YouTubeSubtitleError, YouTubeCircuitOpenError) as error:
-            raise LyricsTranslationError(str(error)) from error
+            raise KoreanLyricsError(str(error)) from error
         if youtube_result is None:
-            raise LyricsTranslationError(
-                "No NamuWiki translation or Korean YouTube subtitles are available."
+            raise KoreanLyricsError(
+                "No NamuWiki lyrics or manually provided Korean YouTube subtitles "
+                "are available."
             )
 
-        translation, source = youtube_result
-        track.lyrics_translation = translation
-        track.lyrics_translation_source = source
-        track.lyrics_translation_url = None
-        track.lyrics_translation_loaded = True
-        return translation
+        lyrics, source = youtube_result
+        track.korean_lyrics = lyrics
+        track.korean_lyrics_source = source
+        track.korean_lyrics_url = None
+        track.korean_lyrics_loaded = True
+        return lyrics
 
 
 async def get_track_hiragana_reading(track: Track) -> str:
     if track.lyrics_reading_loaded and track.lyrics_reading is not None:
         return track.lyrics_reading
-    if not track.lyrics:
-        raise LyricsReadingError("Original lyrics are not available.")
 
     async with track.lyrics_reading_lock:
         if track.lyrics_reading_loaded and track.lyrics_reading is not None:
             return track.lyrics_reading
+
+        if track.korean_lyrics and track.korean_lyrics_url:
+            reading = extract_namuwiki_hiragana_reading(track.korean_lyrics)
+            if reading:
+                track.lyrics_reading = reading
+                track.lyrics_reading_loaded = True
+                track.lyrics_reading_source = "나무위키 · 일본어 독음"
+                track.lyrics_reading_url = track.korean_lyrics_url
+                return reading
+
+        source_lyrics = get_hiragana_reading_source_lyrics(
+            track,
+            track.lyrics or "",
+        )
+        if not source_lyrics:
+            raise LyricsReadingError("Japanese source lyrics are not available.")
         try:
-            reading = await asyncio.to_thread(generate_hiragana_lyrics, track.lyrics)
+            reading = await asyncio.to_thread(
+                generate_hiragana_lyrics,
+                source_lyrics,
+            )
         except LyricsReadingError:
             raise
         except Exception as error:
             raise LyricsReadingError(str(error)) from error
         track.lyrics_reading = reading
         track.lyrics_reading_loaded = True
+        if track.korean_lyrics_url and source_lyrics != track.lyrics:
+            track.lyrics_reading_source = "나무위키 원문 · Sudachi 자동 독음"
+            track.lyrics_reading_url = track.korean_lyrics_url
+        else:
+            track.lyrics_reading_source = "Sudachi · 자동 독음"
+            track.lyrics_reading_url = None
         return reading
 
 
@@ -3044,19 +4218,33 @@ def cancel_lyrics_publish(state: GuildMusicState) -> None:
 
 
 async def clear_lyrics_message(guild_id: int, state: GuildMusicState) -> None:
-    message = state.lyrics_message
+    messages = (state.lyrics_message, state.namuwiki_notice_message)
     state.lyrics_message = None
+    state.namuwiki_notice_message = None
     replace_lyrics_view(state, None)
+    for message in messages:
+        if message is not None:
+            await delete_music_channel_message(guild_id, message)
+
+
+async def clear_namuwiki_lyrics_notice(
+    guild_id: int,
+    state: GuildMusicState,
+) -> None:
+    message = state.namuwiki_notice_message
+    state.namuwiki_notice_message = None
     if message is not None:
         await delete_music_channel_message(guild_id, message)
 
 
 def schedule_lyrics_message_cleanup(guild_id: int, state: GuildMusicState) -> None:
-    message = state.lyrics_message
+    messages = (state.lyrics_message, state.namuwiki_notice_message)
     state.lyrics_message = None
+    state.namuwiki_notice_message = None
     replace_lyrics_view(state, None)
-    if message is not None:
-        asyncio.create_task(delete_music_channel_message(guild_id, message))
+    for message in messages:
+        if message is not None:
+            asyncio.create_task(delete_music_channel_message(guild_id, message))
 
 
 def make_lyrics_file(lyrics: str, filename: str = "lyrics.txt") -> discord.File:
@@ -3083,6 +4271,7 @@ def replace_lyrics_view(
 
 async def send_private_lyrics_variant(
     interaction: discord.Interaction,
+    guild_id: int,
     track: Track,
     *,
     label: str,
@@ -3099,7 +4288,13 @@ async def send_private_lyrics_variant(
             source,
             source_url,
         )
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        message = await send_ephemeral_followup(
+            interaction,
+            embed=embed,
+            delete_after=None,
+        )
+        if message is not None:
+            await register_private_lyrics_message(guild_id, track, message)
         return
 
     embed = make_lyrics_variant_embed(
@@ -3109,11 +4304,14 @@ async def send_private_lyrics_variant(
         source,
         source_url,
     )
-    await interaction.followup.send(
+    message = await send_ephemeral_followup(
+        interaction,
         embed=embed,
         file=make_lyrics_file(text, filename),
-        ephemeral=True,
+        delete_after=None,
     )
+    if message is not None:
+        await register_private_lyrics_message(guild_id, track, message)
 
 
 class LyricsVariantView(discord.ui.View):
@@ -3122,14 +4320,14 @@ class LyricsVariantView(discord.ui.View):
         self.guild_id = guild_id
         self.track = track
 
-        if can_translate_lyrics(track, lyrics):
-            translation_button = discord.ui.Button(
-                label="한국어 번역",
+        if can_show_korean_lyrics(track, lyrics):
+            korean_lyrics_button = discord.ui.Button(
+                label=get_korean_lyrics_label(track),
                 style=discord.ButtonStyle.secondary,
-                custom_id=f"lyrics:translation:{track.track_id}",
+                custom_id=f"lyrics:korean:{track.track_id}",
             )
-            translation_button.callback = self.show_translation
-            self.add_item(translation_button)
+            korean_lyrics_button.callback = self.show_korean_lyrics
+            self.add_item(korean_lyrics_button)
 
         if can_generate_lyrics_reading(track, lyrics):
             reading_button = discord.ui.Button(
@@ -3143,42 +4341,46 @@ class LyricsVariantView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if track_is_current(self.guild_id, self.track):
             return True
-        await interaction.response.send_message(
+        await send_ephemeral_response(
+            interaction,
             "이미 재생이 끝난 곡이에요.",
-            ephemeral=True,
         )
         return False
 
-    async def show_translation(self, interaction: discord.Interaction) -> None:
+    async def show_korean_lyrics(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            translation = await get_track_korean_translation(self.track)
-        except LyricsTranslationError as error:
+            lyrics = await get_track_korean_lyrics(self.track)
+        except KoreanLyricsError as error:
             logger.warning(
-                "Lyrics translation failed for %s: %s",
+                "Korean lyrics lookup failed for %s: %s",
                 self.track.title,
                 error,
             )
-            await interaction.followup.send(
-                "한국어 번역을 가져오지 못했어요. 잠시 후 다시 시도해 주세요.",
-                ephemeral=True,
+            await send_ephemeral_followup(
+                interaction,
+                "한국어 가사를 가져오지 못했어요. 잠시 후 다시 시도해 주세요.",
             )
             return
 
         if not track_is_current(self.guild_id, self.track):
-            await interaction.followup.send(
-                "번역하는 동안 곡이 바뀌었어요.",
-                ephemeral=True,
+            await send_ephemeral_followup(
+                interaction,
+                "가사를 가져오는 동안 곡이 바뀌었어요.",
             )
             return
         await send_private_lyrics_variant(
             interaction,
+            self.guild_id,
             self.track,
-            label="한국어 번역",
-            text=translation,
-            source=self.track.lyrics_translation_source or "한국어 번역",
-            filename="lyrics-ko.txt",
-            source_url=self.track.lyrics_translation_url,
+            label=get_korean_lyrics_label(self.track),
+            text=lyrics,
+            source=(
+                self.track.korean_lyrics_source
+                or get_korean_lyrics_label(self.track)
+            ),
+            filename="lyrics-korean.txt",
+            source_url=self.track.korean_lyrics_url,
         )
 
     async def show_reading(self, interaction: discord.Interaction) -> None:
@@ -3191,25 +4393,27 @@ class LyricsVariantView(discord.ui.View):
                 self.track.title,
                 error,
             )
-            await interaction.followup.send(
+            await send_ephemeral_followup(
+                interaction,
                 "히라가나 독음을 만들지 못했어요.",
-                ephemeral=True,
             )
             return
 
         if not track_is_current(self.guild_id, self.track):
-            await interaction.followup.send(
+            await send_ephemeral_followup(
+                interaction,
                 "독음을 만드는 동안 곡이 바뀌었어요.",
-                ephemeral=True,
             )
             return
         await send_private_lyrics_variant(
             interaction,
+            self.guild_id,
             self.track,
             label="히라가나 독음",
             text=reading,
-            source="Sudachi · 자동 독음",
+            source=self.track.lyrics_reading_source or "Sudachi · 자동 독음",
             filename="lyrics-hiragana.txt",
+            source_url=self.track.lyrics_reading_url,
         )
 
 
@@ -3312,6 +4516,96 @@ async def upsert_lyrics_message(
     return message
 
 
+async def upsert_namuwiki_lyrics_notice(
+    guild_id: int,
+    state: GuildMusicState,
+    track: Track,
+) -> discord.Message | None:
+    channel = resolve_control_panel_channel(guild_id, state)
+    if channel is None or state.current is not track:
+        return None
+
+    message = state.namuwiki_notice_message
+    if message is not None:
+        message_channel_id = getattr(getattr(message, "channel", None), "id", None)
+        channel_id = getattr(channel, "id", None)
+        if (
+            message_channel_id is not None
+            and channel_id is not None
+            and message_channel_id != channel_id
+        ):
+            await delete_music_channel_message(guild_id, message)
+            state.namuwiki_notice_message = None
+            message = None
+
+    embed = make_lyrics_variant_embed(
+        track,
+        "나무위키 가사 발견",
+        "원문 가사는 찾지 못했지만, "
+        "나무위키에는 원문·독음·번역 가사가 있어요.",
+        track.korean_lyrics_source or "나무위키 · 원문·독음·번역",
+        track.korean_lyrics_url,
+    )
+
+    if message is not None:
+        try:
+            edited_message = await message.edit(
+                content=None,
+                embed=embed,
+                attachments=[],
+                view=None,
+            )
+        except discord.NotFound:
+            state.namuwiki_notice_message = None
+            message = None
+        except discord.Forbidden:
+            logger.warning(
+                "Missing permission to edit NamuWiki lyrics notice in guild %s",
+                guild_id,
+            )
+            return None
+        except discord.HTTPException:
+            logger.exception(
+                "Failed to edit NamuWiki lyrics notice in guild %s",
+                guild_id,
+            )
+            return None
+        else:
+            if state.current is not track:
+                await delete_music_channel_message(
+                    guild_id,
+                    edited_message or message,
+                )
+                return None
+            state.namuwiki_notice_message = edited_message or message
+            return state.namuwiki_notice_message
+
+    send_options: dict[str, object] = {
+        "embed": embed,
+        "silent": is_silent_music_channel(channel),
+    }
+    try:
+        message = await channel.send(**send_options)
+    except discord.Forbidden:
+        logger.warning(
+            "Missing permission to send NamuWiki lyrics notice in guild %s",
+            guild_id,
+        )
+        return None
+    except discord.HTTPException:
+        logger.exception(
+            "Failed to send NamuWiki lyrics notice in guild %s",
+            guild_id,
+        )
+        return None
+
+    if state.current is not track:
+        await delete_music_channel_message(guild_id, message)
+        return None
+    state.namuwiki_notice_message = message
+    return message
+
+
 def schedule_lyrics_publish(
     guild_id: int,
     track: Track,
@@ -3331,6 +4625,7 @@ async def publish_current_lyrics(guild_id: int, track: Track) -> None:
     state = get_state(guild_id)
     current_task = asyncio.current_task()
     try:
+        await clear_namuwiki_lyrics_notice(guild_id, state)
         await upsert_lyrics_message(
             guild_id,
             state,
@@ -3368,6 +4663,34 @@ async def publish_current_lyrics(guild_id: int, track: Track) -> None:
                     attachment_lyrics=lyrics,
                     view=view,
                 )
+
+        if not lyrics:
+            namuwiki_lyrics = await get_track_namuwiki_lyrics(track)
+            if state.current is not track:
+                return
+            if namuwiki_lyrics:
+                view = make_lyrics_variant_view(guild_id, track, "")
+                await upsert_lyrics_message(
+                    guild_id,
+                    state,
+                    track,
+                    "미제공",
+                    view=view,
+                )
+                await upsert_namuwiki_lyrics_notice(
+                    guild_id,
+                    state,
+                    track,
+                )
+            else:
+                view = make_lyrics_variant_view(guild_id, track, "")
+                await upsert_lyrics_message(
+                    guild_id,
+                    state,
+                    track,
+                    "미제공",
+                    view=view,
+                )
     except asyncio.CancelledError:
         raise
     finally:
@@ -3384,21 +4707,6 @@ def get_manual_subtitles(info: dict) -> dict[str, list[dict]]:
         str(language): [copy.deepcopy(item) for item in formats if isinstance(item, dict)]
         for language, formats in subtitles.items()
         if isinstance(formats, list)
-    }
-
-
-def get_korean_automatic_subtitles(info: dict) -> dict[str, list[dict]]:
-    subtitles = info.get("automatic_captions")
-    if not isinstance(subtitles, dict):
-        return {}
-
-    return {
-        str(language): [copy.deepcopy(item) for item in formats if isinstance(item, dict)]
-        for language, formats in subtitles.items()
-        if (
-            isinstance(formats, list)
-            and str(language).casefold().replace("_", "-").split("-", 1)[0] == "ko"
-        )
     }
 
 
@@ -3423,7 +4731,6 @@ def make_track_from_info(
         song_name=info.get("track") or info.get("alt_title"),
         uploader=info.get("uploader") or info.get("channel"),
         manual_subtitles=get_manual_subtitles(info),
-        korean_automatic_subtitles=get_korean_automatic_subtitles(info),
         subtitle_language=info.get("language") or info.get("original_language"),
         stream_resolved_at=(
             info.get("_music_bot_extracted_at", time.monotonic())
@@ -3572,7 +4879,6 @@ async def resolve_track_stream(track: Track) -> None:
     track.song_name = info.get("track") or info.get("alt_title") or track.song_name
     track.uploader = info.get("uploader") or info.get("channel") or track.uploader
     track.manual_subtitles = get_manual_subtitles(info)
-    track.korean_automatic_subtitles = get_korean_automatic_subtitles(info)
     track.subtitle_language = (
         info.get("language") or info.get("original_language") or track.subtitle_language
     )
@@ -3632,10 +4938,7 @@ async def extract_track(
 
     resolved_query = resolve_query(query, search_kind)
     info = await extract_first_info(query, resolved_query)
-
-    track = make_track_from_info(info, requester, resolved_query, requester_id)
-    await resolve_track_stream(track)
-    return track
+    return make_track_from_info(info, requester, resolved_query, requester_id)
 
 
 async def extract_tracks(
@@ -3971,7 +5274,10 @@ async def ensure_voice(interaction: discord.Interaction, state: GuildMusicState)
     channel = getattr(voice_state, "channel", None)
 
     if channel is None:
-        await interaction.followup.send("먼저 음성 채널에 들어가 주세요.", ephemeral=True)
+        await send_ephemeral_followup(
+            interaction,
+            "먼저 음성 채널에 들어가 주세요.",
+        )
         return False
 
     if state.voice and not state.voice.is_connected():
@@ -3981,10 +5287,10 @@ async def ensure_voice(interaction: discord.Interaction, state: GuildMusicState)
     if state.voice and state.voice.is_connected():
         if state.voice.channel != channel:
             if state.current or state.queue or state.voice.is_playing() or state.voice.is_paused():
-                await interaction.followup.send(
+                await send_ephemeral_followup(
+                    interaction,
                     f"봇이 이미 {state.voice.channel.mention}에서 재생 중이에요. "
                     "같은 음성 채널에 들어와 주세요.",
-                    ephemeral=True,
                 )
                 return False
             await state.voice.move_to(channel)
@@ -4034,9 +5340,9 @@ async def ensure_same_voice_channel(
 
     message = "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
     if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
+        await send_ephemeral_followup(interaction, message)
     else:
-        await interaction.response.send_message(message, ephemeral=True)
+        await send_ephemeral_response(interaction, message)
     return False
 
 
@@ -4044,6 +5350,7 @@ def stop_playback(state: GuildMusicState, guild_id: int) -> None:
     state.playback_generation += 1
     state.stop_requested = True
     state.queue.clear()
+    schedule_private_lyrics_cleanup(state)
     state.current = None
     cancel_autoplay_refill(state)
     cancel_lyrics_publish(state)
@@ -4215,6 +5522,14 @@ async def enqueue_tracks(
 
     state.queue.extend(tracks)
     schedule_autoplay_refill(guild_id)
+    queue_size = len(state.queue)
+    if len(tracks) == 1:
+        embed = make_track_embed(tracks[0], "Added to queue")
+        embed.add_field(name="Position", value=str(queue_size), inline=True)
+    else:
+        embed = make_bulk_embed(tracks, "Added playlist to queue")
+        embed.add_field(name="Queue size", value=str(queue_size), inline=True)
+
     should_start = (
         bool(state.voice)
         and state.current is None
@@ -4226,23 +5541,16 @@ async def enqueue_tracks(
     if should_start:
         playback_task, started_playback = schedule_play_next(guild_id, announce=False)
 
+    await send_feedback(embed=embed, private=True)
+
     if started_playback and playback_task:
         await playback_task
         if state.current:
             await update_control_panel(guild_id, state)
-            await send_feedback(content="재생을 시작했어요.", private=True)
         else:
             await send_feedback(content="재생을 시작하지 못했어요. 로그를 확인해 주세요.")
         return state.current is not None
 
-    if len(tracks) == 1:
-        embed = make_track_embed(tracks[0], "Added to queue")
-        embed.add_field(name="Position", value=str(len(state.queue)), inline=True)
-    else:
-        embed = make_bulk_embed(tracks, "Added playlist to queue")
-        embed.add_field(name="Queue size", value=str(len(state.queue)), inline=True)
-
-    await send_feedback(embed=embed, private=True)
     if state.current:
         await update_control_panel(guild_id, state)
     return True
@@ -4665,6 +5973,7 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                             ):
                                 return
 
+                            schedule_private_lyrics_cleanup(state, track.track_id)
                             if state.repeat_one and not state.skip_requested and not state.stop_requested:
                                 track.stream_url = None
                                 track.stream_resolved_at = None
@@ -4818,7 +6127,7 @@ async def setup_music_channel(
 ) -> None:
     await interaction.response.defer(ephemeral=True)
     if interaction.guild is None:
-        await interaction.followup.send(guild_only_error(), ephemeral=True)
+        await send_ephemeral_followup(interaction, guild_only_error())
         return
 
     selected_channel = channel
@@ -4844,10 +6153,10 @@ async def setup_music_channel(
     set_music_channel(guild_id, selected_channel.id)
     state.announcement_channel = selected_channel
     await update_control_panel(guild_id, state, channel=selected_channel)
-    await interaction.followup.send(
+    await send_ephemeral_followup(
+        interaction,
         f"{selected_channel.mention} 채널을 음악 신청 전용 채널로 설정했어요. "
         "이제 그 채널에 곡명이나 YouTube URL만 보내면 재생되고, 컨트롤 패널은 항상 유지됩니다.",
-        ephemeral=True,
     )
 
 
@@ -4858,9 +6167,9 @@ async def setup_music_channel_error(
 ) -> None:
     async def send_error(content: str) -> None:
         if interaction.response.is_done():
-            await interaction.followup.send(content, ephemeral=True)
+            await send_ephemeral_followup(interaction, content)
         else:
-            await interaction.response.send_message(content, ephemeral=True)
+            await send_ephemeral_response(interaction, content)
 
     if isinstance(error, app_commands.MissingPermissions):
         await send_error("이 설정은 채널 관리 권한이 있는 사람만 사용할 수 있어요.")
@@ -4875,20 +6184,20 @@ async def setup_music_channel_error(
 async def join(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     if interaction.guild_id is None:
-        await interaction.followup.send(guild_only_error(), ephemeral=True)
+        await send_ephemeral_followup(interaction, guild_only_error())
         return
 
     state = get_state(interaction.guild_id)
     if await ensure_voice(interaction, state):
         state.announcement_channel = interaction.channel
-        await interaction.followup.send("음성 채널에 들어왔어요.", ephemeral=True)
+        await send_ephemeral_followup(interaction, "음성 채널에 들어왔어요.")
 
 
 @bot.tree.command(name="pause", description="Pause the current track.")
 @app_commands.guild_only()
 async def pause(interaction: discord.Interaction) -> None:
     if interaction.guild_id is None:
-        await interaction.response.send_message(guild_only_error(), ephemeral=True)
+        await send_ephemeral_response(interaction, guild_only_error())
         return
 
     state = get_state(interaction.guild_id)
@@ -4896,17 +6205,17 @@ async def pause(interaction: discord.Interaction) -> None:
         return
     if state.voice and state.voice.is_playing():
         state.voice.pause()
-        await interaction.response.send_message("일시정지했어요.", ephemeral=True)
+        await send_ephemeral_response(interaction, "일시정지했어요.")
         return
 
-    await interaction.response.send_message("지금 재생 중인 곡이 없어요.", ephemeral=True)
+    await send_ephemeral_response(interaction, "지금 재생 중인 곡이 없어요.")
 
 
 @bot.tree.command(name="resume", description="Resume the paused track.")
 @app_commands.guild_only()
 async def resume(interaction: discord.Interaction) -> None:
     if interaction.guild_id is None:
-        await interaction.response.send_message(guild_only_error(), ephemeral=True)
+        await send_ephemeral_response(interaction, guild_only_error())
         return
 
     state = get_state(interaction.guild_id)
@@ -4914,17 +6223,17 @@ async def resume(interaction: discord.Interaction) -> None:
         return
     if state.voice and state.voice.is_paused():
         state.voice.resume()
-        await interaction.response.send_message("다시 재생할게요.", ephemeral=True)
+        await send_ephemeral_response(interaction, "다시 재생할게요.")
         return
 
-    await interaction.response.send_message("일시정지된 곡이 없어요.", ephemeral=True)
+    await send_ephemeral_response(interaction, "일시정지된 곡이 없어요.")
 
 
 @bot.tree.command(name="skip", description="Skip the current track.")
 @app_commands.guild_only()
 async def skip(interaction: discord.Interaction) -> None:
     if interaction.guild_id is None:
-        await interaction.response.send_message(guild_only_error(), ephemeral=True)
+        await send_ephemeral_response(interaction, guild_only_error())
         return
 
     state = get_state(interaction.guild_id)
@@ -4936,14 +6245,14 @@ async def skip(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("다음 곡으로 넘어갈게요.")
         return
 
-    await interaction.response.send_message("스킵할 곡이 없어요.", ephemeral=True)
+    await send_ephemeral_response(interaction, "스킵할 곡이 없어요.")
 
 
 @bot.tree.command(name="stop", description="Stop playback and clear the queue.")
 @app_commands.guild_only()
 async def stop(interaction: discord.Interaction) -> None:
     if interaction.guild_id is None:
-        await interaction.response.send_message(guild_only_error(), ephemeral=True)
+        await send_ephemeral_response(interaction, guild_only_error())
         return
 
     state = get_state(interaction.guild_id)
@@ -4959,14 +6268,15 @@ async def stop(interaction: discord.Interaction) -> None:
 @app_commands.guild_only()
 async def show_queue(interaction: discord.Interaction) -> None:
     if interaction.guild_id is None:
-        await interaction.response.send_message(guild_only_error(), ephemeral=True)
+        await send_ephemeral_response(interaction, guild_only_error())
         return
 
     state = get_state(interaction.guild_id)
-    await interaction.response.send_message(
+    await send_queue_management_response(
+        interaction,
+        interaction.guild_id,
         embed=make_queue_embed(state),
         view=QueueManageView(interaction.guild_id) if state.queue else None,
-        ephemeral=True,
     )
 
 
@@ -4975,7 +6285,7 @@ async def show_queue(interaction: discord.Interaction) -> None:
 @app_commands.guild_only()
 async def remove_from_queue(interaction: discord.Interaction, position: int) -> None:
     if interaction.guild_id is None:
-        await interaction.response.send_message(guild_only_error(), ephemeral=True)
+        await send_ephemeral_response(interaction, guild_only_error())
         return
 
     state = get_state(interaction.guild_id)
@@ -4983,16 +6293,20 @@ async def remove_from_queue(interaction: discord.Interaction, position: int) -> 
         return
     removed = remove_queued_track(state, position - 1)
     if removed is None:
-        await interaction.response.send_message("그 번호의 대기열 곡을 찾지 못했어요.", ephemeral=True)
+        await send_ephemeral_response(
+            interaction,
+            "그 번호의 대기열 곡을 찾지 못했어요.",
+        )
         return
 
     schedule_autoplay_refill(interaction.guild_id)
     if state.current:
         await update_control_panel(interaction.guild_id, state)
 
-    await interaction.response.send_message(
+    await send_ephemeral_response(
+        interaction,
         f"대기열에서 `{removed.title}`을 삭제했어요.",
-        ephemeral=True,
+        delete_after=QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
     )
 
 
@@ -5000,7 +6314,7 @@ async def remove_from_queue(interaction: discord.Interaction, position: int) -> 
 @app_commands.guild_only()
 async def now_playing(interaction: discord.Interaction) -> None:
     if interaction.guild_id is None:
-        await interaction.response.send_message(guild_only_error(), ephemeral=True)
+        await send_ephemeral_response(interaction, guild_only_error())
         return
 
     state = get_state(interaction.guild_id)
@@ -5011,14 +6325,14 @@ async def now_playing(interaction: discord.Interaction) -> None:
         )
         return
 
-    await interaction.response.send_message("지금 재생 중인 곡이 없어요.", ephemeral=True)
+    await send_ephemeral_response(interaction, "지금 재생 중인 곡이 없어요.")
 
 
 @bot.tree.command(name="leave", description="Disconnect from voice and clear the queue.")
 @app_commands.guild_only()
 async def leave(interaction: discord.Interaction) -> None:
     if interaction.guild_id is None:
-        await interaction.response.send_message(guild_only_error(), ephemeral=True)
+        await send_ephemeral_response(interaction, guild_only_error())
         return
 
     state = get_state(interaction.guild_id)
@@ -5034,7 +6348,7 @@ async def leave(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("음성 채널에서 나왔어요.")
         return
 
-    await interaction.response.send_message("이미 음성 채널에 없어요.", ephemeral=True)
+    await send_ephemeral_response(interaction, "이미 음성 채널에 없어요.")
 
 
 def main() -> None:

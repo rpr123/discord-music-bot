@@ -1,6 +1,7 @@
 .env
 cookies.txt
 *.cookies.txt
+ytmusic-auth.json
 music_channels.json
 .venv/
 __pycache__/
