@@ -6,6 +6,8 @@ from collections import deque
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from discord.ui.view import ViewStore
+
 import bot
 
 
@@ -533,6 +535,7 @@ class QueueFeedbackLatencyTests(unittest.IsolatedAsyncioTestCase):
         guild_id = 654
         state = bot.get_state(guild_id)
         state.voice = Voice()
+        state.autoplay_enabled = True
         track = make_track("queued")
         track.stream_url = None
         initial_response = MagicMock()
@@ -567,6 +570,7 @@ class QueueFeedbackLatencyTests(unittest.IsolatedAsyncioTestCase):
                 "update_control_panel",
                 new=AsyncMock(),
             ),
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
         ):
             enqueue_task = asyncio.create_task(
                 bot.enqueue_tracks(
@@ -587,11 +591,13 @@ class QueueFeedbackLatencyTests(unittest.IsolatedAsyncioTestCase):
                 initial_response.edit.await_args.kwargs["embed"]
             )
             self.assertFalse(enqueue_task.done())
+            schedule_refill.assert_not_called()
 
             playback_gate.set()
             result = await enqueue_task
 
         self.assertTrue(result)
+        schedule_refill.assert_not_called()
 
 
 class AutoRequestParsingTests(unittest.TestCase):
@@ -1541,7 +1547,7 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
 
         subtitle_lookup.assert_not_awaited()
 
-    async def test_korean_lyrics_button_uses_private_followup_and_track_cache(
+    async def test_korean_lyrics_button_uses_original_response_and_cache(
         self,
     ) -> None:
         guild_id = 101
@@ -1550,14 +1556,19 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
         track.lyrics_loaded = True
         state = bot.get_state(guild_id)
         state.current = track
-        interaction = MagicMock()
-        interaction.response.defer = AsyncMock()
         first_message = MagicMock()
         first_message.delete = AsyncMock()
         second_message = MagicMock()
         second_message.delete = AsyncMock()
-        interaction.followup.send = AsyncMock(
-            side_effect=[first_message, second_message]
+        first_interaction = MagicMock()
+        first_interaction.response.send_message = AsyncMock()
+        first_interaction.edit_original_response = AsyncMock(
+            return_value=first_message
+        )
+        second_interaction = MagicMock()
+        second_interaction.response.send_message = AsyncMock()
+        second_interaction.edit_original_response = AsyncMock(
+            return_value=second_message
         )
         view = bot.LyricsVariantView.__new__(bot.LyricsVariantView)
         view.guild_id = guild_id
@@ -1577,16 +1588,26 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ) as request_lyrics,
         ):
-            await view.show_korean_lyrics(interaction)
-            await view.show_korean_lyrics(interaction)
+            await view.show_korean_lyrics(first_interaction)
+            await view.show_korean_lyrics(second_interaction)
 
-        interaction.response.defer.assert_awaited_with(ephemeral=True, thinking=True)
-        self.assertEqual(interaction.followup.send.await_count, 2)
-        self.assertTrue(
-            all(
-                call.kwargs["ephemeral"] and call.kwargs["wait"]
-                for call in interaction.followup.send.await_args_list
-            )
+        first_interaction.response.send_message.assert_awaited_once_with(
+            "가사 정보를 확인하고 있어요...",
+            ephemeral=True,
+        )
+        second_interaction.response.send_message.assert_awaited_once_with(
+            "가사 정보를 확인하고 있어요...",
+            ephemeral=True,
+        )
+        first_interaction.edit_original_response.assert_awaited_once()
+        second_interaction.edit_original_response.assert_awaited_once()
+        self.assertEqual(
+            first_interaction.edit_original_response.await_args.kwargs["attachments"],
+            [],
+        )
+        self.assertEqual(
+            second_interaction.edit_original_response.await_args.kwargs["attachments"],
+            [],
         )
         request_lyrics.assert_awaited_once_with(track)
         first_message.delete.assert_not_awaited()
@@ -1602,6 +1623,84 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
         first_message.delete.assert_awaited_once_with()
         second_message.delete.assert_awaited_once_with()
         self.assertNotIn(track.track_id, state.private_lyrics_messages)
+
+    async def test_korean_lyrics_button_acknowledges_before_slow_lookup(self) -> None:
+        guild_id = 103
+        track = make_track("slow foreign")
+        state = bot.get_state(guild_id)
+        state.current = track
+        interaction = MagicMock()
+        interaction.response.send_message = AsyncMock()
+        message = MagicMock()
+        message.delete = AsyncMock()
+        interaction.edit_original_response = AsyncMock(return_value=message)
+        lookup_started = asyncio.Event()
+        lookup_gate = asyncio.Event()
+        view = bot.LyricsVariantView.__new__(bot.LyricsVariantView)
+        view.guild_id = guild_id
+        view.track = track
+
+        async def slow_lookup(requested_track: bot.Track) -> str:
+            self.assertIs(requested_track, track)
+            lookup_started.set()
+            await lookup_gate.wait()
+            requested_track.korean_lyrics_source = "나무위키 · 원문·독음·번역"
+            requested_track.korean_lyrics_url = "https://namu.wiki/w/test"
+            return "원문\n독음\n번역"
+
+        with patch.object(bot, "get_track_korean_lyrics", new=slow_lookup):
+            task = asyncio.create_task(view.show_korean_lyrics(interaction))
+            await lookup_started.wait()
+
+            interaction.response.send_message.assert_awaited_once_with(
+                "가사 정보를 확인하고 있어요...",
+                ephemeral=True,
+            )
+            interaction.edit_original_response.assert_not_awaited()
+
+            lookup_gate.set()
+            await task
+
+        interaction.edit_original_response.assert_awaited_once()
+        self.assertEqual(
+            state.private_lyrics_messages[track.track_id],
+            [message],
+        )
+
+    async def test_long_korean_lyrics_are_attached_to_original_response(self) -> None:
+        guild_id = 104
+        track = make_track("long foreign")
+        track.korean_lyrics = "원문\n독음\n번역\n\n" * 500
+        track.korean_lyrics_loaded = True
+        track.korean_lyrics_source = "나무위키 · 원문·독음·번역"
+        track.korean_lyrics_url = "https://namu.wiki/w/test"
+        state = bot.get_state(guild_id)
+        state.current = track
+        interaction = MagicMock()
+        interaction.response.send_message = AsyncMock()
+        message = MagicMock()
+        message.delete = AsyncMock()
+        interaction.edit_original_response = AsyncMock(return_value=message)
+        view = bot.LyricsVariantView.__new__(bot.LyricsVariantView)
+        view.guild_id = guild_id
+        view.track = track
+
+        await view.show_korean_lyrics(interaction)
+
+        attachments = interaction.edit_original_response.await_args.kwargs[
+            "attachments"
+        ]
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].filename, "lyrics-korean.txt")
+        self.assertLess(
+            len(
+                interaction.edit_original_response.await_args.kwargs[
+                    "embed"
+                ].description
+            ),
+            bot.LYRICS_INLINE_LIMIT,
+        )
+        attachments[0].close()
 
     async def test_late_private_lyrics_result_is_deleted_after_track_change(
         self,
@@ -1950,6 +2049,99 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.full_url, self.PAGE_URL)
         self.assertIn("text/html", request.get_header("Accept"))
 
+    def test_public_html_403_switches_to_discord_preview_renderer(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = self.HTML_FIXTURE.encode("utf-8")
+        response.geturl.return_value = self.PAGE_URL
+        blocked = bot.urllib.error.HTTPError(
+            self.PAGE_URL,
+            403,
+            "Forbidden",
+            {},
+            None,
+        )
+
+        with (
+            patch.object(bot, "NAMUWIKI_REQUEST_INTERVAL_SECONDS", 0),
+            patch.object(bot, "NAMUWIKI_PREVIEW_FALLBACK_ENABLED", True),
+            patch.object(bot, "namuwiki_prefer_preview_renderer", False),
+            patch.object(
+                bot.urllib.request,
+                "urlopen",
+                side_effect=[blocked, response, response],
+            ) as urlopen,
+        ):
+            first_result = bot.request_namuwiki_html(self.PAGE_URL)
+            second_result = bot.request_namuwiki_html(self.PAGE_URL)
+
+            self.assertTrue(bot.namuwiki_prefer_preview_renderer)
+
+        self.assertEqual(first_result, (self.HTML_FIXTURE, self.PAGE_URL))
+        self.assertEqual(second_result, (self.HTML_FIXTURE, self.PAGE_URL))
+        user_agents = [
+            call.args[0].get_header("User-agent")
+            for call in urlopen.call_args_list
+        ]
+        self.assertEqual(
+            user_agents,
+            [
+                bot.NAMUWIKI_BROWSER_USER_AGENT,
+                bot.NAMUWIKI_PREVIEW_USER_AGENT,
+                bot.NAMUWIKI_PREVIEW_USER_AGENT,
+            ],
+        )
+
+    def test_public_html_preview_fallback_can_be_disabled(self) -> None:
+        blocked = bot.urllib.error.HTTPError(
+            self.PAGE_URL,
+            403,
+            "Forbidden",
+            {},
+            None,
+        )
+        with (
+            patch.object(bot, "NAMUWIKI_REQUEST_INTERVAL_SECONDS", 0),
+            patch.object(bot, "NAMUWIKI_PREVIEW_FALLBACK_ENABLED", False),
+            patch.object(bot, "namuwiki_prefer_preview_renderer", False),
+            patch.object(
+                bot.urllib.request,
+                "urlopen",
+                side_effect=blocked,
+            ) as urlopen,
+            self.assertRaises(bot.NamuWikiPageBlockedError),
+        ):
+            bot.request_namuwiki_html(self.PAGE_URL)
+
+        urlopen.assert_called_once()
+
+    def test_public_html_challenge_switches_to_discord_preview(self) -> None:
+        challenge_response = MagicMock()
+        challenge_response.__enter__.return_value = challenge_response
+        challenge_response.read.return_value = (
+            "<html><body>CAPTCHA 인증이 필요합니다.</body></html>"
+        ).encode("utf-8")
+        challenge_response.geturl.return_value = self.PAGE_URL
+        preview_response = MagicMock()
+        preview_response.__enter__.return_value = preview_response
+        preview_response.read.return_value = self.HTML_FIXTURE.encode("utf-8")
+        preview_response.geturl.return_value = self.PAGE_URL
+
+        with (
+            patch.object(bot, "NAMUWIKI_REQUEST_INTERVAL_SECONDS", 0),
+            patch.object(bot, "NAMUWIKI_PREVIEW_FALLBACK_ENABLED", True),
+            patch.object(bot, "namuwiki_prefer_preview_renderer", False),
+            patch.object(
+                bot.urllib.request,
+                "urlopen",
+                side_effect=[challenge_response, preview_response],
+            ) as urlopen,
+        ):
+            result = bot.request_namuwiki_html(self.PAGE_URL)
+
+        self.assertEqual(result, (self.HTML_FIXTURE, self.PAGE_URL))
+        self.assertEqual(urlopen.call_count, 2)
+
     def test_api_request_reads_namumark_text_with_bearer_token(self) -> None:
         response = MagicMock()
         response.__enter__.return_value = response
@@ -2285,6 +2477,55 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
         message.delete = AsyncMock()
         channel.send.return_value = message
         return channel, message
+
+    async def test_replacing_lyrics_view_restores_new_button_callbacks(
+        self,
+    ) -> None:
+        guild_id = 609
+        message_id = 709
+        custom_id = "lyrics:korean:replacement-test"
+        state = bot.get_state(guild_id)
+        previous_view = bot.discord.ui.View(timeout=None)
+        previous_view.add_item(
+            bot.discord.ui.Button(label="이전", custom_id=custom_id)
+        )
+        replacement_view = bot.discord.ui.View(timeout=None)
+        replacement_button = bot.discord.ui.Button(
+            label="새 가사",
+            custom_id=custom_id,
+        )
+        replacement_view.add_item(replacement_button)
+        view_store = ViewStore(bot.bot._connection)
+        view_store.add_view(previous_view, message_id)
+        view_store.add_view(replacement_view, message_id)
+        state.lyrics_view = previous_view
+
+        def register_view(
+            view: bot.discord.ui.View,
+            *,
+            message_id: int,
+        ) -> None:
+            view_store.add_view(view, message_id)
+
+        with patch.object(
+            bot.bot,
+            "add_view",
+            side_effect=register_view,
+        ) as add_view:
+            bot.replace_lyrics_view(
+                state,
+                replacement_view,
+                message_id=message_id,
+            )
+
+        key = (bot.discord.ComponentType.button.value, custom_id)
+        self.assertIs(view_store._views[message_id][key], replacement_button)
+        add_view.assert_called_once_with(
+            replacement_view,
+            message_id=message_id,
+        )
+
+        bot.replace_lyrics_view(state, None)
 
     async def test_new_track_edits_the_existing_lyrics_message(self) -> None:
         guild_id = 600
@@ -3187,6 +3428,13 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(sleep.await_args.args[0], 5.0)
         self.assertLessEqual(sleep.await_args.args[0], 6.0)
 
+    async def test_request_can_skip_the_general_interval(self) -> None:
+        bot.ytdl_last_request_started_at = bot.time.monotonic()
+        with patch.object(bot.asyncio, "sleep", new=AsyncMock()) as sleep:
+            await bot.wait_for_ytdl_interval(0.0)
+
+        sleep.assert_not_awaited()
+
     async def test_429_opens_circuit_and_blocks_new_worker(self) -> None:
         with patch.object(bot, "YOUTUBE_CIRCUIT_BREAKER_SECONDS", 1800):
             opened = bot.trip_youtube_circuit(
@@ -3637,7 +3885,13 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         ) as extract:
             await bot.resolve_track_stream(track)
 
-        extract.assert_awaited_once()
+        extract.assert_awaited_once_with(
+            bot.YTDL_OPTIONS,
+            track.source_url,
+            "audio stream resolve",
+            use_cache=False,
+            minimum_interval_seconds=0.0,
+        )
         self.assertEqual(track.stream_url, "https://example.test/new-audio")
         self.assertEqual(track.title, "refreshed")
 

@@ -197,6 +197,14 @@ NAMUWIKI_API_BASE_URL = os.getenv(
     "NAMUWIKI_API_BASE_URL", "https://wiki-api.namu.la/api"
 ).rstrip("/")
 NAMUWIKI_API_TOKEN = os.getenv("NAMUWIKI_API_TOKEN", "").strip() or None
+NAMUWIKI_PREVIEW_FALLBACK_ENABLED = os.getenv(
+    "NAMUWIKI_PREVIEW_FALLBACK_ENABLED", "true"
+).lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 NAMUWIKI_REQUEST_TIMEOUT_SECONDS = parse_positive_int_env(
     "NAMUWIKI_REQUEST_TIMEOUT_SECONDS", 10
 )
@@ -412,11 +420,18 @@ async def cache_ytdl_info(cache_key: tuple[str, str], info: dict) -> None:
             ytdl_cache.popitem(last=False)
 
 
-async def wait_for_ytdl_interval() -> None:
+async def wait_for_ytdl_interval(
+    minimum_interval_seconds: float | None = None,
+) -> None:
     global ytdl_last_request_started_at
+    interval_seconds = (
+        YTDL_MIN_INTERVAL_SECONDS
+        if minimum_interval_seconds is None
+        else max(0.0, minimum_interval_seconds)
+    )
     async with ytdl_rate_lock:
         elapsed = time.monotonic() - ytdl_last_request_started_at
-        delay = max(0.0, YTDL_MIN_INTERVAL_SECONDS - elapsed)
+        delay = max(0.0, interval_seconds - elapsed)
         if delay > 0:
             await asyncio.sleep(delay)
         ytdl_last_request_started_at = time.monotonic()
@@ -438,6 +453,7 @@ async def extract_ytdl_info(
     label: str,
     *,
     use_cache: bool = True,
+    minimum_interval_seconds: float | None = None,
 ) -> dict:
     cache_key = get_ytdl_cache_key(options, query)
     if use_cache:
@@ -467,7 +483,7 @@ async def extract_ytdl_info(
 
     try:
         ensure_youtube_circuit_closed()
-        await wait_for_ytdl_interval()
+        await wait_for_ytdl_interval(minimum_interval_seconds)
     except BaseException:
         ytdl_semaphore.release()
         raise
@@ -806,9 +822,10 @@ class GuildMusicState:
     lyrics_message: discord.Message | None = None
     namuwiki_notice_message: discord.Message | None = None
     lyrics_view: discord.ui.View | None = None
-    private_lyrics_messages: dict[str, list[discord.WebhookMessage]] = field(
-        default_factory=dict
-    )
+    private_lyrics_messages: dict[
+        str,
+        list[discord.WebhookMessage | discord.InteractionMessage],
+    ] = field(default_factory=dict)
     queue_cleanup_tasks: dict[int, asyncio.Task[None]] = field(default_factory=dict)
     empty_channel_task: asyncio.Task[None] | None = None
     playback_generation: int = 0
@@ -879,7 +896,7 @@ async def send_ephemeral_followup(
 
 
 async def delete_private_interaction_message(
-    message: discord.WebhookMessage,
+    message: discord.WebhookMessage | discord.InteractionMessage,
 ) -> None:
     try:
         await message.delete()
@@ -892,7 +909,7 @@ async def delete_private_interaction_message(
 async def register_private_lyrics_message(
     guild_id: int,
     track: Track,
-    message: discord.WebhookMessage,
+    message: discord.WebhookMessage | discord.InteractionMessage,
 ) -> None:
     state = get_state(guild_id)
     if state.current is not track:
@@ -2494,6 +2511,10 @@ class NamuWikiLyricsError(RuntimeError):
     pass
 
 
+class NamuWikiPageBlockedError(NamuWikiLyricsError):
+    pass
+
+
 class LyricsReadingError(RuntimeError):
     pass
 
@@ -2525,8 +2546,15 @@ SUDACHI_TOKENIZER = None
 SUDACHI_TOKENIZER_LOCK = threading.Lock()
 NAMUWIKI_REQUEST_LOCK = threading.Lock()
 namuwiki_last_request_started_at = 0.0
+namuwiki_prefer_preview_renderer = False
 NAMUWIKI_MAX_DOCUMENT_CANDIDATES = 4
 NAMUWIKI_MAX_RESPONSE_BYTES = 3_000_000
+NAMUWIKI_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
+NAMUWIKI_PREVIEW_USER_AGENT = "Discordbot/2.0"
 NAMUWIKI_IGNORED_HTML_TAGS = frozenset(
     {"button", "noscript", "script", "style", "sup", "svg"}
 )
@@ -3308,17 +3336,16 @@ def request_namuwiki_api_source(document: str) -> str | None:
     return source if isinstance(source, str) and source.strip() else None
 
 
-def request_namuwiki_html(page_url: str) -> tuple[str, str] | None:
+def request_namuwiki_html_once(
+    page_url: str,
+    user_agent: str,
+) -> tuple[str, str] | None:
     request = urllib.request.Request(
         page_url,
         headers={
             "Accept": "text/html,application/xhtml+xml",
             "Accept-Language": "ko-KR,ko;q=0.9",
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0 Safari/537.36"
-            ),
+            "User-Agent": user_agent,
         },
     )
     wait_for_namuwiki_interval()
@@ -3332,6 +3359,10 @@ def request_namuwiki_html(page_url: str) -> tuple[str, str] | None:
     except urllib.error.HTTPError as error:
         if error.code in {404, 410}:
             return None
+        if error.code == 403:
+            raise NamuWikiPageBlockedError(
+                "NamuWiki page returned HTTP 403."
+            ) from error
         raise NamuWikiLyricsError(
             f"NamuWiki page returned HTTP {error.code}."
         ) from error
@@ -3341,8 +3372,53 @@ def request_namuwiki_html(page_url: str) -> tuple[str, str] | None:
     source = payload.decode("utf-8", errors="replace")
     lowered_source = source.casefold()
     if any(marker in lowered_source for marker in NAMUWIKI_BLOCKED_MARKERS):
-        raise NamuWikiLyricsError("NamuWiki blocked or challenged the request.")
+        raise NamuWikiPageBlockedError(
+            "NamuWiki blocked or challenged the request."
+        )
     return source, final_url
+
+
+def request_namuwiki_html(page_url: str) -> tuple[str, str] | None:
+    global namuwiki_prefer_preview_renderer
+
+    if (
+        not NAMUWIKI_PREVIEW_FALLBACK_ENABLED
+        or namuwiki_prefer_preview_renderer
+    ):
+        user_agent = (
+            NAMUWIKI_PREVIEW_USER_AGENT
+            if namuwiki_prefer_preview_renderer
+            else NAMUWIKI_BROWSER_USER_AGENT
+        )
+        return request_namuwiki_html_once(page_url, user_agent)
+
+    try:
+        return request_namuwiki_html_once(
+            page_url,
+            NAMUWIKI_BROWSER_USER_AGENT,
+        )
+    except NamuWikiPageBlockedError as browser_error:
+        logger.info(
+            "NamuWiki browser page was blocked; retrying through the "
+            "Discord link-preview renderer"
+        )
+        try:
+            result = request_namuwiki_html_once(
+                page_url,
+                NAMUWIKI_PREVIEW_USER_AGENT,
+            )
+        except NamuWikiLyricsError as preview_error:
+            raise NamuWikiLyricsError(
+                f"{browser_error} Discord preview fallback failed: "
+                f"{preview_error}"
+            ) from preview_error
+
+        namuwiki_prefer_preview_renderer = True
+        logger.info(
+            "NamuWiki Discord link-preview renderer is now preferred "
+            "for this process"
+        )
+        return result
 
 
 def lookup_namuwiki_lyrics(
@@ -4384,15 +4460,20 @@ async def get_track_namuwiki_lyrics(track: Track) -> str | None:
 
         namuwiki_result: tuple[str, str, str] | None = None
         try:
+            request_attempts_per_candidate = (
+                1
+                + (1 if NAMUWIKI_API_TOKEN else 0)
+                + (1 if NAMUWIKI_PREVIEW_FALLBACK_ENABLED else 0)
+            )
             namuwiki_result = await asyncio.wait_for(
                 asyncio.to_thread(lookup_namuwiki_lyrics, track),
                 timeout=(
                     NAMUWIKI_REQUEST_TIMEOUT_SECONDS
                     * NAMUWIKI_MAX_DOCUMENT_CANDIDATES
-                    * (2 if NAMUWIKI_API_TOKEN else 1)
+                    * request_attempts_per_candidate
                     + NAMUWIKI_REQUEST_INTERVAL_SECONDS
                     * NAMUWIKI_MAX_DOCUMENT_CANDIDATES
-                    * (2 if NAMUWIKI_API_TOKEN else 1)
+                    * request_attempts_per_candidate
                     + 5
                 ),
             )
@@ -4545,11 +4626,17 @@ def track_is_current(guild_id: int, track: Track) -> bool:
 def replace_lyrics_view(
     state: GuildMusicState,
     view: discord.ui.View | None,
+    *,
+    message_id: int | None = None,
 ) -> None:
     previous_view = state.lyrics_view
     state.lyrics_view = view
     if previous_view is not None and previous_view is not view:
         previous_view.stop()
+        if view is not None and message_id is not None:
+            # message.edit stores the new items before the old view is stopped.
+            # Identical custom IDs are removed with the old view, so restore them.
+            bot.add_view(view, message_id=message_id)
 
 
 async def send_private_lyrics_variant(
@@ -4562,7 +4649,9 @@ async def send_private_lyrics_variant(
     source: str,
     filename: str,
     source_url: str | None = None,
+    edit_original: bool = False,
 ) -> None:
+    attachment: discord.File | None = None
     if len(text) <= LYRICS_INLINE_LIMIT:
         embed = make_lyrics_variant_embed(
             track,
@@ -4571,28 +4660,29 @@ async def send_private_lyrics_variant(
             source,
             source_url,
         )
+    else:
+        embed = make_lyrics_variant_embed(
+            track,
+            label,
+            "내용이 길어 전체 내용을 파일로 첨부했어요.",
+            source,
+            source_url,
+        )
+        attachment = make_lyrics_file(text, filename)
+
+    if edit_original:
+        message = await interaction.edit_original_response(
+            content=None,
+            embed=embed,
+            attachments=[attachment] if attachment is not None else [],
+        )
+    else:
         message = await send_ephemeral_followup(
             interaction,
             embed=embed,
+            file=attachment,
             delete_after=None,
         )
-        if message is not None:
-            await register_private_lyrics_message(guild_id, track, message)
-        return
-
-    embed = make_lyrics_variant_embed(
-        track,
-        label,
-        "내용이 길어 전체 내용을 파일로 첨부했어요.",
-        source,
-        source_url,
-    )
-    message = await send_ephemeral_followup(
-        interaction,
-        embed=embed,
-        file=make_lyrics_file(text, filename),
-        delete_after=None,
-    )
     if message is not None:
         await register_private_lyrics_message(guild_id, track, message)
 
@@ -4631,7 +4721,12 @@ class LyricsVariantView(discord.ui.View):
         return False
 
     async def show_korean_lyrics(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        logger.info("Korean lyrics button received for %s", self.track.title)
+        await interaction.response.send_message(
+            "가사 정보를 확인하고 있어요...",
+            ephemeral=True,
+        )
+        logger.info("Korean lyrics button acknowledged for %s", self.track.title)
         try:
             lyrics = await get_track_korean_lyrics(self.track)
         except KoreanLyricsError as error:
@@ -4640,16 +4735,24 @@ class LyricsVariantView(discord.ui.View):
                 self.track.title,
                 error,
             )
-            await send_ephemeral_followup(
-                interaction,
-                "한국어 가사를 가져오지 못했어요. 잠시 후 다시 시도해 주세요.",
+            message = await interaction.edit_original_response(
+                content="한국어 가사를 가져오지 못했어요. 잠시 후 다시 시도해 주세요.",
+                embed=None,
+                attachments=[],
+            )
+            asyncio.create_task(
+                delete_message_later(message, EPHEMERAL_RESPONSE_DELETE_SECONDS)
             )
             return
 
         if not track_is_current(self.guild_id, self.track):
-            await send_ephemeral_followup(
-                interaction,
-                "가사를 가져오는 동안 곡이 바뀌었어요.",
+            message = await interaction.edit_original_response(
+                content="가사를 가져오는 동안 곡이 바뀌었어요.",
+                embed=None,
+                attachments=[],
+            )
+            asyncio.create_task(
+                delete_message_later(message, EPHEMERAL_RESPONSE_DELETE_SECONDS)
             )
             return
         await send_private_lyrics_variant(
@@ -4664,6 +4767,7 @@ class LyricsVariantView(discord.ui.View):
             ),
             filename="lyrics-korean.txt",
             source_url=self.track.korean_lyrics_url,
+            edit_original=True,
         )
 
     async def show_reading(self, interaction: discord.Interaction) -> None:
@@ -4770,8 +4874,12 @@ async def upsert_lyrics_message(
                     edited_message or message,
                 )
                 return None
-            replace_lyrics_view(state, view)
             state.lyrics_message = edited_message or message
+            replace_lyrics_view(
+                state,
+                view,
+                message_id=state.lyrics_message.id,
+            )
             return state.lyrics_message
 
     send_options: dict[str, object] = {
@@ -4794,8 +4902,8 @@ async def upsert_lyrics_message(
     if state.current is not track:
         await delete_music_channel_message(guild_id, message)
         return None
-    replace_lyrics_view(state, view)
     state.lyrics_message = message
+    replace_lyrics_view(state, view, message_id=message.id)
     return message
 
 
@@ -5140,6 +5248,7 @@ async def resolve_track_stream(track: Track) -> None:
         track.source_url,
         "audio stream resolve",
         use_cache=False,
+        minimum_interval_seconds=0.0,
     )
 
     if "entries" in info:
@@ -5804,7 +5913,6 @@ async def enqueue_tracks(
         return False
 
     state.queue.extend(tracks)
-    schedule_autoplay_refill(guild_id)
     queue_size = len(state.queue)
     if len(tracks) == 1:
         embed = make_track_embed(tracks[0], "Added to queue")
@@ -5823,6 +5931,8 @@ async def enqueue_tracks(
     started_playback = False
     if should_start:
         playback_task, started_playback = schedule_play_next(guild_id, announce=False)
+    else:
+        schedule_autoplay_refill(guild_id)
 
     await send_feedback(embed=embed, private=True)
 
