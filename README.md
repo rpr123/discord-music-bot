@@ -108,6 +108,7 @@ NAMUWIKI_REQUEST_TIMEOUT_SECONDS=10
 NAMUWIKI_REQUEST_INTERVAL_SECONDS=1.1
 # NAMUWIKI_DOCUMENT_OVERRIDES={"video:abcdefghijk":"泥濘鳴鳴"}
 # YOUTUBE_COOKIES_FILE=./cookies.txt
+# YOUTUBE_PO_TOKEN_PROVIDER_URL=http://127.0.0.1:4416
 YTDL_EXTRACT_TIMEOUT_SECONDS=45
 YTDL_MAX_CONCURRENT_EXTRACTIONS=1
 YTDL_MIN_INTERVAL_SECONDS=6
@@ -174,14 +175,13 @@ Discord 입장, 음성 재생, 컨트롤 패널, 대기열, 앨범, 자동재생
 ffmpeg -f lavfi -i "sine=frequency=440:duration=15" test-tone.wav
 ```
 
-`.env`에 아래 값을 추가하고 봇을 재시작하세요.
+일반 봇 대신 별도 개발용 진입점을 실행하세요.
 
-```env
-MUSIC_TEST_AUDIO_FILE=./test-tone.wav
-MUSIC_TEST_BULK_TRACKS=3
+```bash
+python -m devtools.local_music_bot ./test-tone.wav --bulk-tracks 3
 ```
 
-이 상태에서는 전용 채널에 어떤 곡명을 보내도 번호가 붙은 로컬 테스트 트랙이 생성됩니다. 실제 YouTube 연동을 확인할 때는 `MUSIC_TEST_AUDIO_FILE` 줄을 제거하고 봇을 재시작한 뒤 한 곡만 시험하세요.
+이 프로세스에서는 전용 채널에 어떤 곡명을 보내도 번호가 붙은 로컬 테스트 트랙이 생성됩니다. 일반 `python bot.py` 실행에는 테스트 코드나 테스트 설정이 적용되지 않습니다.
 
 ## 실행
 
@@ -219,6 +219,6 @@ https://www.youtube.com/playlist?list=...
 
 - 음악 재생은 `yt-dlp`와 `FFmpeg`를 사용합니다.
 - 곡명과 `auto` 시드는 동일한 YouTube Music 우선 검색을 사용합니다. 앨범·재생목록 텍스트는 기존 YouTube 재생목록 검색으로 처리합니다.
-- 클라우드 서버 IP가 YouTube 자동화 확인에 걸리면 `YOUTUBE_COOKIES_FILE`로 쿠키 파일을 지정해야 할 수 있습니다.
+- 클라우드 서버 IP가 YouTube 자동화 확인에 걸리면 `YOUTUBE_PO_TOKEN_PROVIDER_URL`로 BgUtils HTTP provider를 연결할 수 있습니다. 공개 영상은 쿠키 없이 먼저 시도하고, 계정이 필요한 콘텐츠에만 `YOUTUBE_COOKIES_FILE`을 사용하세요.
 - YouTube 쪽 변경으로 재생이 갑자기 실패하면 `python -m pip install --upgrade yt-dlp`로 업데이트해 보세요.
 - 봇 토큰은 절대 GitHub나 채팅에 올리지 마세요.

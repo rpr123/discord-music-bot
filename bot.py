@@ -6,7 +6,6 @@ import functools
 import html
 import io
 import json
-import itertools
 import logging
 import math
 import os
@@ -96,7 +95,9 @@ MUSIC_CHANNEL_DELETE_REQUESTS = os.getenv("MUSIC_CHANNEL_DELETE_REQUESTS", "true
     "off",
 }
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE")
-MUSIC_TEST_AUDIO_FILE = os.getenv("MUSIC_TEST_AUDIO_FILE")
+YOUTUBE_PO_TOKEN_PROVIDER_URL = (
+    os.getenv("YOUTUBE_PO_TOKEN_PROVIDER_URL", "").strip() or None
+)
 YOUTUBE_HOSTS = {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
 YOUTUBE_PLAYLIST_SEARCH_FILTER = "EgIQAw%253D%253D"
 
@@ -256,8 +257,9 @@ YOUTUBE_MUSIC_LOCATION = os.getenv("YOUTUBE_MUSIC_LOCATION", "").strip()
 YOUTUBE_CIRCUIT_BREAKER_SECONDS = parse_positive_int_env(
     "YOUTUBE_CIRCUIT_BREAKER_SECONDS", 1800
 )
-MUSIC_TEST_BULK_TRACKS = parse_positive_int_env("MUSIC_TEST_BULK_TRACKS", 3)
 EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS = 3
+VOICE_RECONNECT_GRACE_SECONDS = 5.0
+VOICE_DISCONNECT_TIMEOUT_SECONDS = 10.0
 AUTOPLAY_RETRY_DELAYS_SECONDS = (60, 120, 300, 900, 1800)
 AUTOPLAY_HISTORY_SIZE = 50
 AUTOPLAY_BUTTON_CUSTOM_ID = "music:autoplay"
@@ -276,6 +278,17 @@ YTDL_BASE_OPTIONS = {
 
 if YOUTUBE_COOKIES_FILE:
     YTDL_BASE_OPTIONS["cookiefile"] = str(resolve_project_path(YOUTUBE_COOKIES_FILE))
+
+if YOUTUBE_PO_TOKEN_PROVIDER_URL:
+    YTDL_BASE_OPTIONS["extractor_args"] = {
+        "youtube": {
+            "player_client": ["mweb"],
+            "fetch_pot": ["always"],
+        },
+        "youtubepot-bgutilhttp": {
+            "base_url": [YOUTUBE_PO_TOKEN_PROVIDER_URL.rstrip("/")],
+        },
+    }
 
 YTDL_OPTIONS = {
     **YTDL_BASE_OPTIONS,
@@ -300,7 +313,6 @@ FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
-FFMPEG_LOCAL_OPTIONS = {"options": "-vn"}
 
 ytdl_semaphore = asyncio.Semaphore(YTDL_MAX_CONCURRENT_EXTRACTIONS)
 ytdl_rate_lock = asyncio.Lock()
@@ -315,8 +327,6 @@ youtube_music_rate_lock = asyncio.Lock()
 youtube_music_last_request_started_at = 0.0
 youtube_music_cache_lock = asyncio.Lock()
 youtube_music_cache: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
-music_test_track_counter = itertools.count(1)
-
 YOUTUBE_BLOCK_ERROR_MARKERS = (
     "http error 429",
     "too many requests",
@@ -770,7 +780,6 @@ class Track:
     artist: str | None = None
     song_name: str | None = None
     uploader: str | None = None
-    is_local: bool = False
     stream_resolved_at: float | None = None
     lyrics: str | None = None
     lyrics_loaded: bool = False
@@ -815,6 +824,7 @@ class GuildMusicState:
     skip_requested: bool = False
     stop_requested: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    voice_connect_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     control_panel_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     advance_task: asyncio.Task[None] | None = None
     autoplay_task: asyncio.Task[None] | None = None
@@ -3424,7 +3434,7 @@ def request_namuwiki_html(page_url: str) -> tuple[str, str] | None:
 def lookup_namuwiki_lyrics(
     track: Track,
 ) -> tuple[str, str, str] | None:
-    if not NAMUWIKI_LYRICS_ENABLED or track.is_local:
+    if not NAMUWIKI_LYRICS_ENABLED:
         return None
 
     candidates = get_namuwiki_document_candidates(track)
@@ -3767,9 +3777,6 @@ def request_lyrics_records(track_name: str, artist_name: str | None) -> list[dic
 
 
 def lookup_track_lyrics(track: Track) -> str | None:
-    if track.is_local:
-        return None
-
     track_name, artist_name = get_lyrics_search_terms(track)
     if not track_name:
         return None
@@ -3947,7 +3954,7 @@ async def get_selected_youtube_subtitle(
     *,
     purpose: str,
 ) -> str | None:
-    if track.is_local or selected is None:
+    if selected is None:
         return None
 
     language, extension, url = selected
@@ -5225,14 +5232,6 @@ def parse_auto_request(query: str) -> tuple[str, int] | None:
 
 
 async def resolve_track_stream(track: Track) -> None:
-    if track.is_local:
-        source_path = Path(track.source_url)
-        if not source_path.is_file():
-            raise ValueError(f"로컬 테스트 음원 파일을 찾지 못했어요: {source_path}")
-        track.stream_url = str(source_path)
-        track.stream_resolved_at = time.monotonic()
-        return
-
     stream_age = (
         time.monotonic() - track.stream_resolved_at
         if track.stream_resolved_at is not None
@@ -5276,58 +5275,12 @@ async def resolve_track_stream(track: Track) -> None:
     )
 
 
-def get_music_test_audio_path() -> Path | None:
-    if not MUSIC_TEST_AUDIO_FILE:
-        return None
-    path = resolve_project_path(MUSIC_TEST_AUDIO_FILE)
-    if not path.is_file():
-        raise ValueError(f"MUSIC_TEST_AUDIO_FILE을 찾지 못했어요: {path}")
-    return path
-
-
-def make_music_test_track(
-    query: str,
-    requester: str,
-    requester_id: int | None = None,
-) -> Track:
-    source_path = get_music_test_audio_path()
-    if source_path is None:
-        raise RuntimeError("MUSIC_TEST_AUDIO_FILE is not configured")
-
-    sequence = next(music_test_track_counter)
-    return Track(
-        title=f"[TEST {sequence}] {query}",
-        webpage_url="",
-        requester=requester,
-        source_url=str(source_path),
-        requester_id=requester_id,
-        stream_url=str(source_path),
-        stream_resolved_at=time.monotonic(),
-        is_local=True,
-    )
-
-
-def make_music_test_tracks(
-    query: str,
-    requester: str,
-    count: int,
-    requester_id: int | None = None,
-) -> list[Track]:
-    return [
-        make_music_test_track(query, requester, requester_id)
-        for _ in range(count)
-    ]
-
-
 async def extract_track(
     query: str,
     requester: str,
     search_kind: str | None = None,
     requester_id: int | None = None,
 ) -> Track:
-    if MUSIC_TEST_AUDIO_FILE:
-        return make_music_test_track(query, requester, requester_id)
-
     resolved_query = resolve_query(query, search_kind)
     info = await extract_first_info(query, resolved_query)
     return make_track_from_info(info, requester, resolved_query, requester_id)
@@ -5339,14 +5292,6 @@ async def extract_tracks(
     search_kind: str | None = None,
     requester_id: int | None = None,
 ) -> list[Track]:
-    if MUSIC_TEST_AUDIO_FILE:
-        return make_music_test_tracks(
-            query,
-            requester,
-            min(MUSIC_TEST_BULK_TRACKS, MAX_BULK_TRACKS),
-            requester_id,
-        )
-
     resolved_query = resolve_query(query, search_kind)
     info = await extract_ytdl_info(
         YTDL_PLAYLIST_OPTIONS, resolved_query, "playlist or album search"
@@ -5379,9 +5324,6 @@ async def extract_auto_tracks(
     requester_id: int | None = None,
 ) -> list[Track]:
     auto_count = clamp_auto_count(count)
-    if MUSIC_TEST_AUDIO_FILE:
-        return make_music_test_tracks(query, requester, auto_count, requester_id)
-
     seed_query = resolve_query(query)
     seed_info = await extract_first_info(query, seed_query)
     seed_track = make_track_from_info(seed_info, requester, seed_query, requester_id)
@@ -5660,6 +5602,138 @@ async def refill_autoplay_queue(
                 schedule_autoplay_refill(guild_id)
 
 
+async def wait_for_voice_connection(
+    voice: discord.VoiceProtocol,
+    timeout_seconds: float = VOICE_RECONNECT_GRACE_SECONDS,
+) -> bool:
+    if voice.is_connected():
+        return True
+    if timeout_seconds <= 0:
+        return False
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while not voice.is_connected():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.25, remaining))
+    return True
+
+
+async def discard_stale_voice_client(
+    guild: discord.Guild,
+    state: GuildMusicState,
+    voice: discord.VoiceProtocol,
+) -> None:
+    stop_playback(state, guild.id)
+    try:
+        await asyncio.wait_for(
+            voice.disconnect(force=True),
+            timeout=VOICE_DISCONNECT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Timed out cleaning up stale voice client in guild %s", guild.id)
+    except Exception:
+        logger.warning(
+            "Failed to disconnect stale voice client in guild %s",
+            guild.id,
+            exc_info=True,
+        )
+    finally:
+        if getattr(guild, "voice_client", None) is voice:
+            cleanup = getattr(voice, "cleanup", None)
+            if callable(cleanup):
+                try:
+                    cleanup()
+                except Exception:
+                    logger.warning(
+                        "Failed to remove stale voice client in guild %s",
+                        guild.id,
+                        exc_info=True,
+                    )
+        if state.voice is voice:
+            state.voice = None
+
+
+async def use_connected_voice(
+    voice: discord.VoiceProtocol,
+    channel: discord.abc.Connectable,
+    state: GuildMusicState,
+) -> tuple[bool, str | None]:
+    if voice.channel == channel:
+        return True, None
+    if state.current or state.queue or voice.is_playing() or voice.is_paused():
+        return (
+            False,
+            f"봇이 이미 {voice.channel.mention}에서 재생 중이에요. "
+            "같은 음성 채널에 들어와 주세요.",
+        )
+    await voice.move_to(channel)
+    return True, None
+
+
+async def ensure_voice_channel(
+    guild: discord.Guild,
+    channel: discord.abc.Connectable,
+    state: GuildMusicState,
+) -> tuple[bool, str | None]:
+    async with state.voice_connect_lock:
+        for attempt in range(2):
+            registered_voice = getattr(guild, "voice_client", None)
+            if registered_voice is not None:
+                state.voice = registered_voice
+
+            voice = state.voice
+            if voice is not None and not voice.is_connected():
+                recovered = (
+                    registered_voice is voice
+                    and await wait_for_voice_connection(voice)
+                )
+                if not recovered:
+                    await discard_stale_voice_client(guild, state, voice)
+                    voice = None
+
+            if voice is not None and voice.is_connected():
+                try:
+                    return await use_connected_voice(voice, channel, state)
+                except (asyncio.TimeoutError, discord.DiscordException):
+                    logger.warning(
+                        "Failed to move voice client in guild %s",
+                        guild.id,
+                        exc_info=True,
+                    )
+                    return False, "음성 채널 이동에 실패했어요. 잠시 후 다시 시도해 주세요."
+
+            try:
+                voice = await channel.connect()
+            except discord.ClientException as error:
+                if getattr(guild, "voice_client", None) is not None and attempt == 0:
+                    logger.info(
+                        "Adopting registered voice client after a connection race in guild %s",
+                        guild.id,
+                    )
+                    continue
+                logger.warning(
+                    "Voice connection rejected in guild %s: %s",
+                    guild.id,
+                    error,
+                )
+                return False, "음성 채널 연결에 실패했어요. 잠시 후 다시 시도해 주세요."
+            except (asyncio.TimeoutError, discord.DiscordException):
+                logger.warning(
+                    "Voice connection failed in guild %s",
+                    guild.id,
+                    exc_info=True,
+                )
+                return False, "음성 채널 연결에 실패했어요. 잠시 후 다시 시도해 주세요."
+
+            state.voice = voice
+            return True, None
+
+    return False, "음성 채널 연결에 실패했어요. 잠시 후 다시 시도해 주세요."
+
+
 async def ensure_voice(interaction: discord.Interaction, state: GuildMusicState) -> bool:
     user = interaction.user
     voice_state = getattr(user, "voice", None)
@@ -5672,24 +5746,18 @@ async def ensure_voice(interaction: discord.Interaction, state: GuildMusicState)
         )
         return False
 
-    if state.voice and not state.voice.is_connected():
-        stop_playback(state, interaction.guild_id)
-        state.voice = None
+    guild = interaction.guild
+    if guild is None:
+        await send_ephemeral_followup(interaction, guild_only_error())
+        return False
 
-    if state.voice and state.voice.is_connected():
-        if state.voice.channel != channel:
-            if state.current or state.queue or state.voice.is_playing() or state.voice.is_paused():
-                await send_ephemeral_followup(
-                    interaction,
-                    f"봇이 이미 {state.voice.channel.mention}에서 재생 중이에요. "
-                    "같은 음성 채널에 들어와 주세요.",
-                )
-                return False
-            await state.voice.move_to(channel)
-        return True
-
-    state.voice = await channel.connect()
-    return True
+    ok, error = await ensure_voice_channel(guild, channel, state)
+    if not ok:
+        await send_ephemeral_followup(
+            interaction,
+            error or "음성 채널 연결에 실패했어요.",
+        )
+    return ok
 
 
 async def ensure_voice_for_member(
@@ -5701,24 +5769,7 @@ async def ensure_voice_for_member(
 
     if channel is None:
         return False, "먼저 음성 채널에 들어가 주세요."
-
-    if state.voice and not state.voice.is_connected():
-        stop_playback(state, member.guild.id)
-        state.voice = None
-
-    if state.voice and state.voice.is_connected():
-        if state.voice.channel != channel:
-            if state.current or state.queue or state.voice.is_playing() or state.voice.is_paused():
-                return (
-                    False,
-                    f"봇이 이미 {state.voice.channel.mention}에서 재생 중이에요. "
-                    "같은 음성 채널에 들어와 주세요.",
-                )
-            await state.voice.move_to(channel)
-        return True, None
-
-    state.voice = await channel.connect()
-    return True, None
+    return await ensure_voice_channel(member.guild, channel, state)
 
 
 async def ensure_same_voice_channel(
@@ -6325,11 +6376,10 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
 
             try:
                 await resolve_track_stream(track)
-                ffmpeg_options = FFMPEG_LOCAL_OPTIONS if track.is_local else FFMPEG_OPTIONS
                 ffmpeg_source = discord.FFmpegPCMAudio(
                     track.stream_url,
                     executable=FFMPEG_EXECUTABLE,
-                    **ffmpeg_options,
+                    **FFMPEG_OPTIONS,
                 )
                 source = discord.PCMVolumeTransformer(ffmpeg_source, volume=BOT_VOLUME)
             except asyncio.CancelledError:
@@ -6416,13 +6466,6 @@ async def on_ready() -> None:
         logger.error(
             "FFmpeg executable was not found. Set FFMPEG_PATH in .env or add ffmpeg to PATH."
         )
-    if MUSIC_TEST_AUDIO_FILE:
-        logger.warning(
-            "Local music test mode is enabled with MUSIC_TEST_AUDIO_FILE=%s; "
-            "YouTube will not be queried.",
-            MUSIC_TEST_AUDIO_FILE,
-        )
-
     await restore_control_panels()
 
     if commands_synced:

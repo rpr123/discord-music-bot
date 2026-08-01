@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from discord.ui.view import ViewStore
 
 import bot
+from devtools.local_music_bot import LocalMusicMode
 
 
 def make_track(title: str) -> bot.Track:
@@ -1075,17 +1076,6 @@ class LyricsLookupTests(unittest.TestCase):
                 }
             )
         )
-
-    def test_local_test_track_skips_the_lyrics_service(self) -> None:
-        track = make_track("local")
-        track.is_local = True
-
-        with patch.object(bot, "request_lyrics_records") as request:
-            lyrics = bot.lookup_track_lyrics(track)
-
-        self.assertIsNone(lyrics)
-        request.assert_not_called()
-
 
 class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
     def test_json3_manual_subtitles_are_converted_to_plain_lyrics(self) -> None:
@@ -3561,18 +3551,19 @@ class LocalMusicTestModeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             audio_path = Path(temp_dir) / "test-tone.ogg"
             audio_path.write_bytes(b"test audio fixture")
+            mode = LocalMusicMode(audio_path, bulk_tracks=2)
 
-            with (
-                patch.object(bot, "MUSIC_TEST_AUDIO_FILE", str(audio_path)),
-                patch.object(bot, "MUSIC_TEST_BULK_TRACKS", 2),
-                patch.object(bot, "extract_ytdl_info", new=AsyncMock()) as extract,
-            ):
-                single = await bot.extract_track("test song", "tester")
-                bulk = await bot.extract_tracks("test album", "tester", "album")
-                auto = await bot.extract_auto_tracks("test auto", "tester", 3)
+            with patch.object(
+                bot,
+                "extract_ytdl_info",
+                new=AsyncMock(),
+            ) as extract:
+                single = await mode.extract_track("test song", "tester")
+                bulk = await mode.extract_tracks("test album", "tester", "album")
+                auto = await mode.extract_auto_tracks("test auto", "tester", 3)
 
         extract.assert_not_awaited()
-        self.assertTrue(single.is_local)
+        self.assertEqual(single.source_url, str(audio_path.resolve()))
         self.assertEqual(single.stream_url, str(audio_path))
         self.assertEqual(len(bulk), 2)
         self.assertEqual(len(auto), 3)
@@ -3725,6 +3716,190 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             interaction.message,
             bot.QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
         )
+
+
+class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self) -> None:
+        bot.music_states.clear()
+
+    async def test_concurrent_requests_share_one_voice_connection(self) -> None:
+        class Guild:
+            id = 810
+            voice_client = None
+
+        guild = Guild()
+        connect_started = asyncio.Event()
+        release_connect = asyncio.Event()
+
+        class Channel:
+            mention = "#voice"
+
+            def __init__(self) -> None:
+                self.connect_calls = 0
+
+            async def connect(self) -> object:
+                self.connect_calls += 1
+                connect_started.set()
+                await release_connect.wait()
+                guild.voice_client = voice
+                return voice
+
+        class Voice:
+            def __init__(self, channel: Channel) -> None:
+                self.channel = channel
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return False
+
+            def is_paused(self) -> bool:
+                return False
+
+        channel = Channel()
+        voice = Voice(channel)
+
+        class Member:
+            pass
+
+        member = Member()
+        member.guild = guild
+        member.voice = type("MemberVoice", (), {"channel": channel})()
+        state = bot.GuildMusicState()
+
+        first = asyncio.create_task(bot.ensure_voice_for_member(member, state))
+        await connect_started.wait()
+        second = asyncio.create_task(bot.ensure_voice_for_member(member, state))
+        await asyncio.sleep(0)
+
+        self.assertFalse(second.done())
+        release_connect.set()
+        results = await asyncio.gather(first, second)
+
+        self.assertEqual(results, [(True, None), (True, None)])
+        self.assertEqual(channel.connect_calls, 1)
+        self.assertIs(state.voice, voice)
+
+    async def test_connect_race_adopts_discord_registered_voice_client(self) -> None:
+        class Guild:
+            id = 811
+            voice_client = None
+
+        guild = Guild()
+
+        class Channel:
+            mention = "#voice"
+
+            def __init__(self) -> None:
+                self.connect_calls = 0
+
+            async def connect(self) -> object:
+                self.connect_calls += 1
+                guild.voice_client = voice
+                raise bot.discord.ClientException(
+                    "Already connected to a voice channel."
+                )
+
+        class Voice:
+            def __init__(self, channel: Channel) -> None:
+                self.channel = channel
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return False
+
+            def is_paused(self) -> bool:
+                return False
+
+        channel = Channel()
+        voice = Voice(channel)
+
+        class Member:
+            pass
+
+        member = Member()
+        member.guild = guild
+        member.voice = type("MemberVoice", (), {"channel": channel})()
+        state = bot.GuildMusicState()
+
+        result = await bot.ensure_voice_for_member(member, state)
+
+        self.assertEqual(result, (True, None))
+        self.assertEqual(channel.connect_calls, 1)
+        self.assertIs(state.voice, voice)
+
+    async def test_stale_registered_voice_is_cleaned_before_reconnecting(self) -> None:
+        class Guild:
+            id = 812
+            voice_client = None
+
+        guild = Guild()
+
+        class Channel:
+            mention = "#voice"
+
+            def __init__(self) -> None:
+                self.connect_calls = 0
+
+            async def connect(self) -> object:
+                self.connect_calls += 1
+                guild.voice_client = fresh_voice
+                return fresh_voice
+
+        class Voice:
+            def __init__(self, channel: Channel, *, connected: bool) -> None:
+                self.channel = channel
+                self.connected = connected
+                self.disconnect_calls = 0
+                self.cleanup_calls = 0
+
+            def is_connected(self) -> bool:
+                return self.connected
+
+            def is_playing(self) -> bool:
+                return False
+
+            def is_paused(self) -> bool:
+                return False
+
+            async def disconnect(self, *, force: bool = False) -> None:
+                self.disconnect_calls += 1
+                self.assert_force = force
+
+            def cleanup(self) -> None:
+                self.cleanup_calls += 1
+                guild.voice_client = None
+
+        channel = Channel()
+        stale_voice = Voice(channel, connected=False)
+        fresh_voice = Voice(channel, connected=True)
+        guild.voice_client = stale_voice
+
+        class Member:
+            pass
+
+        member = Member()
+        member.guild = guild
+        member.voice = type("MemberVoice", (), {"channel": channel})()
+        state = bot.GuildMusicState(voice=stale_voice)
+
+        with patch.object(
+            bot,
+            "wait_for_voice_connection",
+            new=AsyncMock(return_value=False),
+        ) as wait_for_connection:
+            result = await bot.ensure_voice_for_member(member, state)
+
+        self.assertEqual(result, (True, None))
+        wait_for_connection.assert_awaited_once_with(stale_voice)
+        self.assertEqual(stale_voice.disconnect_calls, 1)
+        self.assertTrue(stale_voice.assert_force)
+        self.assertEqual(stale_voice.cleanup_calls, 1)
+        self.assertEqual(channel.connect_calls, 1)
+        self.assertIs(state.voice, fresh_voice)
 
 
 class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
