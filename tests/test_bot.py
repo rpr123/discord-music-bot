@@ -3382,6 +3382,13 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
         bot.youtube_circuit_open_until = 0.0
         bot.youtube_circuit_reason = None
 
+    def test_default_options_leave_youtube_client_selection_to_ytdl(self) -> None:
+        extractor_args = bot.YTDL_BASE_OPTIONS.get("extractor_args", {})
+        youtube_args = extractor_args.get("youtube", {})
+
+        self.assertNotIn("player_client", youtube_args)
+        self.assertNotEqual(youtube_args.get("fetch_pot"), ["always"])
+
     async def test_repeated_query_uses_cache_without_a_second_worker(self) -> None:
         payload = {"id": "cachetest01", "title": "cached result"}
         to_thread = AsyncMock(return_value=payload)

@@ -95,9 +95,6 @@ MUSIC_CHANNEL_DELETE_REQUESTS = os.getenv("MUSIC_CHANNEL_DELETE_REQUESTS", "true
     "off",
 }
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE")
-YOUTUBE_PO_TOKEN_PROVIDER_URL = (
-    os.getenv("YOUTUBE_PO_TOKEN_PROVIDER_URL", "").strip() or None
-)
 YOUTUBE_HOSTS = {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
 YOUTUBE_PLAYLIST_SEARCH_FILTER = "EgIQAw%253D%253D"
 
@@ -278,17 +275,6 @@ YTDL_BASE_OPTIONS = {
 
 if YOUTUBE_COOKIES_FILE:
     YTDL_BASE_OPTIONS["cookiefile"] = str(resolve_project_path(YOUTUBE_COOKIES_FILE))
-
-if YOUTUBE_PO_TOKEN_PROVIDER_URL:
-    YTDL_BASE_OPTIONS["extractor_args"] = {
-        "youtube": {
-            "player_client": ["mweb"],
-            "fetch_pot": ["always"],
-        },
-        "youtubepot-bgutilhttp": {
-            "base_url": [YOUTUBE_PO_TOKEN_PROVIDER_URL.rstrip("/")],
-        },
-    }
 
 YTDL_OPTIONS = {
     **YTDL_BASE_OPTIONS,

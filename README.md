@@ -108,7 +108,6 @@ NAMUWIKI_REQUEST_TIMEOUT_SECONDS=10
 NAMUWIKI_REQUEST_INTERVAL_SECONDS=1.1
 # NAMUWIKI_DOCUMENT_OVERRIDES={"video:abcdefghijk":"泥濘鳴鳴"}
 # YOUTUBE_COOKIES_FILE=./cookies.txt
-# YOUTUBE_PO_TOKEN_PROVIDER_URL=http://127.0.0.1:4416
 YTDL_EXTRACT_TIMEOUT_SECONDS=45
 YTDL_MAX_CONCURRENT_EXTRACTIONS=1
 YTDL_MIN_INTERVAL_SECONDS=6
@@ -219,6 +218,6 @@ https://www.youtube.com/playlist?list=...
 
 - 음악 재생은 `yt-dlp`와 `FFmpeg`를 사용합니다.
 - 곡명과 `auto` 시드는 동일한 YouTube Music 우선 검색을 사용합니다. 앨범·재생목록 텍스트는 기존 YouTube 재생목록 검색으로 처리합니다.
-- 클라우드 서버 IP가 YouTube 자동화 확인에 걸리면 `YOUTUBE_PO_TOKEN_PROVIDER_URL`로 BgUtils HTTP provider를 연결할 수 있습니다. 공개 영상은 쿠키 없이 먼저 시도하고, 계정이 필요한 콘텐츠에만 `YOUTUBE_COOKIES_FILE`을 사용하세요.
+- 공개 영상은 쿠키 없이 먼저 시도하고, 계정이 필요한 콘텐츠에만 `YOUTUBE_COOKIES_FILE`을 사용하세요. 쿠키는 YouTube의 서버 IP 제한을 해제하지 않습니다.
 - YouTube 쪽 변경으로 재생이 갑자기 실패하면 `python -m pip install --upgrade yt-dlp`로 업데이트해 보세요.
 - 봇 토큰은 절대 GitHub나 채팅에 올리지 마세요.
