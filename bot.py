@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import copy
 import functools
 import html
@@ -11,7 +12,9 @@ import math
 import os
 import random
 import re
+import signal
 import shutil
+import sys
 import threading
 import time
 import unicodedata
@@ -23,11 +26,10 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Callable, Deque
+from typing import Callable, Deque, TypeVar
 
 import discord
 import requests
-import yt_dlp
 from discord import app_commands
 from discord.ext import commands
 from ytmusicapi import YTMusic
@@ -40,6 +42,8 @@ except ImportError:
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
+YTDL_WORKER_PATH = PROJECT_DIR / "ytdl_worker.py"
+T = TypeVar("T")
 
 
 def load_env_file(path: Path | str = PROJECT_DIR / ".env") -> None:
@@ -120,20 +124,6 @@ def parse_nonnegative_float_env(name: str, default: float) -> float:
     return value
 
 
-def parse_volume_env(name: str, default: float) -> float:
-    try:
-        volume = float(os.getenv(name, str(default)))
-    except ValueError:
-        logger.warning("%s must be a number between 0.0 and 1.0. Falling back to %.2f.", name, default)
-        return default
-
-    if volume < 0.0 or volume > 1.0:
-        logger.warning("%s must be between 0.0 and 1.0. Falling back to %.2f.", name, default)
-        return default
-
-    return volume
-
-
 def parse_string_map_env(name: str) -> dict[str, str]:
     raw_value = os.getenv(name, "").strip()
     if not raw_value:
@@ -163,7 +153,6 @@ QUEUE_DELETE_RESPONSE_DELETE_SECONDS = parse_positive_int_env(
 )
 DEFAULT_AUTO_TRACKS = parse_positive_int_env("DEFAULT_AUTO_TRACKS", 8)
 MAX_AUTO_TRACKS = parse_positive_int_env("MAX_AUTO_TRACKS", 25)
-BOT_VOLUME = parse_volume_env("BOT_VOLUME", 0.2)
 DISCORD_EMBED_FIELD_LIMIT = 1024
 QUEUE_SELECT_LIMIT = 25
 LYRICS_API_URL = os.getenv("LYRICS_API_URL", "https://lrclib.net/api/search")
@@ -222,8 +211,8 @@ YTDL_MAX_CONCURRENT_EXTRACTIONS = parse_positive_int_env(
 )
 STREAM_URL_MAX_AGE_SECONDS = parse_positive_int_env("STREAM_URL_MAX_AGE_SECONDS", 900)
 YTDL_MIN_INTERVAL_SECONDS = parse_nonnegative_float_env("YTDL_MIN_INTERVAL_SECONDS", 6.0)
-YTDL_CACHE_TTL_SECONDS = parse_positive_int_env("YTDL_CACHE_TTL_SECONDS", 600)
-YTDL_CACHE_MAX_ENTRIES = parse_positive_int_env("YTDL_CACHE_MAX_ENTRIES", 128)
+YTDL_CACHE_TTL_SECONDS = parse_positive_int_env("YTDL_CACHE_TTL_SECONDS", 180)
+YTDL_CACHE_MAX_ENTRIES = parse_positive_int_env("YTDL_CACHE_MAX_ENTRIES", 16)
 YOUTUBE_SEARCH_CANDIDATES = min(
     parse_positive_int_env("YOUTUBE_SEARCH_CANDIDATES", 10),
     20,
@@ -257,6 +246,12 @@ YOUTUBE_CIRCUIT_BREAKER_SECONDS = parse_positive_int_env(
 EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS = 3
 VOICE_RECONNECT_GRACE_SECONDS = 5.0
 VOICE_DISCONNECT_TIMEOUT_SECONDS = 10.0
+AUTOPLAY_START_DELAY_SECONDS = parse_nonnegative_float_env(
+    "AUTOPLAY_START_DELAY_SECONDS", 10.0
+)
+LYRICS_START_DELAY_SECONDS = parse_nonnegative_float_env(
+    "LYRICS_START_DELAY_SECONDS", 3.0
+)
 AUTOPLAY_RETRY_DELAYS_SECONDS = (60, 120, 300, 900, 1800)
 AUTOPLAY_HISTORY_SIZE = 50
 AUTOPLAY_BUTTON_CUSTOM_ID = "music:autoplay"
@@ -266,7 +261,7 @@ IDLE_PANEL_TITLE = "🎵 재생 대기 중"
 CONTROL_PANEL_TITLES = frozenset({PLAYING_PANEL_TITLE, IDLE_PANEL_TITLE})
 
 YTDL_BASE_OPTIONS = {
-    "format": "bestaudio/best",
+    "format": "bestaudio[acodec=opus]/bestaudio/best",
     "default_search": "ytsearch",
     "quiet": True,
     "no_warnings": True,
@@ -313,6 +308,10 @@ youtube_music_rate_lock = asyncio.Lock()
 youtube_music_last_request_started_at = 0.0
 youtube_music_cache_lock = asyncio.Lock()
 youtube_music_cache: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
+lyrics_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="music-lyrics",
+)
 YOUTUBE_BLOCK_ERROR_MARKERS = (
     "http error 429",
     "too many requests",
@@ -443,6 +442,81 @@ async def wait_for_youtube_music_interval() -> None:
         youtube_music_last_request_started_at = time.monotonic()
 
 
+async def stop_ytdl_worker(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except ProcessLookupError:
+        return
+    except OSError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+    await process.wait()
+
+
+async def run_ytdl_worker(
+    options: dict,
+    query: str,
+    timeout_seconds: float,
+) -> dict:
+    if not YTDL_WORKER_PATH.is_file():
+        raise RuntimeError(f"yt-dlp worker was not found: {YTDL_WORKER_PATH}")
+
+    process_options: dict[str, object] = {}
+    if os.name == "posix":
+        process_options["start_new_session"] = True
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(YTDL_WORKER_PATH),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        **process_options,
+    )
+    request = json.dumps(
+        {"options": options, "query": query},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    communication = asyncio.create_task(process.communicate(request))
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            communication,
+            timeout=max(0.1, timeout_seconds),
+        )
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        await stop_ytdl_worker(process)
+        if not communication.done():
+            communication.cancel()
+        await asyncio.gather(communication, return_exceptions=True)
+        raise
+
+    stderr_text = stderr.decode("utf-8", errors="replace").strip()
+    try:
+        response = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        detail = stderr_text or "yt-dlp worker returned an invalid response."
+        raise RuntimeError(detail) from error
+
+    if not isinstance(response, dict):
+        raise RuntimeError("yt-dlp worker returned an invalid response.")
+    error_message = response.get("error")
+    if process.returncode != 0 or error_message:
+        raise RuntimeError(str(error_message or stderr_text or "yt-dlp worker failed."))
+
+    info = response.get("info")
+    if not isinstance(info, dict):
+        raise RuntimeError("yt-dlp worker returned invalid track information.")
+    return info
+
+
 async def extract_ytdl_info(
     options: dict,
     query: str,
@@ -462,10 +536,6 @@ async def extract_ytdl_info(
     logger.info("yt-dlp start: %s", label)
     logger.debug("yt-dlp query for %s: %s", label, query)
 
-    def extract() -> dict:
-        with yt_dlp.YoutubeDL(dict(options)) as downloader:
-            return downloader.extract_info(query, download=False)
-
     loop = asyncio.get_running_loop()
     started_at = loop.time()
     try:
@@ -480,30 +550,11 @@ async def extract_ytdl_info(
     try:
         ensure_youtube_circuit_closed()
         await wait_for_ytdl_interval(minimum_interval_seconds)
-    except BaseException:
-        ytdl_semaphore.release()
-        raise
-
-    worker = asyncio.create_task(asyncio.to_thread(extract))
-
-    def extraction_finished(task: asyncio.Task[dict]) -> None:
-        ytdl_semaphore.release()
-        if task.cancelled():
-            return
-        error = task.exception()
-        if error is not None:
-            trip_youtube_circuit(error)
-
-    worker.add_done_callback(extraction_finished)
-    remaining_timeout = max(
-        0.1,
-        YTDL_EXTRACT_TIMEOUT_SECONDS - (loop.time() - started_at),
-    )
-    try:
-        info = await asyncio.wait_for(
-            asyncio.shield(worker),
-            timeout=remaining_timeout,
+        remaining_timeout = max(
+            0.1,
+            YTDL_EXTRACT_TIMEOUT_SECONDS - (loop.time() - started_at),
         )
+        info = await run_ytdl_worker(options, query, remaining_timeout)
     except asyncio.TimeoutError:
         logger.warning(
             "yt-dlp timed out after %s seconds: %s",
@@ -514,6 +565,8 @@ async def extract_ytdl_info(
     except Exception as error:
         trip_youtube_circuit(error)
         raise
+    finally:
+        ytdl_semaphore.release()
 
     stamp_ytdl_info(info, loop.time())
     if use_cache:
@@ -766,6 +819,7 @@ class Track:
     artist: str | None = None
     song_name: str | None = None
     uploader: str | None = None
+    audio_codec: str | None = None
     stream_resolved_at: float | None = None
     lyrics: str | None = None
     lyrics_loaded: bool = False
@@ -813,10 +867,10 @@ class GuildMusicState:
     voice_connect_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     control_panel_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     advance_task: asyncio.Task[None] | None = None
+    noncritical_task: asyncio.Task[None] | None = None
     autoplay_task: asyncio.Task[None] | None = None
     lyrics_task: asyncio.Task[None] | None = None
     lyrics_message: discord.Message | None = None
-    namuwiki_notice_message: discord.Message | None = None
     lyrics_view: discord.ui.View | None = None
     private_lyrics_messages: dict[
         str,
@@ -1191,7 +1245,6 @@ def make_player_embed(track: Track, state: GuildMusicState) -> discord.Embed:
         if len(state.queue) > 5:
             preview.append(f"...and {len(state.queue) - 5} more")
         embed.add_field(name="다음 곡", value="\n".join(preview), inline=False)
-    #embed.set_footer(text=f"기본 볼륨 {int(BOT_VOLUME * 100)} · 버튼으로 바로 제어") 필요 없을듯?
     if track.thumbnail_url:
         embed.set_image(url=track.thumbnail_url)
     return embed
@@ -2323,6 +2376,20 @@ def get_resolved_stream_url(info: dict) -> str | None:
         return None
 
     return info.get("url")
+
+
+def get_audio_codec(info: dict) -> str | None:
+    candidates = [info]
+    for key in ("requested_downloads", "requested_formats"):
+        values = info.get(key)
+        if isinstance(values, list):
+            candidates.extend(value for value in values if isinstance(value, dict))
+
+    for candidate in candidates:
+        codec = candidate.get("acodec")
+        if isinstance(codec, str) and codec.casefold() not in {"", "none"}:
+            return codec
+    return None
 
 
 def get_thumbnail_url(info: dict) -> str | None:
@@ -3934,6 +4001,14 @@ def request_youtube_subtitle(url: str, extension: str) -> str | None:
     return None
 
 
+async def run_lyrics_job(function: Callable[..., T], *args: object) -> T:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        lyrics_executor,
+        functools.partial(function, *args),
+    )
+
+
 async def get_selected_youtube_subtitle(
     track: Track,
     selected: tuple[str, str, str] | None,
@@ -3958,7 +4033,7 @@ async def get_selected_youtube_subtitle(
         ensure_youtube_circuit_closed()
         await wait_for_ytdl_interval()
         lyrics = await asyncio.wait_for(
-            asyncio.to_thread(request_youtube_subtitle, url, extension),
+            run_lyrics_job(request_youtube_subtitle, url, extension),
             timeout=LYRICS_REQUEST_TIMEOUT_SECONDS + 2,
         )
     except Exception as error:
@@ -4010,7 +4085,7 @@ async def get_track_lyrics(track: Track) -> str | None:
     lyrics: str | None = None
     try:
         lyrics = await asyncio.wait_for(
-            asyncio.to_thread(lookup_track_lyrics, track),
+            run_lyrics_job(lookup_track_lyrics, track),
             timeout=LYRICS_REQUEST_TIMEOUT_SECONDS + 2,
         )
     except (asyncio.TimeoutError, LyricsLookupError) as error:
@@ -4459,7 +4534,7 @@ async def get_track_namuwiki_lyrics(track: Track) -> str | None:
                 + (1 if NAMUWIKI_PREVIEW_FALLBACK_ENABLED else 0)
             )
             namuwiki_result = await asyncio.wait_for(
-                asyncio.to_thread(lookup_namuwiki_lyrics, track),
+                run_lyrics_job(lookup_namuwiki_lyrics, track),
                 timeout=(
                     NAMUWIKI_REQUEST_TIMEOUT_SECONDS
                     * NAMUWIKI_MAX_DOCUMENT_CANDIDATES
@@ -4548,7 +4623,7 @@ async def get_track_hiragana_reading(track: Track) -> str:
         if not source_lyrics:
             raise LyricsReadingError("Japanese source lyrics are not available.")
         try:
-            reading = await asyncio.to_thread(
+            reading = await run_lyrics_job(
                 generate_hiragana_lyrics,
                 source_lyrics,
             )
@@ -4575,33 +4650,19 @@ def cancel_lyrics_publish(state: GuildMusicState) -> None:
 
 
 async def clear_lyrics_message(guild_id: int, state: GuildMusicState) -> None:
-    messages = (state.lyrics_message, state.namuwiki_notice_message)
+    message = state.lyrics_message
     state.lyrics_message = None
-    state.namuwiki_notice_message = None
     replace_lyrics_view(state, None)
-    for message in messages:
-        if message is not None:
-            await delete_music_channel_message(guild_id, message)
-
-
-async def clear_namuwiki_lyrics_notice(
-    guild_id: int,
-    state: GuildMusicState,
-) -> None:
-    message = state.namuwiki_notice_message
-    state.namuwiki_notice_message = None
     if message is not None:
         await delete_music_channel_message(guild_id, message)
 
 
 def schedule_lyrics_message_cleanup(guild_id: int, state: GuildMusicState) -> None:
-    messages = (state.lyrics_message, state.namuwiki_notice_message)
+    message = state.lyrics_message
     state.lyrics_message = None
-    state.namuwiki_notice_message = None
     replace_lyrics_view(state, None)
-    for message in messages:
-        if message is not None:
-            asyncio.create_task(delete_music_channel_message(guild_id, message))
+    if message is not None:
+        asyncio.create_task(delete_music_channel_message(guild_id, message))
 
 
 def make_lyrics_file(lyrics: str, filename: str = "lyrics.txt") -> discord.File:
@@ -4900,96 +4961,6 @@ async def upsert_lyrics_message(
     return message
 
 
-async def upsert_namuwiki_lyrics_notice(
-    guild_id: int,
-    state: GuildMusicState,
-    track: Track,
-) -> discord.Message | None:
-    channel = resolve_control_panel_channel(guild_id, state)
-    if channel is None or state.current is not track:
-        return None
-
-    message = state.namuwiki_notice_message
-    if message is not None:
-        message_channel_id = getattr(getattr(message, "channel", None), "id", None)
-        channel_id = getattr(channel, "id", None)
-        if (
-            message_channel_id is not None
-            and channel_id is not None
-            and message_channel_id != channel_id
-        ):
-            await delete_music_channel_message(guild_id, message)
-            state.namuwiki_notice_message = None
-            message = None
-
-    embed = make_lyrics_variant_embed(
-        track,
-        "나무위키 가사 발견",
-        "원문 가사는 찾지 못했지만, "
-        "나무위키에는 원문·독음·번역 가사가 있어요.",
-        track.korean_lyrics_source or "나무위키 · 원문·독음·번역",
-        track.korean_lyrics_url,
-    )
-
-    if message is not None:
-        try:
-            edited_message = await message.edit(
-                content=None,
-                embed=embed,
-                attachments=[],
-                view=None,
-            )
-        except discord.NotFound:
-            state.namuwiki_notice_message = None
-            message = None
-        except discord.Forbidden:
-            logger.warning(
-                "Missing permission to edit NamuWiki lyrics notice in guild %s",
-                guild_id,
-            )
-            return None
-        except discord.HTTPException:
-            logger.exception(
-                "Failed to edit NamuWiki lyrics notice in guild %s",
-                guild_id,
-            )
-            return None
-        else:
-            if state.current is not track:
-                await delete_music_channel_message(
-                    guild_id,
-                    edited_message or message,
-                )
-                return None
-            state.namuwiki_notice_message = edited_message or message
-            return state.namuwiki_notice_message
-
-    send_options: dict[str, object] = {
-        "embed": embed,
-        "silent": is_silent_music_channel(channel),
-    }
-    try:
-        message = await channel.send(**send_options)
-    except discord.Forbidden:
-        logger.warning(
-            "Missing permission to send NamuWiki lyrics notice in guild %s",
-            guild_id,
-        )
-        return None
-    except discord.HTTPException:
-        logger.exception(
-            "Failed to send NamuWiki lyrics notice in guild %s",
-            guild_id,
-        )
-        return None
-
-    if state.current is not track:
-        await delete_music_channel_message(guild_id, message)
-        return None
-    state.namuwiki_notice_message = message
-    return message
-
-
 def schedule_lyrics_publish(
     guild_id: int,
     track: Track,
@@ -5009,7 +4980,6 @@ async def publish_current_lyrics(guild_id: int, track: Track) -> None:
     state = get_state(guild_id)
     current_task = asyncio.current_task()
     try:
-        await clear_namuwiki_lyrics_notice(guild_id, state)
         await upsert_lyrics_message(
             guild_id,
             state,
@@ -5048,33 +5018,6 @@ async def publish_current_lyrics(guild_id: int, track: Track) -> None:
                     view=view,
                 )
 
-        if not lyrics:
-            namuwiki_lyrics = await get_track_namuwiki_lyrics(track)
-            if state.current is not track:
-                return
-            if namuwiki_lyrics:
-                view = make_lyrics_variant_view(guild_id, track, "")
-                await upsert_lyrics_message(
-                    guild_id,
-                    state,
-                    track,
-                    "미제공",
-                    view=view,
-                )
-                await upsert_namuwiki_lyrics_notice(
-                    guild_id,
-                    state,
-                    track,
-                )
-            else:
-                view = make_lyrics_variant_view(guild_id, track, "")
-                await upsert_lyrics_message(
-                    guild_id,
-                    state,
-                    track,
-                    "미제공",
-                    view=view,
-                )
     except asyncio.CancelledError:
         raise
     finally:
@@ -5114,6 +5057,7 @@ def make_track_from_info(
         artist=info.get("artist") or info.get("creator"),
         song_name=info.get("track") or info.get("alt_title"),
         uploader=info.get("uploader") or info.get("channel"),
+        audio_codec=get_audio_codec(info),
         manual_subtitles=get_manual_subtitles(info),
         subtitle_language=info.get("language") or info.get("original_language"),
         stream_resolved_at=(
@@ -5255,6 +5199,7 @@ async def resolve_track_stream(track: Track) -> None:
     track.artist = info.get("artist") or info.get("creator") or track.artist
     track.song_name = info.get("track") or info.get("alt_title") or track.song_name
     track.uploader = info.get("uploader") or info.get("channel") or track.uploader
+    track.audio_codec = get_audio_codec(info)
     track.manual_subtitles = get_manual_subtitles(info)
     track.subtitle_language = (
         info.get("language") or info.get("original_language") or track.subtitle_language
@@ -5588,6 +5533,65 @@ async def refill_autoplay_queue(
                 schedule_autoplay_refill(guild_id)
 
 
+def cancel_noncritical_tasks(state: GuildMusicState) -> None:
+    task = state.noncritical_task
+    if task and not task.done():
+        task.cancel()
+    state.noncritical_task = None
+
+
+def schedule_noncritical_tasks(
+    guild_id: int,
+    track: Track,
+) -> tuple[asyncio.Task[None], bool]:
+    state = get_state(guild_id)
+    if state.noncritical_task and not state.noncritical_task.done():
+        return state.noncritical_task, False
+
+    task = asyncio.create_task(
+        start_noncritical_tasks(
+            guild_id,
+            state.playback_generation,
+            track,
+        )
+    )
+    state.noncritical_task = task
+    return task, True
+
+
+async def start_noncritical_tasks(
+    guild_id: int,
+    generation: int,
+    track: Track,
+) -> None:
+    state = get_state(guild_id)
+    current_task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    jobs = (
+        (AUTOPLAY_START_DELAY_SECONDS, "autoplay"),
+        (LYRICS_START_DELAY_SECONDS, "lyrics"),
+    )
+
+    try:
+        for delay_seconds, job in sorted(jobs):
+            remaining = delay_seconds - (loop.time() - started_at)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            if (
+                generation != state.playback_generation
+                or state.current is not track
+            ):
+                return
+            if job == "autoplay":
+                schedule_autoplay_refill(guild_id)
+            else:
+                schedule_lyrics_publish(guild_id, track)
+    finally:
+        if state.noncritical_task is current_task:
+            state.noncritical_task = None
+
+
 async def wait_for_voice_connection(
     voice: discord.VoiceProtocol,
     timeout_seconds: float = VOICE_RECONNECT_GRACE_SECONDS,
@@ -5781,6 +5785,7 @@ def stop_playback(state: GuildMusicState, guild_id: int) -> None:
     state.queue.clear()
     schedule_private_lyrics_cleanup(state)
     state.current = None
+    cancel_noncritical_tasks(state)
     cancel_autoplay_refill(state)
     cancel_lyrics_publish(state)
     schedule_lyrics_message_cleanup(guild_id, state)
@@ -6319,6 +6324,7 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
         if not ffmpeg_is_available():
             state.current = None
             state.queue.clear()
+            cancel_noncritical_tasks(state)
             cancel_autoplay_refill(state)
             cancel_lyrics_publish(state)
             await clear_lyrics_message(guild_id, state)
@@ -6354,20 +6360,28 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                     should_delete_panel = False
 
             if should_delete_panel:
+                cancel_noncritical_tasks(state)
                 cancel_lyrics_publish(state)
                 await clear_lyrics_message(guild_id, state)
                 await show_idle_panel(guild_id, state)
                 return
             assert track is not None
+            cancel_noncritical_tasks(state)
+            cancel_lyrics_publish(state)
 
             try:
                 await resolve_track_stream(track)
-                ffmpeg_source = discord.FFmpegPCMAudio(
+                source = discord.FFmpegOpusAudio(
                     track.stream_url,
+                    bitrate=128,
+                    codec=(
+                        "copy"
+                        if (track.audio_codec or "").casefold() in {"opus", "libopus"}
+                        else None
+                    ),
                     executable=FFMPEG_EXECUTABLE,
                     **FFMPEG_OPTIONS,
                 )
-                source = discord.PCMVolumeTransformer(ffmpeg_source, volume=BOT_VOLUME)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -6402,6 +6416,8 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                             ):
                                 return
 
+                            cancel_noncritical_tasks(state)
+                            cancel_lyrics_publish(state)
                             schedule_private_lyrics_cleanup(state, track.track_id)
                             if state.repeat_one and not state.skip_requested and not state.stop_requested:
                                 track.stream_url = None
@@ -6426,11 +6442,10 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                 raise
 
             remember_autoplay_track(state, track)
-            schedule_autoplay_refill(guild_id)
             if announce and state.current is track:
                 await update_control_panel(guild_id, state)
             if state.current is track:
-                schedule_lyrics_publish(guild_id, track)
+                schedule_noncritical_tasks(guild_id, track)
             return
     finally:
         if state.advance_task is current_task:

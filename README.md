@@ -111,8 +111,10 @@ NAMUWIKI_REQUEST_INTERVAL_SECONDS=1.1
 YTDL_EXTRACT_TIMEOUT_SECONDS=45
 YTDL_MAX_CONCURRENT_EXTRACTIONS=1
 YTDL_MIN_INTERVAL_SECONDS=6
-YTDL_CACHE_TTL_SECONDS=600
-YTDL_CACHE_MAX_ENTRIES=128
+YTDL_CACHE_TTL_SECONDS=180
+YTDL_CACHE_MAX_ENTRIES=16
+AUTOPLAY_START_DELAY_SECONDS=10
+LYRICS_START_DELAY_SECONDS=3
 YOUTUBE_SEARCH_CANDIDATES=10
 YOUTUBE_MUSIC_SEARCH_ENABLED=true
 YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS=1
@@ -127,7 +129,6 @@ STREAM_URL_MAX_AGE_SECONDS=900
 MAX_BULK_TRACKS=50
 DEFAULT_AUTO_TRACKS=8
 MAX_AUTO_TRACKS=25
-BOT_VOLUME=0.2
 ```
 
 `MUSIC_CHANNEL_SILENT=true`이면 음악 신청 전용 채널에서 봇이 보내는 검색/대기열/Now playing 메시지를 조용한 메시지로 보냅니다. 사용자가 직접 보낸 곡 신청 메시지의 알림이나 각자의 채널 음소거 상태는 디스코드 클라이언트 설정 영역이라 봇이 강제로 바꿀 수 없습니다.
@@ -136,7 +137,7 @@ BOT_VOLUME=0.2
 
 `MUSIC_FEEDBACK_DELETE_SECONDS=10`이면 메시지로 곡을 신청했을 때 나오는 임시 추가 확인 메시지를 10초 뒤 삭제합니다. 슬래시 명령어와 버튼의 일반 개인 응답은 신청자에게만 보이며 `EPHEMERAL_RESPONSE_DELETE_SECONDS=15`초 뒤 정리됩니다. 대기열 관리 메시지는 곡을 삭제할 때마다 만료 시간이 다시 계산되고, 마지막 삭제로부터 `QUEUE_DELETE_RESPONSE_DELETE_SECONDS=30`초 뒤 삭제됩니다.
 
-곡이 재생되기 시작하면 LRCLIB에서 현재 곡을 찾아 전용 채널에 별도의 원문 가사 메시지를 자동으로 보냅니다. LRCLIB에 결과가 없거나 조회에 실패하면 해당 YouTube 영상에서 제공하는 수동 자막을 한 번 더 확인하며, 자동 생성 자막은 가사로 사용하지 않습니다. 두 출처 모두 결과가 없으면 원문 메시지에는 `미제공`으로 표시합니다. 이때 나무위키에 원문·독음·번역 가사 표가 있으면 가사 본문을 공개하지 않고, 나무위키 가사가 있다는 짧은 안내와 원문 문서 링크를 두 번째 메시지로 표시합니다. 문서만 존재하거나 일반 설명·번역 표만 있고 실제 가사 구성이 없으면 안내하지 않습니다. 자막 정보는 재생을 위해 이미 조회한 영상 정보에서 재사용하므로 별도의 영상 재검색은 하지 않습니다. 이후 곡이 바뀔 때는 원문 메시지를 수정하고 이전 곡의 나무위키 안내를 정리하며, 재생목록이 완전히 끝나거나 정지·퇴장할 때 두 메시지를 모두 삭제합니다. 같은 곡의 로마자판과 원문 문자판이 함께 검색되면 원문 문자판을 우선합니다. Discord 메시지 길이 제한을 넘는 가사는 같은 메시지의 UTF-8 텍스트 파일로 전체 원문을 첨부합니다. `LYRICS_REQUEST_TIMEOUT_SECONDS`는 각 가사 조회를 기다리는 최대 시간이며, `YOUTUBE_LYRICS_FALLBACK=false`로 수동 자막 fallback을 끌 수 있습니다.
+곡이 재생된 뒤 `LYRICS_START_DELAY_SECONDS`가 지나면 LRCLIB에서 현재 곡을 찾아 전용 채널에 별도의 원문 가사 메시지를 자동으로 보냅니다. LRCLIB에 결과가 없거나 조회에 실패하면 해당 YouTube 영상에서 제공하는 수동 자막을 한 번 더 확인하며, 자동 생성 자막은 가사로 사용하지 않습니다. 두 출처 모두 결과가 없으면 원문 메시지에는 `미제공`으로 표시합니다. 나무위키는 곡 전환 때 자동 조회하지 않고 `나무위키 가사` 버튼을 누를 때만 확인합니다. 자막 정보는 재생을 위해 이미 조회한 영상 정보에서 재사용하므로 별도의 영상 재검색은 하지 않습니다. 이후 곡이 바뀔 때는 원문 메시지를 수정하고, 재생목록이 완전히 끝나거나 정지·퇴장할 때 메시지를 삭제합니다. 같은 곡의 로마자판과 원문 문자판이 함께 검색되면 원문 문자판을 우선합니다. Discord 메시지 길이 제한을 넘는 가사는 같은 메시지의 UTF-8 텍스트 파일로 전체 원문을 첨부합니다. `LYRICS_REQUEST_TIMEOUT_SECONDS`는 각 가사 조회를 기다리는 최대 시간이며, `YOUTUBE_LYRICS_FALLBACK=false`로 수동 자막 fallback을 끌 수 있습니다.
 
 원문이 한국어가 아니면 가사 메시지에 `나무위키 가사` 버튼이 표시됩니다. 외국어 곡의 원문을 LRCLIB와 YouTube에서 찾지 못해 `미제공`으로 표시된 경우에도 버튼은 남습니다. 버튼을 누른 사용자에게만 결과를 보여주며, 먼저 곡명과 같은 나무위키 문서의 가사 표에서 `원문 → 한글 독음 → 한국어 번역`의 세 줄 묶음을 순서 그대로 가져옵니다. 열로 나뉜 표와 한 셀 또는 여러 행에 세 줄씩 이어지는 표를 모두 처리하며, 접기 문구·제목 뜻·번역 없는 독음 행은 제외합니다. 성공한 결과에는 원문 문서 링크와 출처를 표시합니다. 나무위키 가사가 없고 업로더가 직접 제공한 YouTube 수동 한국어 자막만 사용할 수 있으면 버튼 이름이 `한국어 자막`으로 바뀝니다. 자동 생성 자막과 `tlang=ko` 기계 번역 자막은 사용하지 않습니다. 최초 성공 결과와 출처는 현재 곡에 캐시하며, 개인 가사 메시지는 해당 곡이 끝나거나 스킵·정지되면 바로 삭제됩니다.
 
@@ -144,7 +145,7 @@ BOT_VOLUME=0.2
 
 일본어 가사에는 `히라가나 독음` 버튼이 추가됩니다. 독음 메시지는 가사를 전부 히라가나로 치환하지 않고 원문을 유지한 채 `運命(うんめい)`처럼 한자 뒤에 독음을 붙입니다. `나무위키 가사`의 3줄 구성은 바꾸지 않습니다. 나무위키 3줄 가사에 일본어 독음이 있으면 그 값을 우선 사용하고, 독음이 한글 표기뿐이면 나무위키의 일본어 원문을 Sudachi로 변환합니다. LRCLIB 원문에도 같은 변환을 사용합니다. 원문에 `運命(さだめ)`, `運命（さだめ）`, `運命[さだめ]`, `運命【さだめ】`, `運命《さだめ》`, `｜超電磁砲《レールガン》`처럼 명시된 특수 독음이 있으면 사전 결과보다 우선하며 `運命(さだめ)`, `超電磁砲(れーるがん)`처럼 표시합니다. 괄호 안이 일본어 가나이고 바로 앞에 한자가 있을 때만 독음으로 인식하므로 일반적인 괄호 속 코러스는 그대로 둡니다. `LYRICS_READING_ENABLED=false`로 독음 버튼을 끌 수 있습니다. 가사와 독음이 Discord 표시 한도를 넘으면 각각 UTF-8 텍스트 파일로 첨부합니다.
 
-`YTDL_MIN_INTERVAL_SECONDS=6`은 일반 검색과 자동재생 보충 같은 yt-dlp 작업 사이에 최소 6초를 둡니다. 현재 곡의 재생에 필요한 스트림 URL 해석은 이 간격을 기다리지 않으며, 자동재생 보충도 실제 재생이 시작된 뒤 실행되므로 빈 대기열의 첫 곡을 막지 않습니다. 가벼운 YouTube Music 메타데이터 조회는 별도의 `YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS=1`을 사용합니다. Music 결과와 일반 검색 결과는 `YTDL_CACHE_TTL_SECONDS` 동안 메모리에서 재사용합니다. 일반 YouTube fallback은 `YOUTUBE_SEARCH_CANDIDATES`개의 가벼운 결과에서 제목 일치도, Music에서 얻은 아티스트, 길이, `Full Version`, `Short Ver.`, `Game MV` 같은 표시를 비교해 풀 버전을 우선합니다. 선택된 영상의 스트림은 실제 재생 직전에 준비하므로 오래 대기한 스트림 URL을 다시 받는 요청도 줄어듭니다. 직접 URL을 보냈거나 검색어에 `short`, `game mv`, `live`, `cover`, `off vocal` 같은 버전을 명시한 경우에는 Music 카탈로그를 건너뛰고 그 요청을 우선합니다. 후보 수는 최대 20입니다. 429 또는 봇 확인 오류가 감지되면 `YOUTUBE_CIRCUIT_BREAKER_SECONDS` 동안 새 YouTube 요청을 즉시 거절해 차단을 더 악화시키지 않습니다. 자동재생 검색 실패도 1분, 2분, 5분, 15분, 30분 순서로 간격을 늘려 재시도합니다.
+`YTDL_MIN_INTERVAL_SECONDS=6`은 일반 검색과 자동재생 보충 같은 yt-dlp 작업 사이에 최소 6초를 둡니다. 현재 곡의 재생에 필요한 스트림 URL 해석은 이 간격을 기다리지 않으며, 자동재생 보충은 재생 시작 후 `AUTOPLAY_START_DELAY_SECONDS`가 지난 뒤 실행됩니다. 가사는 `LYRICS_START_DELAY_SECONDS` 뒤에 시작해 FFmpeg·자동재생·가사 조회가 곡 전환 순간에 한꺼번에 몰리지 않게 합니다. 가벼운 YouTube Music 메타데이터 조회는 별도의 `YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS=1`을 사용합니다. Music 결과와 일반 검색 결과는 `YTDL_CACHE_TTL_SECONDS` 동안 메모리에서 재사용하며, 기본 캐시 수는 저사양 서버에 맞춰 16개로 제한합니다. 일반 YouTube fallback은 `YOUTUBE_SEARCH_CANDIDATES`개의 가벼운 결과에서 제목 일치도, Music에서 얻은 아티스트, 길이, `Full Version`, `Short Ver.`, `Game MV` 같은 표시를 비교해 풀 버전을 우선합니다. 선택된 영상의 스트림은 실제 재생 직전에 준비하므로 오래 대기한 스트림 URL을 다시 받는 요청도 줄어듭니다. 직접 URL을 보냈거나 검색어에 `short`, `game mv`, `live`, `cover`, `off vocal` 같은 버전을 명시한 경우에는 Music 카탈로그를 건너뛰고 그 요청을 우선합니다. 후보 수는 최대 20입니다. 429 또는 봇 확인 오류가 감지되면 `YOUTUBE_CIRCUIT_BREAKER_SECONDS` 동안 새 YouTube 요청을 즉시 거절해 차단을 더 악화시키지 않습니다. 자동재생 검색 실패도 1분, 2분, 5분, 15분, 30분 순서로 간격을 늘려 재시도합니다.
 
 YouTube Music의 비로그인 응답은 지역이나 시점에 따라 `songs` 목록을 비워 보낼 수 있습니다. 인증 없이도 앨범·아티스트 힌트와 일반 YouTube fallback은 동작하지만, 카탈로그 결과를 더 안정적으로 받으려면 [ytmusicapi OAuth 설정](https://ytmusicapi.readthedocs.io/en/stable/setup/oauth.html)에 따라 별도 봇 계정으로 인증 파일을 만드세요.
 
@@ -158,13 +159,13 @@ ytmusicapi oauth --file ytmusic-auth.json \
 
 GCP 같은 클라우드 서버에서 `Sign in to confirm you're not a bot` 오류가 나더라도 쿠키는 일반적인 요청 제한 해결책이 아닙니다. 계정 로그인이 꼭 필요한 콘텐츠에서만 별도 계정의 Netscape `cookies.txt`를 사용하고, GitHub에는 절대 올리지 마세요. Deno/EJS와 요청 제한을 구성해도 429가 계속되면 서버 출구 IP가 차단된 것이므로 다른 IP 또는 네트워크가 필요합니다.
 
-`YTDL_EXTRACT_TIMEOUT_SECONDS`는 검색 한 번을 기다리는 최대 시간입니다. `YTDL_MAX_CONCURRENT_EXTRACTIONS`는 동시에 실행할 검색 수를 제한해 느린 요청이 누적되는 것을 막습니다. 오래 대기한 곡은 `STREAM_URL_MAX_AGE_SECONDS`가 지나면 재생 직전에 스트림 주소를 새로 받습니다.
+`YTDL_EXTRACT_TIMEOUT_SECONDS`는 검색 한 번을 기다리는 최대 시간입니다. yt-dlp는 별도 작업 프로세스에서 실행되므로 타임아웃이나 취소가 발생하면 남은 작업도 함께 종료됩니다. `YTDL_MAX_CONCURRENT_EXTRACTIONS`는 동시에 실행할 검색 수를 제한해 느린 요청이 누적되는 것을 막습니다. 오래 대기한 곡은 `STREAM_URL_MAX_AGE_SECONDS`가 지나면 재생 직전에 스트림 주소를 새로 받습니다.
 
 `MAX_BULK_TRACKS`는 앨범이나 재생목록을 한 번에 추가할 때 최대 몇 곡까지 대기열에 넣을지 정합니다.
 
 `DEFAULT_AUTO_TRACKS`와 `MAX_AUTO_TRACKS`는 전용 채널의 `auto:` 요청으로 관련 곡을 추가할 때의 기본/최대 개수입니다.
 
-`BOT_VOLUME`은 봇이 서버에 내보내는 기본 출력 음량입니다. `1.0`이 디스코드 사용자 음량 기준 `100` 정도라고 보면 되고, `0.2`는 `20` 정도의 낮은 시작값입니다. 디스코드 봇은 사용자별 음량을 강제로 설정할 수 없어서, 이후 개인별 조절은 각 사용자가 디스코드에서 봇을 우클릭해 사용자 음량을 바꾸면 됩니다.
+재생은 Opus 형식을 우선 선택하고 가능한 경우 재인코딩 없이 Discord로 전달합니다. 공용 `BOT_VOLUME` 처리는 CPU 절약을 위해 제거했으며, 음량은 각 사용자가 Discord에서 봇을 우클릭해 사용자 음량으로 조절합니다.
 
 ## YouTube 없는 서버 테스트
 

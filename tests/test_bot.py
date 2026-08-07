@@ -2552,10 +2552,6 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
         track = make_track("missing")
         state.current = track
 
-        async def confirm_missing_namuwiki(target: bot.Track) -> str | None:
-            target.namuwiki_lyrics_checked = True
-            return None
-
         with (
             patch.object(
                 bot,
@@ -2565,42 +2561,30 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 bot,
                 "get_track_namuwiki_lyrics",
-                new=AsyncMock(side_effect=confirm_missing_namuwiki),
+                new=AsyncMock(),
             ) as namuwiki_lookup,
         ):
             await bot.publish_current_lyrics(guild_id, track)
 
         channel.send.assert_awaited_once()
-        self.assertEqual(message.edit.await_count, 2)
+        message.edit.assert_awaited_once()
         final_embed = message.edit.await_args.kwargs["embed"]
         self.assertEqual(final_embed.description, "미제공")
         final_view = message.edit.await_args.kwargs["view"]
-        self.assertIsNone(final_view)
+        self.assertIsInstance(final_view, bot.LyricsVariantView)
+        self.assertIn("나무위키 가사", {item.label for item in final_view.children})
         self.assertIs(state.lyrics_message, message)
-        namuwiki_lookup.assert_awaited_once_with(track)
-        self.assertIsNone(state.namuwiki_notice_message)
+        namuwiki_lookup.assert_not_awaited()
 
-    async def test_missing_original_lyrics_publish_a_namuwiki_notice(
+    async def test_missing_original_lyrics_does_not_start_namuwiki_lookup(
         self,
     ) -> None:
         guild_id = 606
-        channel, lyrics_message = self.make_channel_and_message()
-        namuwiki_message = MagicMock()
-        namuwiki_message.id = 702
-        namuwiki_message.channel = channel
-        namuwiki_message.edit = AsyncMock(return_value=namuwiki_message)
-        namuwiki_message.delete = AsyncMock()
-        channel.send.side_effect = [lyrics_message, namuwiki_message]
-
+        channel, _ = self.make_channel_and_message()
         state = bot.get_state(guild_id)
         state.announcement_channel = channel
         track = make_track("namuwiki fallback")
         state.current = track
-
-        async def find_namuwiki(target: bot.Track) -> str:
-            target.korean_lyrics_source = "나무위키 · 원문·독음·번역"
-            target.korean_lyrics_url = "https://namu.wiki/w/example"
-            return "원문\n독음\n번역"
 
         with (
             patch.object(
@@ -2611,26 +2595,15 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 bot,
                 "get_track_namuwiki_lyrics",
-                new=AsyncMock(side_effect=find_namuwiki),
+                new=AsyncMock(return_value="원문\n독음\n번역"),
             ) as namuwiki_lookup,
         ):
             await bot.publish_current_lyrics(guild_id, track)
 
-        self.assertEqual(channel.send.await_count, 2)
-        namuwiki_lookup.assert_awaited_once_with(track)
-        namuwiki_embed = channel.send.await_args_list[1].kwargs["embed"]
-        self.assertIn("나무위키 가사 발견", namuwiki_embed.title)
-        self.assertEqual(
-            namuwiki_embed.description,
-            "원문 가사는 찾지 못했지만, "
-            "나무위키에는 원문·독음·번역 가사가 있어요.",
-        )
-        self.assertNotIn("원문\n독음\n번역", namuwiki_embed.description)
-        self.assertEqual(namuwiki_embed.url, "https://namu.wiki/w/example")
-        self.assertNotIn("file", channel.send.await_args_list[1].kwargs)
-        self.assertIs(state.namuwiki_notice_message, namuwiki_message)
+        channel.send.assert_awaited_once()
+        namuwiki_lookup.assert_not_awaited()
 
-    async def test_available_original_lyrics_do_not_publish_namuwiki_notice(
+    async def test_available_original_lyrics_do_not_lookup_namuwiki(
         self,
     ) -> None:
         guild_id = 607
@@ -2656,31 +2629,6 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
 
         channel.send.assert_awaited_once()
         namuwiki_lookup.assert_not_awaited()
-        self.assertIsNone(state.namuwiki_notice_message)
-
-    async def test_new_track_removes_the_previous_namuwiki_notice(self) -> None:
-        guild_id = 609
-        channel, lyrics_message = self.make_channel_and_message()
-        previous_namuwiki_message = MagicMock()
-        previous_namuwiki_message.channel = channel
-        previous_namuwiki_message.delete = AsyncMock()
-
-        state = bot.get_state(guild_id)
-        state.announcement_channel = channel
-        state.lyrics_message = lyrics_message
-        state.namuwiki_notice_message = previous_namuwiki_message
-        track = make_track("next track")
-        state.current = track
-
-        with patch.object(
-            bot,
-            "get_track_lyrics",
-            new=AsyncMock(return_value="next lyrics"),
-        ):
-            await bot.publish_current_lyrics(guild_id, track)
-
-        previous_namuwiki_message.delete.assert_awaited_once()
-        self.assertIsNone(state.namuwiki_notice_message)
 
     async def test_long_lyrics_replace_attachment_with_full_utf8_text(self) -> None:
         guild_id = 602
@@ -2707,9 +2655,6 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_deletes_the_lyrics_message(self) -> None:
         guild_id = 603
         channel, message = self.make_channel_and_message()
-        namuwiki_message = MagicMock()
-        namuwiki_message.channel = channel
-        namuwiki_message.delete = AsyncMock()
         state = bot.get_state(guild_id)
         state.current = make_track("current")
         private_lyrics_message = MagicMock()
@@ -2718,7 +2663,6 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
             private_lyrics_message
         ]
         state.lyrics_message = message
-        state.namuwiki_notice_message = namuwiki_message
         lyrics_view = MagicMock()
         state.lyrics_view = lyrics_view
 
@@ -2726,23 +2670,17 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         message.delete.assert_awaited_once()
-        namuwiki_message.delete.assert_awaited_once()
         private_lyrics_message.delete.assert_awaited_once_with()
         lyrics_view.stop.assert_called_once_with()
         self.assertIsNone(state.lyrics_message)
-        self.assertIsNone(state.namuwiki_notice_message)
         self.assertIsNone(state.lyrics_view)
         self.assertFalse(state.private_lyrics_messages)
 
     async def test_empty_queue_deletes_the_lyrics_message(self) -> None:
         guild_id = 604
         channel, message = self.make_channel_and_message()
-        namuwiki_message = MagicMock()
-        namuwiki_message.channel = channel
-        namuwiki_message.delete = AsyncMock()
         state = bot.get_state(guild_id)
         state.lyrics_message = message
-        state.namuwiki_notice_message = namuwiki_message
 
         with (
             patch.object(bot, "ffmpeg_is_available", return_value=True),
@@ -2751,10 +2689,8 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
             await bot.play_next(guild_id)
 
         message.delete.assert_awaited_once()
-        namuwiki_message.delete.assert_awaited_once()
         show_idle.assert_awaited_once_with(guild_id, state)
         self.assertIsNone(state.lyrics_message)
-        self.assertIsNone(state.namuwiki_notice_message)
 
 
 class CommandSurfaceTests(unittest.TestCase):
@@ -3391,10 +3327,10 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_repeated_query_uses_cache_without_a_second_worker(self) -> None:
         payload = {"id": "cachetest01", "title": "cached result"}
-        to_thread = AsyncMock(return_value=payload)
+        worker = AsyncMock(return_value=payload)
 
         with (
-            patch.object(bot.asyncio, "to_thread", new=to_thread),
+            patch.object(bot, "run_ytdl_worker", new=worker),
             patch.object(bot, "YTDL_MIN_INTERVAL_SECONDS", 0.0),
             patch.object(bot, "YTDL_CACHE_TTL_SECONDS", 600),
         ):
@@ -3410,8 +3346,58 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
                 "cache test",
             )
 
-        to_thread.assert_awaited_once()
+        worker.assert_awaited_once()
         self.assertEqual(second["title"], "cached result")
+
+    async def test_timed_out_worker_process_is_stopped(self) -> None:
+        class FakeProcess:
+            returncode = None
+            pid = 12345
+
+            async def communicate(self, request: bytes) -> tuple[bytes, bytes]:
+                await asyncio.Event().wait()
+                return b"", b""
+
+        process = FakeProcess()
+        stop_worker = AsyncMock()
+        with (
+            patch.object(
+                bot.asyncio,
+                "create_subprocess_exec",
+                new=AsyncMock(return_value=process),
+            ),
+            patch.object(bot, "stop_ytdl_worker", new=stop_worker),
+            self.assertRaises(asyncio.TimeoutError),
+        ):
+            await bot.run_ytdl_worker({}, "timeout-test", 0.01)
+
+        stop_worker.assert_awaited_once_with(process)
+
+    async def test_worker_entrypoint_returns_a_structured_error(self) -> None:
+        with self.assertRaises(RuntimeError):
+            await bot.run_ytdl_worker({}, "", 5.0)
+
+    async def test_extraction_slot_is_released_after_worker_timeout(self) -> None:
+        semaphore = asyncio.Semaphore(1)
+        with (
+            patch.object(bot, "ytdl_semaphore", semaphore),
+            patch.object(bot, "YTDL_MIN_INTERVAL_SECONDS", 0.0),
+            patch.object(
+                bot,
+                "run_ytdl_worker",
+                new=AsyncMock(side_effect=asyncio.TimeoutError),
+            ),
+            self.assertRaises(asyncio.TimeoutError),
+        ):
+            await bot.extract_ytdl_info(
+                bot.YTDL_OPTIONS,
+                "ytsearch1:worker-timeout-test",
+                "worker timeout test",
+                use_cache=False,
+            )
+
+        await asyncio.wait_for(semaphore.acquire(), timeout=0.1)
+        semaphore.release()
 
     async def test_rate_limiter_waits_before_the_next_worker(self) -> None:
         bot.ytdl_last_request_started_at = bot.time.monotonic()
@@ -3441,9 +3427,9 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(opened)
         self.assertGreater(bot.get_youtube_circuit_retry_after(), 1700)
 
-        to_thread = AsyncMock(return_value={"id": "should-not-run"})
+        worker = AsyncMock(return_value={"id": "should-not-run"})
         with (
-            patch.object(bot.asyncio, "to_thread", new=to_thread),
+            patch.object(bot, "run_ytdl_worker", new=worker),
             self.assertRaises(bot.YouTubeCircuitOpenError),
         ):
             await bot.extract_ytdl_info(
@@ -3453,7 +3439,7 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
                 use_cache=False,
             )
 
-        to_thread.assert_not_awaited()
+        worker.assert_not_awaited()
 
     def test_only_rate_limit_errors_trip_the_circuit(self) -> None:
         self.assertTrue(
@@ -3912,6 +3898,7 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
 class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         for state in bot.music_states.values():
+            bot.cancel_noncritical_tasks(state)
             bot.cancel_autoplay_refill(state)
             bot.cancel_lyrics_publish(state)
             bot.schedule_private_lyrics_cleanup(state)
@@ -3959,6 +3946,8 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
 
         guild_id = 456
         first = make_track("first")
+        first.stream_url = "https://example.test/first.opus"
+        first.audio_codec = "opus"
         second = make_track("second")
         voice = FakeVoice()
         state = bot.get_state(guild_id)
@@ -3969,10 +3958,12 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(bot, "ffmpeg_is_available", return_value=True),
             patch.object(bot, "resolve_track_stream", new=AsyncMock()),
-            patch.object(bot.discord, "FFmpegPCMAudio", return_value=object()),
-            patch.object(bot.discord, "PCMVolumeTransformer", return_value=object()),
-            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
-            patch.object(bot, "schedule_lyrics_publish") as schedule_lyrics,
+            patch.object(
+                bot.discord,
+                "FFmpegOpusAudio",
+                return_value=MagicMock(),
+            ) as ffmpeg_opus,
+            patch.object(bot, "schedule_noncritical_tasks") as schedule_background,
         ):
             first_task, first_created = bot.schedule_play_next(guild_id, announce=False)
             second_task, second_created = bot.schedule_play_next(guild_id, announce=False)
@@ -3984,8 +3975,52 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(state.current, first)
         self.assertEqual(list(state.queue), [second])
         self.assertIn(bot.normalize_track_key(first), state.recent_track_keys)
+        ffmpeg_opus.assert_called_once()
+        self.assertEqual(ffmpeg_opus.call_args.kwargs["codec"], "copy")
+        self.assertEqual(ffmpeg_opus.call_args.kwargs["bitrate"], 128)
+        schedule_background.assert_called_once_with(guild_id, first)
+
+    async def test_noncritical_work_is_scheduled_after_playback_starts(self) -> None:
+        guild_id = 458
+        track = make_track("background")
+        state = bot.get_state(guild_id)
+        state.current = track
+
+        with (
+            patch.object(bot, "AUTOPLAY_START_DELAY_SECONDS", 0.0),
+            patch.object(bot, "LYRICS_START_DELAY_SECONDS", 0.0),
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+            patch.object(bot, "schedule_lyrics_publish") as schedule_lyrics,
+        ):
+            await bot.start_noncritical_tasks(
+                guild_id,
+                state.playback_generation,
+                track,
+            )
+
         schedule_refill.assert_called_once_with(guild_id)
-        schedule_lyrics.assert_called_once_with(guild_id, first)
+        schedule_lyrics.assert_called_once_with(guild_id, track)
+
+    async def test_noncritical_work_stops_when_the_track_changes(self) -> None:
+        guild_id = 459
+        track = make_track("old")
+        state = bot.get_state(guild_id)
+        state.current = make_track("new")
+
+        with (
+            patch.object(bot, "AUTOPLAY_START_DELAY_SECONDS", 0.0),
+            patch.object(bot, "LYRICS_START_DELAY_SECONDS", 0.0),
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+            patch.object(bot, "schedule_lyrics_publish") as schedule_lyrics,
+        ):
+            await bot.start_noncritical_tasks(
+                guild_id,
+                state.playback_generation,
+                track,
+            )
+
+        schedule_refill.assert_not_called()
+        schedule_lyrics.assert_not_called()
 
     async def test_track_end_deletes_its_private_lyrics_messages(self) -> None:
         class FakeVoice:
@@ -4021,10 +4056,8 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(bot, "ffmpeg_is_available", return_value=True),
             patch.object(bot, "resolve_track_stream", new=AsyncMock()),
-            patch.object(bot.discord, "FFmpegPCMAudio", return_value=object()),
-            patch.object(bot.discord, "PCMVolumeTransformer", return_value=object()),
-            patch.object(bot, "schedule_autoplay_refill"),
-            patch.object(bot, "schedule_lyrics_publish"),
+            patch.object(bot.discord, "FFmpegOpusAudio", return_value=MagicMock()),
+            patch.object(bot, "schedule_noncritical_tasks"),
             patch.object(bot, "schedule_play_next") as schedule_next,
             patch.object(bot, "bot", fake_bot),
         ):
@@ -4057,6 +4090,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
             "title": "refreshed",
             "webpage_url": track.webpage_url,
             "url": "https://example.test/new-audio",
+            "acodec": "opus",
             "formats": [{}],
         }
 
@@ -4076,6 +4110,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(track.stream_url, "https://example.test/new-audio")
         self.assertEqual(track.title, "refreshed")
+        self.assertEqual(track.audio_codec, "opus")
 
     async def test_extraction_slot_wait_also_times_out(self) -> None:
         with (
