@@ -40,7 +40,7 @@ class MusicNamuWikiCandidatesTests(unittest.TestCase):
             {
                 "__future__",
                 "collections.abc",
-                "music_lyrics_matching",
+                "music_lyrics_sources",
                 "music_models",
                 "music_namuwiki_parsing",
                 "music_search_scoring",

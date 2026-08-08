@@ -3,10 +3,23 @@ import unittest
 from pathlib import Path
 
 import bot
-import music_subtitles
+import music_lyrics_sources
 
 
 MOVED_NAMES = (
+    "LRC_METADATA_RE",
+    "LRC_TIMESTAMP_RE",
+    "LYRICS_DURATION_MATCH_TOLERANCE_SECONDS",
+    "LYRICS_NATIVE_SCRIPT_MIN_RATIO",
+    "LYRICS_NATIVE_SCRIPT_SCORE_WINDOW",
+    "QUOTED_TRACK_TITLE_RE",
+    "extract_original_lyrics",
+    "get_lyrics_search_terms",
+    "get_lyrics_title_aliases",
+    "lyrics_native_script_ratio",
+    "lyrics_record_score",
+    "normalize_lyrics_match_text",
+    "select_lyrics_record",
     "VTT_TAG_RE",
     "VTT_TIMESTAMP_LINE_RE",
     "YouTubeSubtitleError",
@@ -20,17 +33,17 @@ MOVED_NAMES = (
 )
 
 
-class MusicSubtitleTests(unittest.TestCase):
-    def test_bot_reexports_moved_subtitle_names(self) -> None:
+class MusicLyricsSourcesTests(unittest.TestCase):
+    def test_bot_reexports_moved_lyrics_source_names(self) -> None:
         for name in MOVED_NAMES:
             with self.subTest(name=name):
                 self.assertIs(
                     getattr(bot, name),
-                    getattr(music_subtitles, name),
+                    getattr(music_lyrics_sources, name),
                 )
 
-    def test_module_does_not_import_bot(self) -> None:
-        source = Path(music_subtitles.__file__).read_text(encoding="utf-8")
+    def test_module_has_only_the_expected_import_dependencies(self) -> None:
+        source = Path(music_lyrics_sources.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
         imported_modules = {
             node.module
@@ -46,11 +59,19 @@ class MusicSubtitleTests(unittest.TestCase):
 
         self.assertEqual(
             imported_modules,
-            {"__future__", "html", "json", "music_models", "re"},
+            {
+                "__future__",
+                "html",
+                "json",
+                "music_models",
+                "music_search_scoring",
+                "re",
+                "unicodedata",
+            },
         )
 
     def test_candidates_ignore_malformed_and_unsupported_formats(self) -> None:
-        candidates = music_subtitles.get_subtitle_candidates(
+        candidates = music_lyrics_sources.get_subtitle_candidates(
             {
                 "ja": [
                     {"ext": "srt", "url": "https://example.test/unsupported"},
@@ -65,4 +86,12 @@ class MusicSubtitleTests(unittest.TestCase):
         self.assertEqual(
             candidates,
             [("ja", "json3", "https://example.test/json3", 30)],
+        )
+
+    def test_title_aliases_include_full_and_split_script_variants(self) -> None:
+        self.assertEqual(
+            music_lyrics_sources.get_lyrics_title_aliases(
+                "らしさ - Rashisa"
+            ),
+            {"らしさ rashisa", "らしさ", "rashisa"},
         )

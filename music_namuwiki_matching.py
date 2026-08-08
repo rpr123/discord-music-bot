@@ -5,7 +5,7 @@ import unicodedata
 import urllib.parse
 from collections.abc import Mapping
 
-from music_lyrics_matching import QUOTED_TRACK_TITLE_RE, get_lyrics_search_terms
+from music_lyrics_sources import QUOTED_TRACK_TITLE_RE, get_lyrics_search_terms
 from music_models import Track
 from music_namuwiki_parsing import NamuWikiLyricsError
 from music_search_scoring import (

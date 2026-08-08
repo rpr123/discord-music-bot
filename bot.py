@@ -92,20 +92,30 @@ from music_discord_display import (
     truncate_option_text,
     truncate_text,
 )
-from music_lyrics_matching import (
+from music_lyrics_sources import (
     LRC_METADATA_RE,
     LRC_TIMESTAMP_RE,
     LYRICS_DURATION_MATCH_TOLERANCE_SECONDS,
     LYRICS_NATIVE_SCRIPT_MIN_RATIO,
     LYRICS_NATIVE_SCRIPT_SCORE_WINDOW,
     QUOTED_TRACK_TITLE_RE,
+    VTT_TAG_RE,
+    VTT_TIMESTAMP_LINE_RE,
+    YouTubeSubtitleError,
+    extract_json3_lyrics,
     extract_original_lyrics,
+    extract_vtt_lyrics,
+    get_manual_subtitle_candidates,
     get_lyrics_search_terms,
     get_lyrics_title_aliases,
+    get_subtitle_candidates,
     lyrics_native_script_ratio,
     lyrics_record_score,
     normalize_lyrics_match_text,
+    normalize_subtitle_text,
+    select_korean_manual_subtitle,
     select_lyrics_record,
+    select_manual_subtitle,
 )
 from music_namuwiki_matching import (
     build_namuwiki_document_candidates,
@@ -197,18 +207,6 @@ from music_search_scoring import (
     strip_edge_title_tags,
     youtube_music_entries_are_ambiguous,
     youtube_music_result_to_entry,
-)
-from music_subtitles import (
-    VTT_TAG_RE,
-    VTT_TIMESTAMP_LINE_RE,
-    YouTubeSubtitleError,
-    extract_json3_lyrics,
-    extract_vtt_lyrics,
-    get_manual_subtitle_candidates,
-    get_subtitle_candidates,
-    normalize_subtitle_text,
-    select_korean_manual_subtitle,
-    select_manual_subtitle,
 )
 from music_track_metadata import (
     get_audio_codec,
