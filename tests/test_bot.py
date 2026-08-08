@@ -861,6 +861,145 @@ class QueueFeedbackLatencyTests(unittest.IsolatedAsyncioTestCase):
             view=None,
         )
 
+    async def test_stop_during_loading_reply_does_not_start_search(
+        self,
+    ) -> None:
+        guild_id = 656
+        loading_started = asyncio.Event()
+        release_loading = asyncio.Event()
+
+        class Guild:
+            id = guild_id
+
+        guild = Guild()
+
+        class Channel:
+            id = 1656
+            mention = "#voice"
+
+        channel = Channel()
+
+        class FakeMember:
+            def __init__(self) -> None:
+                self.bot = False
+                self.guild = guild
+                self.voice = type("MemberVoice", (), {"channel": channel})()
+                self.display_name = "tester"
+                self.id = 123
+
+        requester = FakeMember()
+        channel.members = [requester]
+
+        class Voice:
+            def __init__(self) -> None:
+                self.channel = channel
+                self.playing = True
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            def stop(self) -> None:
+                self.playing = False
+
+        state = bot.get_state(guild_id)
+        state.voice = Voice()
+        state.current = make_track("current")
+        guild.voice_client = state.voice
+        original_generation = state.playback_generation
+        late_track = make_track("late")
+        loading_message = MagicMock()
+        loading_message.edit = AsyncMock()
+        message = MagicMock()
+        message.author = requester
+        message.guild = guild
+        message.channel = channel
+        message.content = "late song"
+
+        async def delayed_loading_reply(
+            content: str,
+            **kwargs: object,
+        ) -> object:
+            self.assertTrue(content)
+            self.assertEqual(kwargs["mention_author"], False)
+            self.assertEqual(kwargs["silent"], False)
+            loading_started.set()
+            await release_loading.wait()
+            return loading_message
+
+        message.reply = AsyncMock(side_effect=delayed_loading_reply)
+        message.delete = AsyncMock()
+
+        def discard_housekeeping(coroutine) -> None:
+            coroutine.close()
+
+        request_task = None
+        with (
+            patch.object(bot, "bot_shutdown_started", False),
+            patch.object(bot.discord, "Member", FakeMember),
+            patch.object(bot, "get_music_channel_id", return_value=channel.id),
+            patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
+            patch.object(bot, "MUSIC_CHANNEL_DELETE_REQUESTS", False),
+            patch.object(
+                bot,
+                "extract_track",
+                new=AsyncMock(return_value=late_track),
+            ) as extract_track,
+            patch.object(
+                bot,
+                "schedule_play_next",
+                return_value=(None, False),
+            ) as schedule_play_next,
+            patch.object(bot, "schedule_autoplay_refill") as schedule_autoplay_refill,
+            patch.object(bot.bot, "process_commands", new=AsyncMock()) as process_commands,
+            patch.object(
+                bot,
+                "create_housekeeping_task",
+                side_effect=discard_housekeeping,
+            ),
+        ):
+            try:
+                request_task = asyncio.create_task(bot.on_message(message))
+                await asyncio.wait_for(loading_started.wait(), timeout=1)
+
+                bot.stop_playback(state, guild_id)
+                self.assertEqual(
+                    state.playback_generation,
+                    original_generation + 1,
+                )
+                self.assertIsNone(state.current)
+                self.assertFalse(state.queue)
+
+                release_loading.set()
+                await asyncio.wait_for(request_task, timeout=1)
+            finally:
+                release_loading.set()
+                if request_task is not None and not request_task.done():
+                    request_task.cancel()
+                if request_task is not None:
+                    await asyncio.gather(request_task, return_exceptions=True)
+                bot.cancel_empty_channel_disconnect(state)
+                bot.music_states.pop(guild_id, None)
+
+        message.reply.assert_awaited_once()
+        extract_track.assert_not_awaited()
+        schedule_play_next.assert_not_called()
+        schedule_autoplay_refill.assert_not_called()
+        self.assertFalse(state.queue)
+        self.assertIsNone(state.current)
+        loading_message.edit.assert_awaited_once_with(
+            content="곡을 찾는 동안 재생이 중지되어 요청을 취소했어요.",
+            embed=None,
+            view=None,
+        )
+        message.delete.assert_not_awaited()
+        process_commands.assert_awaited_once_with(message)
+
 
 class AutoRequestParsingTests(unittest.TestCase):
     def test_auto_without_count_uses_default(self) -> None:

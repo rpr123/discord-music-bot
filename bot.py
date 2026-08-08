@@ -4618,9 +4618,11 @@ async def enqueue_tracks(
     bulk: bool | None = None,
     search_kind: str | None = None,
     auto_count: int | None = None,
+    request_generation: int | None = None,
 ) -> bool:
     state = get_state(guild_id)
-    request_generation = state.playback_generation
+    if request_generation is None:
+        request_generation = state.playback_generation
     state.announcement_channel = text_channel
 
     async def send_feedback(
@@ -4665,6 +4667,12 @@ async def enqueue_tracks(
                 delete_message_later(message, MUSIC_FEEDBACK_DELETE_SECONDS)
             )
         return message
+
+    if state.playback_generation != request_generation:
+        await send_feedback(
+            content="곡을 찾는 동안 재생이 중지되어 요청을 취소했어요."
+        )
+        return False
 
     try:
         auto_request = parse_auto_request(query)
@@ -5295,6 +5303,7 @@ async def on_message(message: discord.Message) -> None:
         await delete_music_request_message(message)
         return
 
+    request_generation = state.playback_generation
     loading_message = await send_music_request_reply(message, "곡을 찾고 있어요...")
     try:
         await enqueue_tracks(
@@ -5303,6 +5312,7 @@ async def on_message(message: discord.Message) -> None:
             message.author,
             query,
             initial_response=loading_message,
+            request_generation=request_generation,
         )
     except discord.HTTPException as error:
         log_discord_http_error("processing a music request", error)
