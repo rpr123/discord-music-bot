@@ -30,6 +30,7 @@ import requests
 from discord import app_commands
 from discord.ext import commands
 from music_autoplay_policy import (
+    AUTOPLAY_QUEUE_TARGET,
     AUTOPLAY_RETRY_DELAYS_SECONDS,
     autoplay_can_refill,
     get_autoplay_retry_delay,
@@ -4115,7 +4116,7 @@ async def refill_autoplay_queue(
                     and not voice.is_paused()
                 ):
                     schedule_play_next(guild_id)
-            return
+                return
     finally:
         if state.autoplay_task is current_task:
             state.autoplay_task = None

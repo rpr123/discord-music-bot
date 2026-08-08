@@ -3402,6 +3402,41 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         query_extract.assert_not_awaited()
         update_panel.assert_awaited_once_with(guild_id, state)
 
+    async def test_refill_fills_empty_queue_to_two_tracks(self) -> None:
+        guild_id = 559
+        seed = make_track("seed")
+        first = make_track("first")
+        second = make_track("second")
+        state = bot.get_state(guild_id)
+        state.voice = self.Voice()
+        state.current = seed
+        state.autoplay_enabled = True
+
+        with (
+            patch.object(
+                bot,
+                "extract_auto_tracks_from_seed",
+                new=AsyncMock(
+                    side_effect=[
+                        [seed, first],
+                        [first, second],
+                    ]
+                ),
+            ) as extract,
+            patch.object(bot, "update_control_panel", new=AsyncMock()) as update_panel,
+        ):
+            await bot.refill_autoplay_queue(
+                guild_id,
+                state.playback_generation,
+                seed,
+            )
+
+        self.assertEqual(list(state.queue), [first, second])
+        self.assertEqual(extract.await_count, 2)
+        self.assertIs(extract.await_args_list[0].args[0], seed)
+        self.assertIs(extract.await_args_list[1].args[0], first)
+        self.assertEqual(update_panel.await_count, 2)
+
     async def test_refill_restarts_playback_if_track_ends_during_search(self) -> None:
         guild_id = 556
         seed = make_track("seed")
@@ -3440,10 +3475,12 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
     async def test_refill_retries_after_a_search_failure(self) -> None:
         guild_id = 558
         seed = make_track("seed")
+        queued = make_track("queued")
         fresh = make_track("fresh")
         state = bot.get_state(guild_id)
         state.voice = self.Voice()
         state.current = seed
+        state.queue.append(queued)
         state.autoplay_enabled = True
 
         with (
@@ -3461,7 +3498,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
                 seed,
             )
 
-        self.assertEqual(list(state.queue), [fresh])
+        self.assertEqual(list(state.queue), [queued, fresh])
         self.assertEqual(extract.await_count, 2)
         sleep.assert_awaited_once_with(bot.AUTOPLAY_RETRY_DELAYS_SECONDS[0])
 
@@ -3471,7 +3508,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
             [60, 120, 300, 900, 1800, 1800, 1800],
         )
 
-    async def test_only_one_refill_task_runs_and_threshold_is_one_track(self) -> None:
+    async def test_only_one_refill_task_runs_and_target_is_two_tracks(self) -> None:
         guild_id = 557
         state = bot.get_state(guild_id)
         state.voice = self.Voice()

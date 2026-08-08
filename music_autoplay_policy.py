@@ -4,6 +4,7 @@ from music_models import GuildMusicState, Track
 
 
 AUTOPLAY_RETRY_DELAYS_SECONDS = (60, 120, 300, 900, 1800)
+AUTOPLAY_QUEUE_TARGET = 2
 
 
 def get_autoplay_seed(state: GuildMusicState) -> Track | None:
@@ -19,7 +20,7 @@ def autoplay_can_refill(state: GuildMusicState, generation: int) -> bool:
         and generation == state.playback_generation
         and voice is not None
         and voice.is_connected()
-        and len(state.queue) <= 1
+        and len(state.queue) < AUTOPLAY_QUEUE_TARGET
     )
 
 

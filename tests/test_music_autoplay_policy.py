@@ -8,6 +8,7 @@ from music_models import GuildMusicState, Track
 
 
 MOVED_NAMES = (
+    "AUTOPLAY_QUEUE_TARGET",
     "AUTOPLAY_RETRY_DELAYS_SECONDS",
     "autoplay_can_refill",
     "get_autoplay_retry_delay",
@@ -75,6 +76,7 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
         )
 
         self.assertTrue(music_autoplay_policy.autoplay_can_refill(state, 7))
+        self.assertEqual(music_autoplay_policy.AUTOPLAY_QUEUE_TARGET, 2)
         state.queue.append(make_track("one"))
         self.assertTrue(music_autoplay_policy.autoplay_can_refill(state, 7))
         state.queue.append(make_track("two"))
