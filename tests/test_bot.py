@@ -324,6 +324,7 @@ class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
             bot.YTDL_SEARCH_OPTIONS,
             f"ytsearch{bot.YOUTUBE_SEARCH_CANDIDATES}:sample song",
             "YouTube search",
+            job_kind=bot.YtdlJobKind.USER_REQUEST,
         )
         select.assert_called_once_with("sample song", entries)
 
@@ -364,6 +365,7 @@ class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
             bot.YTDL_OPTIONS,
             "https://www.youtube.com/watch?v=CuRIuFRD1zI",
             "YouTube Music catalog song resolve",
+            job_kind=bot.YtdlJobKind.USER_REQUEST,
         )
 
     async def test_top_album_artist_enriches_youtube_fallback(self) -> None:
@@ -411,6 +413,7 @@ class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
             f"ytsearch{bot.YOUTUBE_SEARCH_CANDIDATES}:"
             "でいねいめいめい CoMETIK",
             "YouTube search",
+            job_kind=bot.YtdlJobKind.USER_REQUEST,
         )
 
     async def test_direct_url_keeps_full_extraction_options(self) -> None:
@@ -431,6 +434,7 @@ class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
             bot.YTDL_OPTIONS,
             url,
             "YouTube search",
+            job_kind=bot.YtdlJobKind.USER_REQUEST,
         )
 
     async def test_text_track_defers_stream_resolution_until_playback(self) -> None:
@@ -484,6 +488,7 @@ class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
             bot.YTDL_SEARCH_OPTIONS,
             "ytsearch6:Seed Song radio mix",
             "auto fallback search",
+            job_kind=bot.YtdlJobKind.USER_REQUEST,
         )
 
     async def test_auto_supplemental_search_uses_flat_options(self) -> None:
@@ -510,11 +515,111 @@ class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([track.title for track in tracks], ["Seed Song", "Candidate Song"])
         self.assertEqual(extract.await_count, 2)
-        self.assertEqual(extract.await_args_list[0].args[0], bot.YTDL_PLAYLIST_OPTIONS)
+        self.assertEqual(
+            extract.await_args_list[0].args[0]["playlistend"],
+            2,
+        )
+        self.assertEqual(
+            extract.await_args_list[0].kwargs["job_kind"],
+            bot.YtdlJobKind.USER_REQUEST,
+        )
         self.assertEqual(extract.await_args_list[1].args[0], bot.YTDL_SEARCH_OPTIONS)
         self.assertEqual(
             extract.await_args_list[1].args[2],
             "auto supplemental search",
+        )
+        self.assertEqual(
+            extract.await_args_list[1].kwargs["job_kind"],
+            bot.YtdlJobKind.USER_REQUEST,
+        )
+
+    async def test_user_auto_count_is_not_limited_by_background_refill(self) -> None:
+        seed = bot.Track(
+            title="Seed Song",
+            webpage_url="https://www.youtube.com/watch?v=seedtrack01",
+            requester="tester",
+            source_url="https://www.youtube.com/watch?v=seedtrack01",
+        )
+        entries = [
+            {
+                "id": f"track{index:06d}",
+                "title": f"Candidate {index}",
+                "duration": 180,
+            }
+            for index in range(24)
+        ]
+        extract = AsyncMock(return_value={"entries": entries})
+
+        with (
+            patch.object(bot, "MAX_AUTO_TRACKS", 25),
+            patch.object(bot, "MAX_BULK_TRACKS", 10),
+            patch.object(bot, "AUTOPLAY_REFILL_CANDIDATES", 5),
+            patch.object(bot, "extract_ytdl_info", extract),
+        ):
+            tracks = await bot.extract_auto_tracks_from_seed(seed, "tester", 25)
+
+        self.assertEqual(len(tracks), 25)
+        self.assertEqual(extract.await_args.args[0]["playlistend"], 25)
+        self.assertEqual(
+            extract.await_args.kwargs["job_kind"],
+            bot.YtdlJobKind.USER_REQUEST,
+        )
+
+    async def test_background_auto_fallback_uses_refill_candidate_count(self) -> None:
+        seed = bot.Track(
+            title="Seed Song",
+            webpage_url="https://example.test/seed",
+            requester="tester",
+            source_url="https://example.test/seed",
+        )
+        entries = [
+            {
+                "id": f"track{index:06d}",
+                "title": f"Candidate {index}",
+                "duration": 180,
+            }
+            for index in range(4)
+        ]
+        extract = AsyncMock(return_value={"entries": entries})
+
+        with (
+            patch.object(bot, "AUTOPLAY_REFILL_CANDIDATES", 5),
+            patch.object(bot, "extract_ytdl_info", extract),
+        ):
+            tracks = await bot.extract_auto_tracks_from_seed(
+                seed,
+                "tester",
+                5,
+                job_kind=bot.YtdlJobKind.AUTOPLAY,
+            )
+
+        self.assertEqual(len(tracks), 5)
+        extract.assert_awaited_once_with(
+            bot.YTDL_SEARCH_OPTIONS,
+            "ytsearch5:Seed Song radio mix",
+            "auto fallback search",
+            job_kind=bot.YtdlJobKind.AUTOPLAY,
+        )
+
+    async def test_playlist_request_uses_bulk_priority(self) -> None:
+        url = "https://www.youtube.com/playlist?list=PL1234567890"
+        extract = AsyncMock(
+            return_value={
+                "entries": [
+                    {"id": "abcdefghijk", "title": "Playlist Track"},
+                ]
+            }
+        )
+
+        with patch.object(bot, "extract_ytdl_info", extract):
+            tracks = await bot.extract_tracks(url, "tester", "playlist")
+
+        self.assertEqual([track.title for track in tracks], ["Playlist Track"])
+        extract.assert_awaited_once_with(
+            bot.YTDL_PLAYLIST_OPTIONS,
+            url,
+            "playlist or album search",
+            job_kind=bot.YtdlJobKind.PLAYLIST_ALBUM,
         )
 
 
@@ -3286,6 +3391,14 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(state.queue), [queued, fresh])
         extract.assert_awaited_once()
         self.assertIs(extract.await_args.args[0], queued)
+        self.assertEqual(
+            extract.await_args.args[2],
+            bot.AUTOPLAY_REFILL_CANDIDATES,
+        )
+        self.assertEqual(
+            extract.await_args.kwargs["job_kind"],
+            bot.YtdlJobKind.AUTOPLAY,
+        )
         query_extract.assert_not_awaited()
         update_panel.assert_awaited_once_with(guild_id, state)
 
@@ -3300,7 +3413,10 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         state.current = seed
         state.autoplay_enabled = True
 
-        async def finish_current_during_search(*args: object) -> list[bot.Track]:
+        async def finish_current_during_search(
+            *args: object,
+            **kwargs: object,
+        ) -> list[bot.Track]:
             state.current = None
             return [seed, fresh]
 
@@ -3427,12 +3543,14 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
                 bot.YTDL_OPTIONS,
                 "ytsearch1:cache-protection-test",
                 "cache test",
+                job_kind=bot.YtdlJobKind.USER_REQUEST,
             )
             first["title"] = "caller mutation"
             second = await bot.extract_ytdl_info(
                 bot.YTDL_OPTIONS,
                 "ytsearch1:cache-protection-test",
                 "cache test",
+                job_kind=bot.YtdlJobKind.USER_REQUEST,
             )
 
         worker.assert_awaited_once()
@@ -3462,31 +3580,124 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
 
         stop_worker.assert_awaited_once_with(process)
 
+    async def test_repeated_cancellation_waits_for_process_cleanup(self) -> None:
+        communicate_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+        cleanup_cancelled = asyncio.Event()
+
+        class FakeProcess:
+            returncode = None
+            pid = 12345
+
+            async def communicate(self, request: bytes) -> tuple[bytes, bytes]:
+                communicate_started.set()
+                await asyncio.Event().wait()
+                return b"", b""
+
+        async def stop_worker(process: object) -> None:
+            cleanup_started.set()
+            try:
+                await cleanup_release.wait()
+            except asyncio.CancelledError:
+                cleanup_cancelled.set()
+                raise
+            cleanup_finished.set()
+
+        with (
+            patch.object(
+                bot.asyncio,
+                "create_subprocess_exec",
+                new=AsyncMock(return_value=FakeProcess()),
+            ),
+            patch.object(bot, "stop_ytdl_worker", side_effect=stop_worker),
+        ):
+            worker = asyncio.create_task(
+                bot.run_ytdl_worker({}, "repeated-cancel", 5.0)
+            )
+            await communicate_started.wait()
+            worker.cancel()
+            await cleanup_started.wait()
+            worker.cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            self.assertFalse(worker.done())
+            self.assertFalse(cleanup_cancelled.is_set())
+            cleanup_release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await worker
+
+        self.assertTrue(cleanup_finished.is_set())
+
+    async def test_worker_log_includes_queue_wait_and_execution_time(self) -> None:
+        class FakeProcess:
+            returncode = 0
+            pid = 12345
+
+            async def communicate(self, request: bytes) -> tuple[bytes, bytes]:
+                response = json.dumps({"info": {"id": "logged"}}).encode("utf-8")
+                return response, b""
+
+        with (
+            patch.object(
+                bot.asyncio,
+                "create_subprocess_exec",
+                new=AsyncMock(return_value=FakeProcess()),
+            ),
+            self.assertLogs("music-bot", level="INFO") as logs,
+        ):
+            result = await bot.run_ytdl_worker(
+                {},
+                "log-test",
+                1.0,
+                label="stream log test",
+                job_kind=bot.YtdlJobKind.PLAYBACK_STREAM.log_name,
+                priority=str(int(bot.YtdlJobKind.PLAYBACK_STREAM)),
+                queue_wait_seconds=0.25,
+            )
+
+        output = "\n".join(logs.output)
+        self.assertEqual(result["id"], "logged")
+        self.assertIn("queue_wait=0.250s", output)
+        self.assertIn("worker=", output)
+        self.assertIn("response_bytes=", output)
+
     async def test_worker_entrypoint_returns_a_structured_error(self) -> None:
         with self.assertRaises(RuntimeError):
             await bot.run_ytdl_worker({}, "", 5.0)
 
     async def test_extraction_slot_is_released_after_worker_timeout(self) -> None:
-        semaphore = asyncio.Semaphore(1)
+        scheduler = bot.YtdlPriorityScheduler(1)
+        worker = AsyncMock(
+            side_effect=[asyncio.TimeoutError, {"id": "next-request"}],
+        )
         with (
-            patch.object(bot, "ytdl_semaphore", semaphore),
+            patch.object(bot, "ytdl_scheduler", scheduler),
             patch.object(bot, "YTDL_MIN_INTERVAL_SECONDS", 0.0),
-            patch.object(
-                bot,
-                "run_ytdl_worker",
-                new=AsyncMock(side_effect=asyncio.TimeoutError),
-            ),
-            self.assertRaises(asyncio.TimeoutError),
+            patch.object(bot, "run_ytdl_worker", new=worker),
         ):
-            await bot.extract_ytdl_info(
+            with self.assertRaises(asyncio.TimeoutError):
+                await bot.extract_ytdl_info(
+                    bot.YTDL_OPTIONS,
+                    "ytsearch1:worker-timeout-test",
+                    "worker timeout test",
+                    job_kind=bot.YtdlJobKind.USER_REQUEST,
+                    use_cache=False,
+                )
+
+            result = await bot.extract_ytdl_info(
                 bot.YTDL_OPTIONS,
-                "ytsearch1:worker-timeout-test",
-                "worker timeout test",
+                "ytsearch1:worker-after-timeout",
+                "worker after timeout",
+                job_kind=bot.YtdlJobKind.USER_REQUEST,
                 use_cache=False,
             )
 
-        await asyncio.wait_for(semaphore.acquire(), timeout=0.1)
-        semaphore.release()
+        await scheduler.shutdown()
+        self.assertEqual(result["id"], "next-request")
+        self.assertEqual(worker.await_count, 2)
 
     async def test_rate_limiter_waits_before_the_next_worker(self) -> None:
         bot.ytdl_last_request_started_at = bot.time.monotonic()
@@ -3525,6 +3736,7 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
                 bot.YTDL_OPTIONS,
                 "ytsearch1:circuit-open-test",
                 "circuit test",
+                job_kind=bot.YtdlJobKind.USER_REQUEST,
                 use_cache=False,
             )
 
@@ -3535,6 +3747,1303 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
             bot.is_youtube_block_error(RuntimeError("Sign in to confirm you're not a bot"))
         )
         self.assertFalse(bot.is_youtube_block_error(RuntimeError("Video unavailable")))
+
+
+class YtdlPrioritySchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        bot.ytdl_last_request_started_at = 0.0
+        bot.youtube_circuit_open_until = 0.0
+        bot.youtube_circuit_reason = None
+        self.scheduler = bot.YtdlPriorityScheduler(1)
+
+    async def asyncTearDown(self) -> None:
+        await self.scheduler.shutdown()
+        bot.ytdl_last_request_started_at = 0.0
+        bot.youtube_circuit_open_until = 0.0
+        bot.youtube_circuit_reason = None
+
+    async def submit(
+        self,
+        query: str,
+        job_kind: bot.YtdlJobKind,
+        *,
+        timeout_seconds: float = 1.0,
+    ) -> dict:
+        return await self.scheduler.submit(
+            {},
+            query,
+            query,
+            job_kind=job_kind,
+            timeout_seconds=timeout_seconds,
+            minimum_interval_seconds=0.0,
+        )
+
+    async def assert_priority_order(
+        self,
+        lower_kind: bot.YtdlJobKind,
+        higher_kind: bot.YtdlJobKind,
+    ) -> list[str]:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        order: list[str] = []
+
+        async def worker(
+            options: dict,
+            query: str,
+            timeout_seconds: float,
+            **kwargs: object,
+        ) -> dict:
+            order.append(query)
+            if query == "blocker":
+                started.set()
+                await release.wait()
+            return {"id": query}
+
+        with patch.object(bot, "run_ytdl_worker", side_effect=worker):
+            blocker = asyncio.create_task(
+                self.submit("blocker", bot.YtdlJobKind.USER_REQUEST)
+            )
+            await started.wait()
+
+            lower = asyncio.create_task(self.submit("lower", lower_kind))
+            await asyncio.sleep(0)
+            higher = asyncio.create_task(self.submit("higher", higher_kind))
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(blocker, lower, higher)
+
+        return order
+
+    async def test_playback_stream_runs_before_queued_autoplay(self) -> None:
+        order = await self.assert_priority_order(
+            bot.YtdlJobKind.AUTOPLAY,
+            bot.YtdlJobKind.PLAYBACK_STREAM,
+        )
+
+        self.assertEqual(order, ["blocker", "higher", "lower"])
+
+    async def test_submit_replaces_done_worker_before_callback_cleanup(self) -> None:
+        finished_worker = asyncio.create_task(asyncio.sleep(0))
+        await finished_worker
+        self.scheduler.worker_tasks.add(finished_worker)
+
+        with patch.object(
+            bot,
+            "run_ytdl_worker",
+            new=AsyncMock(return_value={"id": "replacement"}),
+        ):
+            result = await self.submit(
+                "replacement",
+                bot.YtdlJobKind.USER_REQUEST,
+            )
+
+        self.assertEqual(result["id"], "replacement")
+        self.assertNotIn(finished_worker, self.scheduler.worker_tasks)
+
+    async def test_playback_preempts_autoplay_rate_limit_wait(self) -> None:
+        autoplay_waiting = asyncio.Event()
+        autoplay_release = asyncio.Event()
+        executed: list[str] = []
+
+        async def interval_wait(
+            minimum_interval: float | None = None,
+            *,
+            on_interval_reserved: object = None,
+        ) -> None:
+            if minimum_interval is None:
+                autoplay_waiting.set()
+                await autoplay_release.wait()
+            if callable(on_interval_reserved):
+                on_interval_reserved()
+
+        async def worker(
+            options: dict,
+            query: str,
+            timeout_seconds: float,
+            **kwargs: object,
+        ) -> dict:
+            executed.append(query)
+            return {"id": query}
+
+        with (
+            patch.object(bot, "wait_for_ytdl_interval", side_effect=interval_wait),
+            patch.object(bot, "run_ytdl_worker", side_effect=worker),
+        ):
+            autoplay = asyncio.create_task(
+                self.scheduler.submit(
+                    {},
+                    "autoplay",
+                    "autoplay",
+                    job_kind=bot.YtdlJobKind.AUTOPLAY,
+                    timeout_seconds=1.0,
+                    minimum_interval_seconds=None,
+                )
+            )
+            await autoplay_waiting.wait()
+            playback = await asyncio.wait_for(
+                self.scheduler.submit(
+                    {},
+                    "playback",
+                    "playback",
+                    job_kind=bot.YtdlJobKind.PLAYBACK_STREAM,
+                    timeout_seconds=1.0,
+                    minimum_interval_seconds=0.0,
+                ),
+                timeout=0.2,
+            )
+            autoplay.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await autoplay
+            autoplay_release.set()
+
+        self.assertEqual(playback["id"], "playback")
+        self.assertEqual(executed, ["playback"])
+
+    async def test_reserved_rate_slot_is_not_cancelled_before_worker_start(self) -> None:
+        slot_reserved = asyncio.Event()
+        release_interval = asyncio.Event()
+        order: list[str] = []
+        interval_calls = 0
+
+        async def interval_wait(
+            minimum_interval: float | None = None,
+            *,
+            on_interval_reserved: object = None,
+        ) -> None:
+            nonlocal interval_calls
+            interval_calls += 1
+            if callable(on_interval_reserved):
+                on_interval_reserved()
+            if interval_calls == 1:
+                slot_reserved.set()
+                await release_interval.wait()
+
+        async def worker(
+            options: dict,
+            query: str,
+            timeout_seconds: float,
+            **kwargs: object,
+        ) -> dict:
+            order.append(query)
+            return {"id": query}
+
+        with (
+            patch.object(bot, "wait_for_ytdl_interval", side_effect=interval_wait),
+            patch.object(bot, "run_ytdl_worker", side_effect=worker),
+        ):
+            autoplay = asyncio.create_task(
+                self.scheduler.submit(
+                    {},
+                    "autoplay",
+                    "autoplay",
+                    job_kind=bot.YtdlJobKind.AUTOPLAY,
+                    timeout_seconds=1.0,
+                    minimum_interval_seconds=None,
+                )
+            )
+            await slot_reserved.wait()
+            user = asyncio.create_task(
+                self.submit("user", bot.YtdlJobKind.USER_REQUEST)
+            )
+            await asyncio.sleep(0)
+
+            self.assertFalse(autoplay.done())
+            self.assertFalse(user.done())
+            release_interval.set()
+            await asyncio.gather(autoplay, user)
+
+        self.assertEqual(order, ["autoplay", "user"])
+
+    async def test_user_search_runs_before_queued_autoplay(self) -> None:
+        order = await self.assert_priority_order(
+            bot.YtdlJobKind.AUTOPLAY,
+            bot.YtdlJobKind.USER_REQUEST,
+        )
+
+        self.assertEqual(order, ["blocker", "higher", "lower"])
+
+    async def test_cancelled_queued_autoplay_is_not_executed(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        executed: list[str] = []
+
+        async def worker(
+            options: dict,
+            query: str,
+            timeout_seconds: float,
+            **kwargs: object,
+        ) -> dict:
+            executed.append(query)
+            if query == "blocker":
+                started.set()
+                await release.wait()
+            return {"id": query}
+
+        with patch.object(bot, "run_ytdl_worker", side_effect=worker):
+            blocker = asyncio.create_task(
+                self.submit("blocker", bot.YtdlJobKind.USER_REQUEST)
+            )
+            await started.wait()
+            autoplay = asyncio.create_task(
+                self.submit("cancelled-autoplay", bot.YtdlJobKind.AUTOPLAY)
+            )
+            await asyncio.sleep(0)
+            autoplay.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await autoplay
+            release.set()
+            await blocker
+            await self.scheduler.queue.join()
+
+        self.assertEqual(executed, ["blocker"])
+
+    async def test_worker_concurrency_never_exceeds_one(self) -> None:
+        active = 0
+        maximum_active = 0
+
+        async def worker(
+            options: dict,
+            query: str,
+            timeout_seconds: float,
+            **kwargs: object,
+        ) -> dict:
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return {"id": query}
+
+        with patch.object(bot, "run_ytdl_worker", side_effect=worker):
+            await asyncio.gather(
+                *(
+                    self.submit(f"job-{index}", bot.YtdlJobKind.USER_REQUEST)
+                    for index in range(6)
+                )
+            )
+
+        self.assertEqual(maximum_active, 1)
+
+    async def test_subtitle_request_does_not_block_stream_resolution(self) -> None:
+        subtitle_started = asyncio.Event()
+        release_subtitle = asyncio.Event()
+        track = make_track("subtitle")
+
+        async def lyrics_job(*args: object) -> str:
+            subtitle_started.set()
+            await release_subtitle.wait()
+            return "lyrics"
+
+        worker = AsyncMock(return_value={"id": "stream"})
+        with (
+            patch.object(bot, "auxiliary_network_semaphore", asyncio.Semaphore(1)),
+            patch.object(
+                bot,
+                "wait_for_youtube_subtitle_interval",
+                new=AsyncMock(),
+            ),
+            patch.object(bot, "run_lyrics_job", side_effect=lyrics_job),
+            patch.object(bot, "run_ytdl_worker", new=worker),
+        ):
+            subtitle = asyncio.create_task(
+                bot.get_selected_youtube_subtitle(
+                    track,
+                    ("ko", "vtt", "https://example.test/subtitle"),
+                    purpose="test",
+                )
+            )
+            await subtitle_started.wait()
+            stream = await asyncio.wait_for(
+                self.submit("stream", bot.YtdlJobKind.PLAYBACK_STREAM),
+                timeout=0.2,
+            )
+            release_subtitle.set()
+            lyrics = await subtitle
+
+        self.assertEqual(stream["id"], "stream")
+        self.assertEqual(lyrics, "lyrics")
+        worker.assert_awaited_once()
+
+    async def test_subtitle_rechecks_circuit_after_rate_limit_wait(self) -> None:
+        semaphore = asyncio.Semaphore(1)
+        lyrics_job = AsyncMock(return_value="lyrics")
+
+        async def open_circuit_during_wait() -> None:
+            bot.youtube_circuit_open_until = bot.time.monotonic() + 60
+            bot.youtube_circuit_reason = "test circuit"
+
+        with (
+            patch.object(bot, "auxiliary_network_semaphore", semaphore),
+            patch.object(
+                bot,
+                "wait_for_youtube_subtitle_interval",
+                side_effect=open_circuit_during_wait,
+            ),
+            patch.object(bot, "run_lyrics_job", new=lyrics_job),
+            self.assertRaises(bot.YouTubeCircuitOpenError),
+        ):
+            await bot.get_selected_youtube_subtitle(
+                make_track("subtitle"),
+                ("ko", "vtt", "https://example.test/subtitle"),
+                purpose="test",
+            )
+
+        lyrics_job.assert_not_awaited()
+        self.assertEqual(semaphore._value, 1)
+
+    async def test_multiple_guild_jobs_share_priority_and_single_worker(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        order: list[str] = []
+        active = 0
+        maximum_active = 0
+
+        async def worker(
+            options: dict,
+            query: str,
+            timeout_seconds: float,
+            **kwargs: object,
+        ) -> dict:
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            order.append(query)
+            if query == "guild-a-blocker":
+                started.set()
+                await release.wait()
+            await asyncio.sleep(0)
+            active -= 1
+            return {"id": query}
+
+        with patch.object(bot, "run_ytdl_worker", side_effect=worker):
+            blocker = asyncio.create_task(
+                self.submit("guild-a-blocker", bot.YtdlJobKind.USER_REQUEST)
+            )
+            await started.wait()
+            jobs = [
+                asyncio.create_task(
+                    self.submit("guild-a-autoplay", bot.YtdlJobKind.AUTOPLAY)
+                ),
+                asyncio.create_task(
+                    self.submit("guild-b-autoplay", bot.YtdlJobKind.AUTOPLAY)
+                ),
+                asyncio.create_task(
+                    self.submit("guild-a-user", bot.YtdlJobKind.USER_REQUEST)
+                ),
+                asyncio.create_task(
+                    self.submit(
+                        "guild-b-playback",
+                        bot.YtdlJobKind.PLAYBACK_STREAM,
+                    )
+                ),
+            ]
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(blocker, *jobs)
+
+        self.assertEqual(
+            order,
+            [
+                "guild-a-blocker",
+                "guild-b-playback",
+                "guild-a-user",
+                "guild-a-autoplay",
+                "guild-b-autoplay",
+            ],
+        )
+        self.assertEqual(maximum_active, 1)
+
+    async def test_scheduler_shutdown_does_not_recancel_worker_cleanup(self) -> None:
+        communicate_started = asyncio.Event()
+        communication_cancelled = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+        cleanup_cancelled = asyncio.Event()
+        stop_calls = 0
+
+        class FakeProcess:
+            returncode = None
+            pid = 12345
+
+            async def communicate(self, request: bytes) -> tuple[bytes, bytes]:
+                communicate_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    communication_cancelled.set()
+                    raise
+                return b"", b""
+
+        async def stop_worker(process: object) -> None:
+            nonlocal stop_calls
+            stop_calls += 1
+            cleanup_started.set()
+            try:
+                await cleanup_release.wait()
+            except asyncio.CancelledError:
+                cleanup_cancelled.set()
+                raise
+            cleanup_finished.set()
+
+        with (
+            patch.object(
+                bot.asyncio,
+                "create_subprocess_exec",
+                new=AsyncMock(return_value=FakeProcess()),
+            ),
+            patch.object(bot, "stop_ytdl_worker", side_effect=stop_worker),
+        ):
+            submission = asyncio.create_task(
+                self.submit(
+                    "shutdown-cleanup",
+                    bot.YtdlJobKind.USER_REQUEST,
+                    timeout_seconds=5.0,
+                )
+            )
+            await communicate_started.wait()
+            shutdown = asyncio.create_task(self.scheduler.shutdown())
+            await cleanup_started.wait()
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            self.assertFalse(shutdown.done())
+            self.assertFalse(cleanup_cancelled.is_set())
+            cleanup_release.set()
+            await shutdown
+            result = await asyncio.gather(submission, return_exceptions=True)
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertEqual(stop_calls, 1)
+        self.assertTrue(cleanup_finished.is_set())
+        self.assertTrue(communication_cancelled.is_set())
+        self.assertFalse(self.scheduler.active_jobs)
+        self.assertFalse(self.scheduler.worker_tasks)
+
+    async def test_caller_cancellation_overlapping_shutdown_cleans_once(self) -> None:
+        communicate_started = asyncio.Event()
+        communication_cancelled = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+        cleanup_cancelled = asyncio.Event()
+        stop_calls = 0
+
+        class FakeProcess:
+            returncode = None
+            pid = 12345
+
+            async def communicate(self, request: bytes) -> tuple[bytes, bytes]:
+                communicate_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    communication_cancelled.set()
+                    raise
+                return b"", b""
+
+        async def stop_worker(process: object) -> None:
+            nonlocal stop_calls
+            stop_calls += 1
+            cleanup_started.set()
+            try:
+                await cleanup_release.wait()
+            except asyncio.CancelledError:
+                cleanup_cancelled.set()
+                raise
+
+        with (
+            patch.object(
+                bot.asyncio,
+                "create_subprocess_exec",
+                new=AsyncMock(return_value=FakeProcess()),
+            ),
+            patch.object(bot, "stop_ytdl_worker", side_effect=stop_worker),
+        ):
+            submission = asyncio.create_task(
+                self.submit(
+                    "caller-cancel-cleanup",
+                    bot.YtdlJobKind.USER_REQUEST,
+                    timeout_seconds=5.0,
+                )
+            )
+            await communicate_started.wait()
+            submission.cancel()
+            await cleanup_started.wait()
+            execution_task = next(iter(self.scheduler.active_jobs.values())).execution_task
+            self.assertIsNotNone(execution_task)
+            cancelling_count = execution_task.cancelling()
+
+            shutdown = asyncio.create_task(self.scheduler.shutdown())
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            self.assertEqual(execution_task.cancelling(), cancelling_count)
+            self.assertFalse(shutdown.done())
+            self.assertFalse(cleanup_cancelled.is_set())
+            cleanup_release.set()
+            await shutdown
+            result = await asyncio.gather(submission, return_exceptions=True)
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertEqual(stop_calls, 1)
+        self.assertTrue(communication_cancelled.is_set())
+        self.assertFalse(self.scheduler.active_jobs)
+        self.assertFalse(self.scheduler.worker_tasks)
+
+    async def test_shutdown_cancels_running_and_pending_jobs(self) -> None:
+        started = asyncio.Event()
+
+        async def worker(
+            options: dict,
+            query: str,
+            timeout_seconds: float,
+            **kwargs: object,
+        ) -> dict:
+            started.set()
+            await asyncio.Event().wait()
+            return {"id": query}
+
+        with patch.object(bot, "run_ytdl_worker", side_effect=worker):
+            running = asyncio.create_task(
+                self.submit("running", bot.YtdlJobKind.USER_REQUEST)
+            )
+            await started.wait()
+            pending = asyncio.create_task(
+                self.submit("pending", bot.YtdlJobKind.AUTOPLAY)
+            )
+            await asyncio.sleep(0)
+            await self.scheduler.shutdown()
+            results = await asyncio.gather(
+                running,
+                pending,
+                return_exceptions=True,
+            )
+
+        self.assertTrue(
+            all(isinstance(result, asyncio.CancelledError) for result in results)
+        )
+
+
+class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        bot.auxiliary_operation_tasks.clear()
+        bot.auxiliary_worker_tasks.clear()
+        bot.auxiliary_workers_closing = False
+        bot.lyrics_executor_closing = False
+        bot.lyrics_executor_shutdown_task = None
+        bot.bot_shutdown_started = False
+        bot.voice_operation_tasks.clear()
+        bot.bot._discord_close_task = None
+        bot.music_states.pop(991, None)
+        bot.music_states.pop(992, None)
+        bot.music_states.pop(993, None)
+        bot.music_states.pop(994, None)
+
+    async def asyncTearDown(self) -> None:
+        tasks = list(
+            bot.auxiliary_operation_tasks
+            | bot.auxiliary_worker_tasks
+            | bot.voice_operation_tasks
+        )
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        bot.auxiliary_operation_tasks.clear()
+        bot.auxiliary_worker_tasks.clear()
+        bot.voice_operation_tasks.clear()
+        bot.auxiliary_workers_closing = False
+        shutdown_task = bot.lyrics_executor_shutdown_task
+        if shutdown_task is not None and not shutdown_task.done():
+            shutdown_task.cancel()
+            await asyncio.gather(shutdown_task, return_exceptions=True)
+        bot.lyrics_executor_closing = False
+        bot.lyrics_executor_shutdown_task = None
+        bot.bot_shutdown_started = False
+        discord_close_task = bot.bot._discord_close_task
+        if discord_close_task is not None and not discord_close_task.done():
+            discord_close_task.cancel()
+            await asyncio.gather(discord_close_task, return_exceptions=True)
+        bot.bot._discord_close_task = None
+        bot.music_states.pop(991, None)
+        bot.music_states.pop(992, None)
+        bot.music_states.pop(993, None)
+        bot.music_states.pop(994, None)
+
+    async def test_shutdown_waits_for_running_auxiliary_worker(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def work() -> str:
+            started.set()
+            await release.wait()
+            return "done"
+
+        worker = bot.track_auxiliary_worker(asyncio.create_task(work()))
+        await started.wait()
+        shutdown = asyncio.create_task(bot.shutdown_auxiliary_workers())
+        await asyncio.sleep(0)
+
+        self.assertFalse(shutdown.done())
+        self.assertIn(worker, bot.auxiliary_worker_tasks)
+        release.set()
+        await shutdown
+
+        self.assertTrue(worker.done())
+        self.assertFalse(bot.auxiliary_worker_tasks)
+
+    async def test_cancelled_auxiliary_shutdown_still_waits_for_worker(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        worker_cancelled = asyncio.Event()
+
+        async def work() -> str:
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                worker_cancelled.set()
+                raise
+            return "done"
+
+        worker = bot.track_auxiliary_worker(asyncio.create_task(work()))
+        await started.wait()
+        shutdown = asyncio.create_task(bot.shutdown_auxiliary_workers())
+        await asyncio.sleep(0)
+        shutdown.cancel()
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        self.assertFalse(shutdown.done())
+        self.assertFalse(worker_cancelled.is_set())
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await shutdown
+
+        self.assertTrue(worker.done())
+        self.assertFalse(bot.auxiliary_worker_tasks)
+
+    async def test_lyrics_executor_shutdown_is_idempotent(self) -> None:
+        calls: list[tuple[bool, bool]] = []
+
+        class FakeExecutor:
+            def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+                calls.append((wait, cancel_futures))
+
+        async def run_inline(
+            function: object,
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            return function(*args, **kwargs)
+
+        with (
+            patch.object(bot, "lyrics_executor", FakeExecutor()),
+            patch.object(bot.asyncio, "to_thread", side_effect=run_inline),
+        ):
+            await bot.shutdown_lyrics_executor()
+            await bot.shutdown_lyrics_executor()
+
+        self.assertEqual(calls, [(True, True)])
+
+    async def test_concurrent_executor_shutdown_callers_share_completion(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[tuple[bool, bool]] = []
+
+        class FakeExecutor:
+            def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+                calls.append((wait, cancel_futures))
+
+        async def delayed_to_thread(
+            function: object,
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            started.set()
+            await release.wait()
+            return function(*args, **kwargs)
+
+        with (
+            patch.object(bot, "lyrics_executor", FakeExecutor()),
+            patch.object(bot.asyncio, "to_thread", side_effect=delayed_to_thread),
+        ):
+            first = asyncio.create_task(bot.shutdown_lyrics_executor())
+            await started.wait()
+            second = asyncio.create_task(bot.shutdown_lyrics_executor())
+            await asyncio.sleep(0)
+
+            self.assertFalse(first.done())
+            self.assertFalse(second.done())
+            release.set()
+            await asyncio.gather(first, second)
+
+        self.assertEqual(calls, [(True, True)])
+
+    async def test_cancelled_shutdown_waits_before_later_caller_returns(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[tuple[bool, bool]] = []
+
+        class FakeExecutor:
+            def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+                calls.append((wait, cancel_futures))
+
+        async def delayed_to_thread(
+            function: object,
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            started.set()
+            await release.wait()
+            return function(*args, **kwargs)
+
+        with (
+            patch.object(bot, "lyrics_executor", FakeExecutor()),
+            patch.object(bot.asyncio, "to_thread", side_effect=delayed_to_thread),
+        ):
+            first = asyncio.create_task(bot.shutdown_lyrics_executor())
+            await started.wait()
+            first.cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            self.assertFalse(first.done())
+
+            second = asyncio.create_task(bot.shutdown_lyrics_executor())
+            await asyncio.sleep(0)
+            self.assertFalse(second.done())
+            release.set()
+            results = await asyncio.gather(
+                first,
+                second,
+                return_exceptions=True,
+            )
+
+        self.assertEqual(calls, [(True, True)])
+        self.assertIsInstance(results[0], asyncio.CancelledError)
+        self.assertIsNone(results[1])
+
+    async def test_run_lyrics_job_rejects_work_after_shutdown_begins(self) -> None:
+        function = MagicMock(return_value="lyrics")
+        bot.begin_lyrics_executor_shutdown()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await bot.run_lyrics_job(function)
+
+        function.assert_not_called()
+
+    async def test_lyrics_executor_shutdown_propagates_worker_error(self) -> None:
+        async def failing_to_thread(
+            function: object,
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            raise RuntimeError("executor shutdown failed")
+
+        with patch.object(
+            bot.asyncio,
+            "to_thread",
+            side_effect=failing_to_thread,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "executor shutdown failed",
+            ):
+                await bot.shutdown_lyrics_executor()
+
+    async def test_shutdown_cancels_delayed_noncritical_lyrics_work(self) -> None:
+        guild_id = 991
+        state = bot.get_state(guild_id)
+        started = asyncio.Event()
+        lyrics_job = AsyncMock()
+
+        async def delayed_work() -> None:
+            started.set()
+            await asyncio.Event().wait()
+            await bot.run_lyrics_job(lambda: "lyrics")
+
+        state.noncritical_task = asyncio.create_task(delayed_work())
+        await started.wait()
+        with patch.object(bot, "run_lyrics_job", new=lyrics_job):
+            await bot.cancel_music_background_tasks_for_shutdown()
+
+        self.assertIsNone(state.noncritical_task)
+        lyrics_job.assert_not_awaited()
+        bot.music_states.pop(guild_id, None)
+
+    async def test_shutdown_collects_background_task_rescheduled_in_finally(self) -> None:
+        guild_id = 992
+        state = bot.get_state(guild_id)
+        started = asyncio.Event()
+        replacements: list[asyncio.Task[None]] = []
+
+        async def replacement() -> None:
+            await asyncio.Event().wait()
+
+        async def initial() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                task = asyncio.create_task(replacement())
+                replacements.append(task)
+                state.autoplay_task = task
+
+        state.autoplay_task = asyncio.create_task(initial())
+        await started.wait()
+        await bot.cancel_music_background_tasks_for_shutdown()
+
+        self.assertEqual(len(replacements), 1)
+        self.assertTrue(replacements[0].cancelled())
+        self.assertIsNone(state.autoplay_task)
+        bot.music_states.pop(guild_id, None)
+
+    async def test_cancelled_close_waits_for_lyrics_executor_shutdown(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        order: list[str] = []
+        calls: list[tuple[bool, bool]] = []
+
+        class FakeExecutor:
+            def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+                calls.append((wait, cancel_futures))
+                order.append("executor")
+
+        async def delayed_to_thread(
+            function: object,
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            started.set()
+            await release.wait()
+            return function(*args, **kwargs)
+
+        async def base_close(_self: object) -> None:
+            order.append("super")
+
+        with (
+            patch.object(bot, "lyrics_executor", FakeExecutor()),
+            patch.object(bot.asyncio, "to_thread", side_effect=delayed_to_thread),
+            patch.object(
+                bot,
+                "cancel_music_background_tasks_for_shutdown",
+                new=AsyncMock(),
+            ),
+            patch.object(bot.ytdl_scheduler, "shutdown", new=AsyncMock()),
+            patch.object(bot, "shutdown_auxiliary_workers", new=AsyncMock()),
+            patch.object(bot.commands.Bot, "close", new=base_close),
+        ):
+            close_task = asyncio.create_task(bot.MusicBot.close(bot.bot))
+            await started.wait()
+            close_task.cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            self.assertFalse(close_task.done())
+            self.assertEqual(order, [])
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await close_task
+
+        self.assertEqual(order, ["executor", "super"])
+        self.assertEqual(calls, [(True, True)])
+
+    async def test_repeated_cancellation_waits_for_discord_close(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        base_cancelled = asyncio.Event()
+        calls = 0
+
+        async def base_close(_self: object) -> None:
+            nonlocal calls
+            calls += 1
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                base_cancelled.set()
+                raise
+
+        with (
+            patch.object(
+                bot,
+                "cancel_music_background_tasks_for_shutdown",
+                new=AsyncMock(),
+            ),
+            patch.object(bot, "shutdown_voice_operations", new=AsyncMock()),
+            patch.object(bot, "shutdown_auxiliary_operations", new=AsyncMock()),
+            patch.object(bot.ytdl_scheduler, "shutdown", new=AsyncMock()),
+            patch.object(bot, "shutdown_auxiliary_workers", new=AsyncMock()),
+            patch.object(bot, "shutdown_lyrics_executor", new=AsyncMock()),
+            patch.object(bot.commands.Bot, "close", new=base_close),
+        ):
+            close_task = asyncio.create_task(bot.MusicBot.close(bot.bot))
+            await started.wait()
+            close_task.cancel()
+            await asyncio.sleep(0)
+            close_task.cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            self.assertFalse(close_task.done())
+            self.assertFalse(base_cancelled.is_set())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await close_task
+
+        self.assertEqual(calls, 1)
+
+    async def test_concurrent_close_callers_share_discord_close(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def base_close(_self: object) -> None:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+
+        with (
+            patch.object(
+                bot,
+                "cancel_music_background_tasks_for_shutdown",
+                new=AsyncMock(),
+            ),
+            patch.object(bot, "shutdown_voice_operations", new=AsyncMock()),
+            patch.object(bot, "shutdown_auxiliary_operations", new=AsyncMock()),
+            patch.object(bot.ytdl_scheduler, "shutdown", new=AsyncMock()),
+            patch.object(bot, "shutdown_auxiliary_workers", new=AsyncMock()),
+            patch.object(bot, "shutdown_lyrics_executor", new=AsyncMock()),
+            patch.object(bot.commands.Bot, "close", new=base_close),
+        ):
+            first = asyncio.create_task(bot.MusicBot.close(bot.bot))
+            await started.wait()
+            second = asyncio.create_task(bot.MusicBot.close(bot.bot))
+            await asyncio.sleep(0)
+
+            self.assertFalse(first.done())
+            self.assertFalse(second.done())
+            release.set()
+            await asyncio.gather(first, second)
+
+        self.assertEqual(calls, 1)
+
+    async def test_autoplay_finalizer_cannot_reschedule_during_shutdown(self) -> None:
+        guild_id = 993
+        state = bot.get_state(guild_id)
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        results: list[tuple[asyncio.Task[None] | None, bool]] = []
+
+        async def autoplay_task() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release.wait()
+            finally:
+                if state.autoplay_task is asyncio.current_task():
+                    state.autoplay_task = None
+                    results.append(bot.schedule_autoplay_refill(guild_id))
+
+        state.autoplay_task = asyncio.create_task(autoplay_task())
+        await started.wait()
+        bot.begin_bot_shutdown()
+        cleanup = asyncio.create_task(
+            bot.cancel_music_background_tasks_for_shutdown()
+        )
+        await cancellation_seen.wait()
+        release.set()
+        await cleanup
+
+        self.assertEqual(results, [(None, False)])
+        self.assertIsNone(state.autoplay_task)
+
+    async def test_shutdown_gate_rejects_new_managed_tasks(self) -> None:
+        guild_id = 993
+        state = bot.get_state(guild_id)
+        track = make_track("shutdown-gate")
+        state.current = track
+        state.autoplay_enabled = True
+        message = MagicMock(id=1234)
+
+        bot.begin_bot_shutdown()
+
+        self.assertEqual(bot.schedule_play_next(guild_id), (None, False))
+        self.assertEqual(
+            bot.schedule_play_next_after_current(
+                guild_id,
+                state.playback_generation,
+            ),
+            (None, False),
+        )
+        self.assertEqual(
+            bot.schedule_noncritical_tasks(guild_id, track),
+            (None, False),
+        )
+        self.assertEqual(
+            bot.schedule_autoplay_refill(guild_id),
+            (None, False),
+        )
+        self.assertEqual(
+            bot.schedule_lyrics_publish(guild_id, track),
+            (None, False),
+        )
+        self.assertIsNone(
+            bot.schedule_queue_message_cleanup(state, message, 30)
+        )
+
+        self.assertIsNone(state.advance_task)
+        self.assertIsNone(state.noncritical_task)
+        self.assertIsNone(state.autoplay_task)
+        self.assertIsNone(state.lyrics_task)
+        self.assertFalse(state.queue_cleanup_tasks)
+
+        with patch.object(
+            bot.ytdl_scheduler,
+            "submit",
+            new=AsyncMock(),
+        ) as submit:
+            with self.assertRaises(asyncio.CancelledError):
+                await bot.extract_ytdl_info(
+                    bot.YTDL_SEARCH_OPTIONS,
+                    "ytsearch1:closing",
+                    "closing",
+                    job_kind=bot.YtdlJobKind.AUTOPLAY,
+                    use_cache=False,
+                )
+
+        submit.assert_not_awaited()
+
+    async def test_inflight_advance_cannot_schedule_work_during_shutdown(self) -> None:
+        guild_id = 994
+        state = bot.get_state(guild_id)
+        track = make_track("late-advance")
+        state.current = track
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        scheduling_result: list[tuple[asyncio.Task[None] | None, bool]] = []
+
+        async def inflight_advance() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release.wait()
+            scheduling_result.append(
+                bot.schedule_noncritical_tasks(guild_id, track)
+            )
+
+        state.advance_task = asyncio.create_task(inflight_advance())
+        await started.wait()
+        bot.begin_bot_shutdown()
+        cleanup = asyncio.create_task(
+            bot.cancel_music_background_tasks_for_shutdown()
+        )
+        await cancellation_seen.wait()
+
+        self.assertFalse(cleanup.done())
+        release.set()
+        await cleanup
+
+        self.assertEqual(scheduling_result, [(None, False)])
+        self.assertIsNone(state.advance_task)
+        self.assertIsNone(state.noncritical_task)
+
+    async def test_shutdown_finishes_with_no_pending_guild_tasks(self) -> None:
+        guild_id = 993
+        state = bot.get_state(guild_id)
+
+        async def wait_forever() -> None:
+            await asyncio.Event().wait()
+
+        state.advance_task = asyncio.create_task(wait_forever())
+        state.pending_advance_task = state.advance_task
+        state.pending_advance_generation = state.playback_generation
+        state.noncritical_task = asyncio.create_task(wait_forever())
+        state.autoplay_task = asyncio.create_task(wait_forever())
+        state.lyrics_task = asyncio.create_task(wait_forever())
+        state.empty_channel_task = asyncio.create_task(wait_forever())
+        state.queue_cleanup_tasks[99] = asyncio.create_task(wait_forever())
+        await asyncio.sleep(0)
+
+        bot.begin_bot_shutdown()
+        await bot.cancel_music_background_tasks_for_shutdown()
+
+        self.assertIsNone(state.advance_task)
+        self.assertIsNone(state.pending_advance_task)
+        self.assertIsNone(state.noncritical_task)
+        self.assertIsNone(state.autoplay_task)
+        self.assertIsNone(state.lyrics_task)
+        self.assertIsNone(state.empty_channel_task)
+        self.assertFalse(state.queue_cleanup_tasks)
+
+    async def test_shutdown_invalidates_generation_before_voice_stop(self) -> None:
+        guild_id = 994
+        state = bot.get_state(guild_id)
+        old_generation = state.playback_generation
+        observed_generations: list[int] = []
+        scheduling_results: list[
+            tuple[asyncio.Task[None] | None, bool]
+        ] = []
+
+        class Voice:
+            @staticmethod
+            def is_playing() -> bool:
+                return True
+
+            @staticmethod
+            def is_paused() -> bool:
+                return False
+
+            @staticmethod
+            def stop() -> None:
+                observed_generations.append(state.playback_generation)
+                scheduling_results.append(
+                    bot.schedule_play_next_after_current(
+                        guild_id,
+                        old_generation,
+                    )
+                )
+
+        state.voice = Voice()
+        bot.begin_bot_shutdown()
+        await bot.cancel_music_background_tasks_for_shutdown()
+
+        self.assertEqual(observed_generations, [old_generation + 1])
+        self.assertEqual(scheduling_results, [(None, False)])
+        self.assertTrue(state.stop_requested)
+
+    async def test_closing_during_auxiliary_rate_wait_starts_no_worker(self) -> None:
+        wait_started = asyncio.Event()
+        release_wait = asyncio.Event()
+        semaphore = asyncio.Semaphore(1)
+        to_thread = AsyncMock(return_value=[])
+
+        async def interval_wait() -> None:
+            wait_started.set()
+            await release_wait.wait()
+
+        with (
+            patch.object(bot, "auxiliary_network_semaphore", semaphore),
+            patch.object(bot.asyncio, "to_thread", new=to_thread),
+            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
+            patch.object(
+                bot,
+                "wait_for_youtube_music_interval",
+                side_effect=interval_wait,
+            ),
+        ):
+            search = asyncio.create_task(bot.search_youtube_music("closing"))
+            await wait_started.wait()
+            bot.begin_auxiliary_worker_shutdown()
+            release_wait.set()
+            with self.assertRaises(RuntimeError):
+                await search
+
+        to_thread.assert_not_awaited()
+        self.assertEqual(semaphore._value, 1)
+
+    async def test_shutdown_waits_for_youtube_music_pre_worker_operation(self) -> None:
+        wait_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release_wait = asyncio.Event()
+        semaphore = asyncio.Semaphore(1)
+        to_thread = AsyncMock(return_value=[])
+
+        async def interval_wait() -> None:
+            wait_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release_wait.wait()
+
+        with (
+            patch.object(bot, "auxiliary_network_semaphore", semaphore),
+            patch.object(bot.asyncio, "to_thread", new=to_thread),
+            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
+            patch.object(
+                bot,
+                "wait_for_youtube_music_interval",
+                side_effect=interval_wait,
+            ),
+        ):
+            search = asyncio.create_task(
+                bot.search_youtube_music("shutdown waiter")
+            )
+            await wait_started.wait()
+            bot.begin_bot_shutdown()
+            shutdown = asyncio.create_task(
+                bot.shutdown_auxiliary_operations()
+            )
+            await cancellation_seen.wait()
+
+            self.assertFalse(shutdown.done())
+            self.assertEqual(semaphore._value, 0)
+            release_wait.set()
+            results = await asyncio.gather(search, return_exceptions=True)
+            await shutdown
+
+        self.assertIsInstance(results[0], RuntimeError)
+        to_thread.assert_not_awaited()
+        self.assertEqual(semaphore._value, 1)
+        self.assertFalse(bot.auxiliary_operation_tasks)
+
+    async def test_shutdown_waits_for_subtitle_pre_worker_operation(self) -> None:
+        wait_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release_wait = asyncio.Event()
+        semaphore = asyncio.Semaphore(1)
+        lyrics_job = AsyncMock(return_value="lyrics")
+        track = make_track("subtitle-shutdown")
+
+        async def interval_wait() -> None:
+            wait_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release_wait.wait()
+
+        with (
+            patch.object(bot, "auxiliary_network_semaphore", semaphore),
+            patch.object(bot, "run_lyrics_job", new=lyrics_job),
+            patch.object(
+                bot,
+                "wait_for_youtube_subtitle_interval",
+                side_effect=interval_wait,
+            ),
+        ):
+            subtitle = asyncio.create_task(
+                bot.get_selected_youtube_subtitle(
+                    track,
+                    ("ko", "json3", "https://example.test/subtitle"),
+                    purpose="shutdown",
+                )
+            )
+            await wait_started.wait()
+            bot.begin_bot_shutdown()
+            shutdown = asyncio.create_task(
+                bot.shutdown_auxiliary_operations()
+            )
+            await cancellation_seen.wait()
+
+            self.assertFalse(shutdown.done())
+            self.assertEqual(semaphore._value, 0)
+            release_wait.set()
+            results = await asyncio.gather(subtitle, return_exceptions=True)
+            await shutdown
+
+        self.assertIsInstance(results[0], RuntimeError)
+        lyrics_job.assert_not_awaited()
+        self.assertEqual(semaphore._value, 1)
+        self.assertFalse(bot.auxiliary_operation_tasks)
 
 
 class YouTubeMusicProtectionTests(unittest.IsolatedAsyncioTestCase):
@@ -3626,6 +5135,30 @@ class YouTubeMusicProtectionTests(unittest.IsolatedAsyncioTestCase):
 
         music_wait.assert_awaited_once_with()
         ytdl_wait.assert_not_awaited()
+
+    async def test_music_search_rechecks_circuit_after_rate_limit_wait(self) -> None:
+        semaphore = asyncio.Semaphore(1)
+        to_thread = AsyncMock(return_value=[])
+
+        async def open_circuit_during_wait() -> None:
+            bot.youtube_circuit_open_until = bot.time.monotonic() + 60
+            bot.youtube_circuit_reason = "test circuit"
+
+        with (
+            patch.object(bot, "auxiliary_network_semaphore", semaphore),
+            patch.object(bot.asyncio, "to_thread", new=to_thread),
+            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
+            patch.object(
+                bot,
+                "wait_for_youtube_music_interval",
+                side_effect=open_circuit_during_wait,
+            ),
+            self.assertRaises(bot.YouTubeCircuitOpenError),
+        ):
+            await bot.search_youtube_music("circuit opens while waiting")
+
+        to_thread.assert_not_awaited()
+        self.assertEqual(semaphore._value, 1)
 
 
 class LocalMusicTestModeTests(unittest.IsolatedAsyncioTestCase):
@@ -3801,7 +5334,27 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
 
 
 class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        bot.bot_shutdown_started = False
+        bot.auxiliary_workers_closing = False
+        bot.lyrics_executor_closing = False
+        bot.voice_operation_tasks.clear()
+        bot.bot._discord_close_task = None
+
     async def asyncTearDown(self) -> None:
+        tasks = list(bot.voice_operation_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        bot.voice_operation_tasks.clear()
+        bot.bot_shutdown_started = False
+        bot.auxiliary_workers_closing = False
+        bot.lyrics_executor_closing = False
+        discord_close_task = bot.bot._discord_close_task
+        if discord_close_task is not None and not discord_close_task.done():
+            discord_close_task.cancel()
+            await asyncio.gather(discord_close_task, return_exceptions=True)
+        bot.bot._discord_close_task = None
         bot.music_states.clear()
 
     async def test_concurrent_requests_share_one_voice_connection(self) -> None:
@@ -3982,6 +5535,126 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stale_voice.cleanup_calls, 1)
         self.assertEqual(channel.connect_calls, 1)
         self.assertIs(state.voice, fresh_voice)
+
+    async def test_inflight_voice_connect_cannot_escape_shutdown(self) -> None:
+        class Guild:
+            id = 813
+            voice_client = None
+
+        guild = Guild()
+        connect_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release_connect = asyncio.Event()
+
+        class Voice:
+            def __init__(self) -> None:
+                self.disconnect_calls = 0
+                self.cleanup_calls = 0
+
+            async def disconnect(self, *, force: bool = False) -> None:
+                self.disconnect_calls += 1
+                self.force = force
+
+            def cleanup(self) -> None:
+                self.cleanup_calls += 1
+                guild.voice_client = None
+
+        voice = Voice()
+
+        class Channel:
+            mention = "#voice"
+
+            async def connect(self) -> object:
+                connect_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+                    await release_connect.wait()
+                guild.voice_client = voice
+                return voice
+
+        channel = Channel()
+
+        class Member:
+            pass
+
+        member = Member()
+        member.guild = guild
+        member.voice = type("MemberVoice", (), {"channel": channel})()
+        state = bot.GuildMusicState()
+        connection = asyncio.create_task(
+            bot.ensure_voice_for_member(member, state)
+        )
+        await connect_started.wait()
+
+        async def base_close(_self: object) -> None:
+            return None
+
+        with (
+            patch.object(
+                bot,
+                "cancel_music_background_tasks_for_shutdown",
+                new=AsyncMock(),
+            ),
+            patch.object(bot, "shutdown_auxiliary_operations", new=AsyncMock()),
+            patch.object(bot.ytdl_scheduler, "shutdown", new=AsyncMock()),
+            patch.object(bot, "shutdown_auxiliary_workers", new=AsyncMock()),
+            patch.object(bot, "shutdown_lyrics_executor", new=AsyncMock()),
+            patch.object(bot.commands.Bot, "close", new=base_close),
+        ):
+            close_task = asyncio.create_task(bot.MusicBot.close(bot.bot))
+            await cancellation_seen.wait()
+
+            self.assertFalse(close_task.done())
+            release_connect.set()
+            result = await connection
+            await close_task
+
+        self.assertFalse(result[0])
+        self.assertIsNone(state.voice)
+        self.assertIsNone(guild.voice_client)
+        self.assertEqual(voice.disconnect_calls, 1)
+        self.assertTrue(voice.force)
+        self.assertEqual(voice.cleanup_calls, 1)
+        self.assertFalse(bot.voice_operation_tasks)
+
+    async def test_shutdown_gate_prevents_voice_move(self) -> None:
+        class Guild:
+            id = 814
+            voice_client = None
+
+        guild = Guild()
+        target_channel = MagicMock()
+        existing_channel = MagicMock()
+
+        class Voice:
+            channel = existing_channel
+
+            @staticmethod
+            def is_connected() -> bool:
+                return True
+
+            @staticmethod
+            def is_playing() -> bool:
+                return False
+
+            @staticmethod
+            def is_paused() -> bool:
+                return False
+
+            move_to = AsyncMock()
+
+        voice = Voice()
+        guild.voice_client = voice
+        state = bot.GuildMusicState(voice=voice)
+        bot.begin_bot_shutdown()
+
+        result = await bot.ensure_voice_channel(guild, target_channel, state)
+
+        self.assertFalse(result[0])
+        voice.move_to.assert_not_awaited()
+        self.assertFalse(bot.voice_operation_tasks)
 
 
 class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
@@ -4679,6 +6352,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
             bot.YTDL_OPTIONS,
             track.source_url,
             "audio stream resolve",
+            job_kind=bot.YtdlJobKind.PLAYBACK_STREAM,
             use_cache=False,
             minimum_interval_seconds=0.0,
         )
@@ -4687,12 +6361,43 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(track.audio_codec, "opus")
 
     async def test_extraction_slot_wait_also_times_out(self) -> None:
+        scheduler = bot.YtdlPriorityScheduler(1)
+        worker_started = asyncio.Event()
+        release_worker = asyncio.Event()
+
+        async def worker(*args: object, **kwargs: object) -> dict:
+            worker_started.set()
+            await release_worker.wait()
+            return {"id": "blocker"}
+
         with (
-            patch.object(bot, "ytdl_semaphore", asyncio.Semaphore(0)),
+            patch.object(bot, "ytdl_scheduler", scheduler),
+            patch.object(bot, "run_ytdl_worker", side_effect=worker),
             patch.object(bot, "YTDL_EXTRACT_TIMEOUT_SECONDS", 0.01),
         ):
+            blocker = asyncio.create_task(
+                scheduler.submit(
+                    {},
+                    "blocker",
+                    "blocker",
+                    job_kind=bot.YtdlJobKind.USER_REQUEST,
+                    timeout_seconds=1.0,
+                    minimum_interval_seconds=0.0,
+                )
+            )
+            await worker_started.wait()
             with self.assertRaises(asyncio.TimeoutError):
-                await bot.extract_ytdl_info({}, "test", "blocked extraction")
+                await bot.extract_ytdl_info(
+                    {},
+                    "test",
+                    "blocked extraction",
+                    job_kind=bot.YtdlJobKind.PLAYBACK_STREAM,
+                    use_cache=False,
+                )
+            release_worker.set()
+            await blocker
+
+        await scheduler.shutdown()
 
     async def test_empty_channel_stops_and_disconnects(self) -> None:
         class Member:

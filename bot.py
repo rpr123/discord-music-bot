@@ -24,6 +24,7 @@ import urllib.request
 import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from enum import IntEnum
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Deque, TypeVar
@@ -153,6 +154,10 @@ QUEUE_DELETE_RESPONSE_DELETE_SECONDS = parse_positive_int_env(
 )
 DEFAULT_AUTO_TRACKS = parse_positive_int_env("DEFAULT_AUTO_TRACKS", 8)
 MAX_AUTO_TRACKS = parse_positive_int_env("MAX_AUTO_TRACKS", 25)
+AUTOPLAY_REFILL_CANDIDATES = min(
+    parse_positive_int_env("AUTOPLAY_REFILL_CANDIDATES", 5),
+    MAX_AUTO_TRACKS,
+)
 DISCORD_EMBED_FIELD_LIMIT = 1024
 QUEUE_SELECT_LIMIT = 25
 LYRICS_API_URL = os.getenv("LYRICS_API_URL", "https://lrclib.net/api/search")
@@ -212,6 +217,10 @@ YTDL_MAX_CONCURRENT_EXTRACTIONS = parse_positive_int_env(
 STREAM_URL_MAX_AGE_SECONDS = parse_positive_int_env("STREAM_URL_MAX_AGE_SECONDS", 900)
 MAX_PLAYBACK_ATTEMPTS = 2
 YTDL_MIN_INTERVAL_SECONDS = parse_nonnegative_float_env("YTDL_MIN_INTERVAL_SECONDS", 6.0)
+YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS = parse_nonnegative_float_env(
+    "YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS",
+    YTDL_MIN_INTERVAL_SECONDS,
+)
 YTDL_CACHE_TTL_SECONDS = parse_positive_int_env("YTDL_CACHE_TTL_SECONDS", 180)
 YTDL_CACHE_MAX_ENTRIES = parse_positive_int_env("YTDL_CACHE_MAX_ENTRIES", 16)
 YOUTUBE_SEARCH_CANDIDATES = min(
@@ -296,7 +305,6 @@ FFMPEG_OPTIONS = {
     "options": "-vn",
 }
 
-ytdl_semaphore = asyncio.Semaphore(YTDL_MAX_CONCURRENT_EXTRACTIONS)
 ytdl_rate_lock = asyncio.Lock()
 ytdl_cache_lock = asyncio.Lock()
 ytdl_cache: OrderedDict[tuple[str, str], tuple[float, dict]] = OrderedDict()
@@ -305,14 +313,24 @@ youtube_circuit_open_until = 0.0
 youtube_circuit_reason: str | None = None
 youtube_music_client: YTMusic | None = None
 youtube_music_client_lock = threading.Lock()
+auxiliary_network_semaphore = asyncio.Semaphore(1)
+auxiliary_operation_tasks: set[asyncio.Task] = set()
+auxiliary_worker_tasks: set[asyncio.Task] = set()
+auxiliary_workers_closing = False
 youtube_music_rate_lock = asyncio.Lock()
 youtube_music_last_request_started_at = 0.0
 youtube_music_cache_lock = asyncio.Lock()
 youtube_music_cache: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
+youtube_subtitle_rate_lock = asyncio.Lock()
+youtube_subtitle_last_request_started_at = 0.0
 lyrics_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="music-lyrics",
 )
+lyrics_executor_closing = False
+lyrics_executor_shutdown_task: asyncio.Task[None] | None = None
+bot_shutdown_started = False
+voice_operation_tasks: set[asyncio.Task] = set()
 YOUTUBE_BLOCK_ERROR_MARKERS = (
     "http error 429",
     "too many requests",
@@ -416,8 +434,109 @@ async def cache_ytdl_info(cache_key: tuple[str, str], info: dict) -> None:
             ytdl_cache.popitem(last=False)
 
 
+def ensure_auxiliary_workers_open() -> None:
+    if auxiliary_workers_closing:
+        raise RuntimeError("Auxiliary network workers are shutting down.")
+
+
+def track_auxiliary_worker(task: asyncio.Task) -> asyncio.Task:
+    ensure_auxiliary_workers_open()
+    auxiliary_worker_tasks.add(task)
+    task.add_done_callback(auxiliary_worker_tasks.discard)
+    return task
+
+
+def track_auxiliary_operation() -> asyncio.Task:
+    ensure_auxiliary_workers_open()
+    task = asyncio.current_task()
+    if task is None:
+        raise RuntimeError("Auxiliary operation requires an asyncio task.")
+    auxiliary_operation_tasks.add(task)
+    return task
+
+
+def begin_auxiliary_worker_shutdown() -> None:
+    global auxiliary_workers_closing
+    auxiliary_workers_closing = True
+
+
+async def shutdown_auxiliary_operations() -> None:
+    begin_auxiliary_worker_shutdown()
+    cancellation_received = False
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        auxiliary_operation_tasks.discard(current_task)
+
+    while auxiliary_operation_tasks:
+        tasks = list(auxiliary_operation_tasks)
+        for task in tasks:
+            if task.done():
+                auxiliary_operation_tasks.discard(task)
+                continue
+            if task.cancelling() == 0:
+                task.cancel()
+            task_cancelled, _ = (
+                await wait_for_task_completion_despite_cancellation(task)
+            )
+            cancellation_received = cancellation_received or task_cancelled
+            auxiliary_operation_tasks.discard(task)
+
+    if cancellation_received:
+        raise asyncio.CancelledError
+
+
+async def shutdown_auxiliary_workers() -> None:
+    begin_auxiliary_worker_shutdown()
+    cancellation_received = False
+    while auxiliary_worker_tasks:
+        tasks = list(auxiliary_worker_tasks)
+        for task in tasks:
+            task_cancelled, _ = (
+                await wait_for_task_completion_despite_cancellation(task)
+            )
+            cancellation_received = cancellation_received or task_cancelled
+    if cancellation_received:
+        raise asyncio.CancelledError
+
+
+def begin_lyrics_executor_shutdown() -> None:
+    global lyrics_executor_closing
+    lyrics_executor_closing = True
+
+
+def begin_bot_shutdown() -> None:
+    global bot_shutdown_started
+    bot_shutdown_started = True
+    begin_auxiliary_worker_shutdown()
+    begin_lyrics_executor_shutdown()
+
+
+async def shutdown_lyrics_executor() -> None:
+    global lyrics_executor_shutdown_task
+    begin_lyrics_executor_shutdown()
+    if lyrics_executor_shutdown_task is None:
+        lyrics_executor_shutdown_task = asyncio.create_task(
+            asyncio.to_thread(
+                lyrics_executor.shutdown,
+                wait=True,
+                cancel_futures=True,
+            )
+        )
+    cancellation_received, shutdown_error = (
+        await wait_for_task_completion_despite_cancellation(
+            lyrics_executor_shutdown_task
+        )
+    )
+    if shutdown_error is not None:
+        raise shutdown_error
+    if cancellation_received:
+        raise asyncio.CancelledError
+
+
 async def wait_for_ytdl_interval(
     minimum_interval_seconds: float | None = None,
+    *,
+    on_interval_reserved: Callable[[], None] | None = None,
 ) -> None:
     global ytdl_last_request_started_at
     interval_seconds = (
@@ -430,6 +549,8 @@ async def wait_for_ytdl_interval(
         delay = max(0.0, interval_seconds - elapsed)
         if delay > 0:
             await asyncio.sleep(delay)
+        if on_interval_reserved is not None:
+            on_interval_reserved()
         ytdl_last_request_started_at = time.monotonic()
 
 
@@ -441,6 +562,16 @@ async def wait_for_youtube_music_interval() -> None:
         if delay > 0:
             await asyncio.sleep(delay)
         youtube_music_last_request_started_at = time.monotonic()
+
+
+async def wait_for_youtube_subtitle_interval() -> None:
+    global youtube_subtitle_last_request_started_at
+    async with youtube_subtitle_rate_lock:
+        elapsed = time.monotonic() - youtube_subtitle_last_request_started_at
+        delay = max(0.0, YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS - elapsed)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        youtube_subtitle_last_request_started_at = time.monotonic()
 
 
 async def stop_ytdl_worker(process: asyncio.subprocess.Process) -> None:
@@ -462,15 +593,92 @@ async def stop_ytdl_worker(process: asyncio.subprocess.Process) -> None:
     await process.wait()
 
 
-def classify_ytdl_job(label: str) -> tuple[str, str]:
-    normalized = label.casefold()
-    if "audio stream" in normalized:
-        return "playback", "high"
-    if "auto" in normalized or "radio" in normalized:
-        return "autoplay", "background"
-    if "playlist" in normalized or "album" in normalized:
-        return "bulk", "normal"
-    return "search", "normal"
+async def wait_for_task_completion_despite_cancellation(
+    task: asyncio.Task,
+) -> tuple[bool, BaseException | None]:
+    cancellation_received = False
+    current_task = asyncio.current_task()
+    observed_cancellations = (
+        current_task.cancelling() if current_task is not None else 0
+    )
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            current_cancellations = (
+                current_task.cancelling() if current_task is not None else 0
+            )
+            if current_cancellations > observed_cancellations or not task.done():
+                cancellation_received = True
+            observed_cancellations = current_cancellations
+        except BaseException:
+            break
+
+    if task.cancelled():
+        return cancellation_received, asyncio.CancelledError()
+    return cancellation_received, task.exception()
+
+
+async def cleanup_ytdl_process(
+    process: asyncio.subprocess.Process,
+    communication: asyncio.Task[tuple[bytes, bytes]],
+) -> None:
+    try:
+        await stop_ytdl_worker(process)
+    finally:
+        if not communication.done():
+            communication.cancel()
+        await asyncio.gather(communication, return_exceptions=True)
+
+
+async def finish_ytdl_process_cleanup(
+    process: asyncio.subprocess.Process,
+    communication: asyncio.Task[tuple[bytes, bytes]],
+) -> bool:
+    cleanup_task = asyncio.create_task(
+        cleanup_ytdl_process(process, communication)
+    )
+    cancellation_received, cleanup_error = (
+        await wait_for_task_completion_despite_cancellation(cleanup_task)
+    )
+    if cleanup_error is not None and not isinstance(
+        cleanup_error,
+        asyncio.CancelledError,
+    ):
+        logger.warning(
+            "Failed to finish yt-dlp subprocess cleanup: %s",
+            cleanup_error,
+        )
+    return cancellation_received
+
+
+class YtdlJobKind(IntEnum):
+    PLAYBACK_STREAM = 0
+    USER_REQUEST = 10
+    PLAYLIST_ALBUM = 20
+    AUTOPLAY = 30
+    LYRICS_FALLBACK = 40
+
+    @property
+    def log_name(self) -> str:
+        return self.name.casefold()
+
+
+@dataclass
+class YtdlQueueJob:
+    sequence: int
+    options: dict
+    query: str
+    label: str
+    job_kind: YtdlJobKind
+    minimum_interval_seconds: float | None
+    enqueued_at: float
+    deadline: float
+    future: asyncio.Future[dict]
+    execution_task: asyncio.Task[dict] | None = None
+    rate_slot_reserved: bool = False
+    worker_started: bool = False
+    defer_requested: bool = False
 
 
 async def run_ytdl_worker(
@@ -514,17 +722,16 @@ async def run_ytdl_worker(
             )
         except asyncio.TimeoutError:
             status = "timeout"
-            await stop_ytdl_worker(process)
-            if not communication.done():
-                communication.cancel()
-            await asyncio.gather(communication, return_exceptions=True)
+            cancelled_during_cleanup = await finish_ytdl_process_cleanup(
+                process,
+                communication,
+            )
+            if cancelled_during_cleanup:
+                raise asyncio.CancelledError
             raise
         except asyncio.CancelledError:
             status = "cancelled"
-            await stop_ytdl_worker(process)
-            if not communication.done():
-                communication.cancel()
-            await asyncio.gather(communication, return_exceptions=True)
+            await finish_ytdl_process_cleanup(process, communication)
             raise
 
         response_bytes = len(stdout)
@@ -564,14 +771,299 @@ async def run_ytdl_worker(
         )
 
 
+class YtdlPriorityScheduler:
+    def __init__(self, max_concurrency: int = 1) -> None:
+        self.max_concurrency = max(1, max_concurrency)
+        self.queue: asyncio.PriorityQueue[tuple[int, int, YtdlQueueJob]] = (
+            asyncio.PriorityQueue()
+        )
+        self.sequence = 0
+        self.worker_tasks: set[asyncio.Task[None]] = set()
+        self.active_jobs: dict[int, YtdlQueueJob] = {}
+        self.closed = False
+
+    def _ensure_workers(self) -> None:
+        completed_tasks = {
+            task for task in self.worker_tasks if task.done()
+        }
+        self.worker_tasks.difference_update(completed_tasks)
+        available_slots = self.max_concurrency - len(self.worker_tasks)
+        worker_count = min(available_slots, self.queue.qsize())
+        for _ in range(worker_count):
+            task = asyncio.create_task(self._worker_loop())
+            self.worker_tasks.add(task)
+            task.add_done_callback(self._worker_done)
+
+    def _worker_done(self, task: asyncio.Task[None]) -> None:
+        self.worker_tasks.discard(task)
+        if not self.closed and not self.queue.empty():
+            self._ensure_workers()
+
+    @staticmethod
+    def _request_execution_cancel(task: asyncio.Task[dict] | None) -> None:
+        if task is not None and not task.done() and task.cancelling() == 0:
+            task.cancel()
+
+    @classmethod
+    async def _cancel_execution_once(
+        cls,
+        task: asyncio.Task[dict] | None,
+    ) -> bool:
+        if task is None or task.done():
+            return False
+        cls._request_execution_cancel(task)
+        cancellation_received, _ = (
+            await wait_for_task_completion_despite_cancellation(task)
+        )
+        return cancellation_received
+
+    async def submit(
+        self,
+        options: dict,
+        query: str,
+        label: str,
+        *,
+        job_kind: YtdlJobKind,
+        timeout_seconds: float,
+        minimum_interval_seconds: float | None,
+    ) -> dict:
+        if self.closed:
+            raise RuntimeError("yt-dlp scheduler is closed.")
+
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        future: asyncio.Future[dict] = loop.create_future()
+        job = YtdlQueueJob(
+            sequence=self.sequence,
+            options=options,
+            query=query,
+            label=label,
+            job_kind=job_kind,
+            minimum_interval_seconds=minimum_interval_seconds,
+            enqueued_at=now,
+            deadline=now + max(0.1, timeout_seconds),
+            future=future,
+        )
+        self.sequence += 1
+        self.queue.put_nowait((int(job_kind), job.sequence, job))
+        self._defer_waiting_lower_priority_jobs(job_kind)
+        self._ensure_workers()
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(future),
+                timeout=max(0.1, timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            timed_out_while_pending = not future.done()
+            if timed_out_while_pending:
+                future.cancel()
+            execution_task = job.execution_task
+            cancelled_during_cleanup = False
+            if not self.closed:
+                cancelled_during_cleanup = await self._cancel_execution_once(
+                    execution_task
+                )
+            if timed_out_while_pending and not job.worker_started:
+                self._log_pre_worker_exit(
+                    job,
+                    "queue_timeout",
+                    loop.time() - job.enqueued_at,
+                )
+            if cancelled_during_cleanup:
+                raise asyncio.CancelledError
+            raise
+        except asyncio.CancelledError:
+            future.cancel()
+            execution_task = job.execution_task
+            if not self.closed:
+                await self._cancel_execution_once(execution_task)
+            raise
+
+    def _defer_waiting_lower_priority_jobs(
+        self,
+        incoming_kind: YtdlJobKind,
+    ) -> None:
+        for active_job in self.active_jobs.values():
+            execution_task = active_job.execution_task
+            if (
+                active_job.job_kind > incoming_kind
+                and not active_job.rate_slot_reserved
+                and not active_job.worker_started
+                and not active_job.defer_requested
+                and execution_task is not None
+                and not execution_task.done()
+            ):
+                # Rate-limit waits are interruptible; a subprocess already running is not.
+                active_job.defer_requested = True
+                self._request_execution_cancel(execution_task)
+
+    async def _worker_loop(self) -> None:
+        while not self.closed:
+            try:
+                _, _, job = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+            try:
+                await self._run_job(job)
+            finally:
+                self.queue.task_done()
+
+    async def _run_job(self, job: YtdlQueueJob) -> None:
+        if job.future.cancelled():
+            logger.debug("Skipped cancelled yt-dlp job: %s", job.label)
+            return
+
+        loop = asyncio.get_running_loop()
+        queue_wait_seconds = loop.time() - job.enqueued_at
+        if loop.time() >= job.deadline:
+            self._log_pre_worker_exit(job, "queue_timeout", queue_wait_seconds)
+            job.future.set_exception(asyncio.TimeoutError())
+            return
+
+        execution_task = asyncio.create_task(
+            self._execute_job(job, queue_wait_seconds)
+        )
+        job.execution_task = execution_task
+        self.active_jobs[id(job)] = job
+        try:
+            info = await execution_task
+        except asyncio.CancelledError:
+            if (
+                job.defer_requested
+                and not self.closed
+                and not job.future.done()
+            ):
+                job.defer_requested = False
+                job.rate_slot_reserved = False
+                self.queue.put_nowait((int(job.job_kind), job.sequence, job))
+                return
+            if not job.future.done():
+                job.future.cancel()
+            return
+        except asyncio.TimeoutError as error:
+            if not job.worker_started:
+                self._log_pre_worker_exit(job, "timeout", queue_wait_seconds)
+            if not job.future.done():
+                job.future.set_exception(error)
+        except Exception as error:
+            trip_youtube_circuit(error)
+            if not job.worker_started:
+                self._log_pre_worker_exit(job, "failure", queue_wait_seconds)
+            if not job.future.done():
+                job.future.set_exception(error)
+        else:
+            if not job.future.done():
+                job.future.set_result(info)
+        finally:
+            self.active_jobs.pop(id(job), None)
+            job.execution_task = None
+
+    async def _execute_job(
+        self,
+        job: YtdlQueueJob,
+        queue_wait_seconds: float,
+    ) -> dict:
+        ensure_youtube_circuit_closed()
+        loop = asyncio.get_running_loop()
+        remaining_timeout = job.deadline - loop.time()
+        if remaining_timeout <= 0:
+            raise asyncio.TimeoutError
+
+        await asyncio.wait_for(
+            wait_for_ytdl_interval(
+                job.minimum_interval_seconds,
+                on_interval_reserved=lambda: setattr(
+                    job,
+                    "rate_slot_reserved",
+                    True,
+                ),
+            ),
+            timeout=remaining_timeout,
+        )
+        ensure_youtube_circuit_closed()
+        remaining_timeout = job.deadline - loop.time()
+        if remaining_timeout <= 0:
+            raise asyncio.TimeoutError
+
+        job.worker_started = True
+        return await run_ytdl_worker(
+            job.options,
+            job.query,
+            remaining_timeout,
+            label=job.label,
+            job_kind=job.job_kind.log_name,
+            priority=str(int(job.job_kind)),
+            queue_wait_seconds=queue_wait_seconds,
+        )
+
+    @staticmethod
+    def _log_pre_worker_exit(
+        job: YtdlQueueJob,
+        status: str,
+        queue_wait_seconds: float,
+    ) -> None:
+        logger.warning(
+            "yt-dlp job: label=%s kind=%s priority=%s status=%s "
+            "queue_wait=%.3fs worker=0.000s response_bytes=0",
+            job.label,
+            job.job_kind.log_name,
+            int(job.job_kind),
+            status,
+            queue_wait_seconds,
+        )
+
+    async def shutdown(self) -> None:
+        if self.closed and not self.worker_tasks:
+            return
+        self.closed = True
+
+        while True:
+            try:
+                _, _, job = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not job.future.done():
+                job.future.cancel()
+            self.queue.task_done()
+
+        execution_tasks: list[asyncio.Task[dict]] = []
+        for job in list(self.active_jobs.values()):
+            if not job.future.done():
+                job.future.cancel()
+            if job.execution_task and not job.execution_task.done():
+                self._request_execution_cancel(job.execution_task)
+                execution_tasks.append(job.execution_task)
+
+        workers = list(self.worker_tasks)
+        cancellation_received = False
+        for task in [*execution_tasks, *workers]:
+            task_cancelled, _ = (
+                await wait_for_task_completion_despite_cancellation(task)
+            )
+            cancellation_received = cancellation_received or task_cancelled
+        self.active_jobs.clear()
+        self.worker_tasks.clear()
+        if cancellation_received:
+            raise asyncio.CancelledError
+
+
+ytdl_scheduler = YtdlPriorityScheduler(YTDL_MAX_CONCURRENT_EXTRACTIONS)
+
+
 async def extract_ytdl_info(
     options: dict,
     query: str,
     label: str,
     *,
+    job_kind: YtdlJobKind,
     use_cache: bool = True,
     minimum_interval_seconds: float | None = None,
 ) -> dict:
+    if bot_shutdown_started:
+        raise asyncio.CancelledError
+
     cache_key = get_ytdl_cache_key(options, query)
     if use_cache:
         cached = await get_cached_ytdl_info(cache_key)
@@ -580,44 +1072,18 @@ async def extract_ytdl_info(
             return cached
 
     ensure_youtube_circuit_closed()
-    job_kind, priority = classify_ytdl_job(label)
     logger.debug("yt-dlp query for %s: %s", label, query)
 
     loop = asyncio.get_running_loop()
     started_at = loop.time()
-    queue_started_at = loop.time()
     try:
-        await asyncio.wait_for(
-            ytdl_semaphore.acquire(),
-            timeout=YTDL_EXTRACT_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            "yt-dlp job: label=%s kind=%s priority=%s status=queue_timeout "
-            "queue_wait=%.3fs worker=0.000s response_bytes=0",
-            label,
-            job_kind,
-            priority,
-            loop.time() - queue_started_at,
-        )
-        raise
-
-    queue_wait_seconds = loop.time() - queue_started_at
-    try:
-        ensure_youtube_circuit_closed()
-        await wait_for_ytdl_interval(minimum_interval_seconds)
-        remaining_timeout = max(
-            0.1,
-            YTDL_EXTRACT_TIMEOUT_SECONDS - (loop.time() - started_at),
-        )
-        info = await run_ytdl_worker(
+        info = await ytdl_scheduler.submit(
             options,
             query,
-            remaining_timeout,
-            label=label,
+            label,
             job_kind=job_kind,
-            priority=priority,
-            queue_wait_seconds=queue_wait_seconds,
+            timeout_seconds=YTDL_EXTRACT_TIMEOUT_SECONDS,
+            minimum_interval_seconds=minimum_interval_seconds,
         )
     except asyncio.TimeoutError:
         logger.warning(
@@ -629,8 +1095,6 @@ async def extract_ytdl_info(
     except Exception as error:
         trip_youtube_circuit(error)
         raise
-    finally:
-        ytdl_semaphore.release()
 
     stamp_ytdl_info(info, loop.time())
     if use_cache:
@@ -720,7 +1184,9 @@ async def cache_youtube_music_results(query: str, results: list[dict]) -> None:
             youtube_music_cache.popitem(last=False)
 
 
-async def search_youtube_music(query: str) -> list[dict]:
+async def _search_youtube_music_operation(query: str) -> list[dict]:
+    if bot_shutdown_started:
+        raise asyncio.CancelledError
     if not YOUTUBE_MUSIC_SEARCH_ENABLED:
         return []
 
@@ -743,7 +1209,7 @@ async def search_youtube_music(query: str) -> list[dict]:
     started_at = loop.time()
     try:
         await asyncio.wait_for(
-            ytdl_semaphore.acquire(),
+            auxiliary_network_semaphore.acquire(),
             timeout=YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
@@ -753,14 +1219,18 @@ async def search_youtube_music(query: str) -> list[dict]:
     try:
         ensure_youtube_circuit_closed()
         await wait_for_youtube_music_interval()
+        ensure_youtube_circuit_closed()
+        ensure_auxiliary_workers_open()
     except BaseException:
-        ytdl_semaphore.release()
+        auxiliary_network_semaphore.release()
         raise
 
-    worker = asyncio.create_task(asyncio.to_thread(search))
+    worker = track_auxiliary_worker(
+        asyncio.create_task(asyncio.to_thread(search))
+    )
 
     def search_finished(task: asyncio.Task[list[dict]]) -> None:
-        ytdl_semaphore.release()
+        auxiliary_network_semaphore.release()
         if task.cancelled():
             return
         error = task.exception()
@@ -791,6 +1261,16 @@ async def search_youtube_music(query: str) -> list[dict]:
     await cache_youtube_music_results(query, results)
     logger.info("YouTube Music search done: %s result(s)", len(results))
     return results
+
+
+async def search_youtube_music(query: str) -> list[dict]:
+    if bot_shutdown_started:
+        raise asyncio.CancelledError
+    operation_task = track_auxiliary_operation()
+    try:
+        return await _search_youtube_music_operation(query)
+    finally:
+        auxiliary_operation_tasks.discard(operation_task)
 
 
 def ffmpeg_is_available() -> bool:
@@ -954,7 +1434,158 @@ intents = discord.Intents.default()
 intents.voice_states = True
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+
+def track_voice_operation() -> asyncio.Task:
+    if bot_shutdown_started:
+        raise asyncio.CancelledError
+    task = asyncio.current_task()
+    if task is None:
+        raise RuntimeError("Voice operation requires an asyncio task.")
+    voice_operation_tasks.add(task)
+    return task
+
+
+async def shutdown_voice_operations() -> None:
+    cancellation_received = False
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        voice_operation_tasks.discard(current_task)
+
+    while voice_operation_tasks:
+        tasks = list(voice_operation_tasks)
+        for task in tasks:
+            if task.done():
+                voice_operation_tasks.discard(task)
+                continue
+            if task.cancelling() == 0:
+                task.cancel()
+            task_cancelled, _ = (
+                await wait_for_task_completion_despite_cancellation(task)
+            )
+            cancellation_received = cancellation_received or task_cancelled
+            voice_operation_tasks.discard(task)
+
+    if cancellation_received:
+        raise asyncio.CancelledError
+
+
+async def cancel_music_background_tasks_for_shutdown() -> None:
+    cancellation_received = False
+    for state in list(music_states.values()):
+        state.playback_generation += 1
+        state.stop_requested = True
+        clear_pending_playback_advance(state)
+        voice = state.voice
+        if voice and (voice.is_playing() or voice.is_paused()):
+            try:
+                voice.stop()
+            except Exception:
+                logger.warning(
+                    "Failed to stop voice playback during shutdown",
+                    exc_info=True,
+                )
+
+    while True:
+        tracked_tasks: list[tuple[GuildMusicState, str, asyncio.Task]] = []
+        queue_tasks: list[tuple[GuildMusicState, int, asyncio.Task]] = []
+        seen_tasks: set[asyncio.Task] = set()
+        for state in list(music_states.values()):
+            for attribute in (
+                "advance_task",
+                "noncritical_task",
+                "autoplay_task",
+                "lyrics_task",
+                "empty_channel_task",
+            ):
+                task = getattr(state, attribute)
+                if task is None:
+                    continue
+                if task.done():
+                    if getattr(state, attribute) is task:
+                        setattr(state, attribute, None)
+                    continue
+                if task in seen_tasks:
+                    continue
+                seen_tasks.add(task)
+                tracked_tasks.append((state, attribute, task))
+                if task.cancelling() == 0:
+                    task.cancel()
+
+            for message_id, task in list(state.queue_cleanup_tasks.items()):
+                if task.done():
+                    if state.queue_cleanup_tasks.get(message_id) is task:
+                        state.queue_cleanup_tasks.pop(message_id, None)
+                    continue
+                if task in seen_tasks:
+                    continue
+                seen_tasks.add(task)
+                queue_tasks.append((state, message_id, task))
+                if task.cancelling() == 0:
+                    task.cancel()
+
+        if not tracked_tasks and not queue_tasks:
+            break
+
+        for state, attribute, task in tracked_tasks:
+            task_cancelled, _ = (
+                await wait_for_task_completion_despite_cancellation(task)
+            )
+            cancellation_received = cancellation_received or task_cancelled
+            if getattr(state, attribute) is task:
+                setattr(state, attribute, None)
+
+        for state, message_id, task in queue_tasks:
+            task_cancelled, _ = (
+                await wait_for_task_completion_despite_cancellation(task)
+            )
+            cancellation_received = cancellation_received or task_cancelled
+            if state.queue_cleanup_tasks.get(message_id) is task:
+                state.queue_cleanup_tasks.pop(message_id, None)
+
+    if cancellation_received:
+        raise asyncio.CancelledError
+
+
+class MusicBot(commands.Bot):
+    _discord_close_task: asyncio.Task[None] | None = None
+
+    async def _shutdown_discord_client(self) -> None:
+        if self._discord_close_task is None:
+            self._discord_close_task = asyncio.create_task(super().close())
+        cancellation_received, close_error = (
+            await wait_for_task_completion_despite_cancellation(
+                self._discord_close_task
+            )
+        )
+        if close_error is not None:
+            raise close_error
+        if cancellation_received:
+            raise asyncio.CancelledError
+
+    async def close(self) -> None:
+        begin_bot_shutdown()
+        try:
+            try:
+                try:
+                    try:
+                        await cancel_music_background_tasks_for_shutdown()
+                    finally:
+                        await shutdown_voice_operations()
+                finally:
+                    await shutdown_auxiliary_operations()
+            finally:
+                await ytdl_scheduler.shutdown()
+        finally:
+            try:
+                await shutdown_auxiliary_workers()
+            finally:
+                try:
+                    await shutdown_lyrics_executor()
+                finally:
+                    await self._shutdown_discord_client()
+
+
+bot = MusicBot(command_prefix="!", intents=intents)
 music_states: dict[int, GuildMusicState] = {}
 configured_music_channels: dict[int, int] = {}
 configured_control_messages: dict[int, int] = {}
@@ -1054,7 +1685,8 @@ def schedule_private_lyrics_cleanup(
         messages = state.private_lyrics_messages.pop(track_id, [])
 
     for message in messages:
-        asyncio.create_task(delete_private_interaction_message(message))
+        if not bot_shutdown_started:
+            asyncio.create_task(delete_private_interaction_message(message))
 
 
 async def delete_queue_message_after(
@@ -1082,7 +1714,7 @@ def schedule_queue_message_cleanup(
     message: discord.InteractionMessage | None,
     delay_seconds: float,
 ) -> asyncio.Task[None] | None:
-    if message is None:
+    if bot_shutdown_started or message is None:
         return None
     message_id = getattr(message, "id", None)
     if not isinstance(message_id, int):
@@ -2387,6 +3019,7 @@ async def extract_first_info(
                     YTDL_OPTIONS,
                     music_entry["webpage_url"],
                     "YouTube Music catalog song resolve",
+                    job_kind=YtdlJobKind.USER_REQUEST,
                 )
             except YouTubeCircuitOpenError:
                 raise
@@ -2409,7 +3042,12 @@ async def extract_first_info(
             )
 
     try:
-        info = await extract_ytdl_info(options, search_query, "YouTube search")
+        info = await extract_ytdl_info(
+            options,
+            search_query,
+            "YouTube search",
+            job_kind=YtdlJobKind.USER_REQUEST,
+        )
     except asyncio.TimeoutError:
         raise ValueError(f"Timed out while searching for '{query}'.") from None
 
@@ -4073,6 +4711,8 @@ def request_youtube_subtitle(url: str, extension: str) -> str | None:
 
 
 async def run_lyrics_job(function: Callable[..., T], *args: object) -> T:
+    if lyrics_executor_closing:
+        raise asyncio.CancelledError
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         lyrics_executor,
@@ -4080,12 +4720,14 @@ async def run_lyrics_job(function: Callable[..., T], *args: object) -> T:
     )
 
 
-async def get_selected_youtube_subtitle(
+async def _get_selected_youtube_subtitle_operation(
     track: Track,
     selected: tuple[str, str, str] | None,
     *,
     purpose: str,
 ) -> str | None:
+    if bot_shutdown_started:
+        raise asyncio.CancelledError
     if selected is None:
         return None
 
@@ -4094,7 +4736,7 @@ async def get_selected_youtube_subtitle(
     ensure_youtube_circuit_closed()
     try:
         await asyncio.wait_for(
-            ytdl_semaphore.acquire(),
+            auxiliary_network_semaphore.acquire(),
             timeout=LYRICS_REQUEST_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError as error:
@@ -4102,9 +4744,31 @@ async def get_selected_youtube_subtitle(
 
     try:
         ensure_youtube_circuit_closed()
-        await wait_for_ytdl_interval()
+        await wait_for_youtube_subtitle_interval()
+        ensure_youtube_circuit_closed()
+        ensure_auxiliary_workers_open()
+    except BaseException:
+        auxiliary_network_semaphore.release()
+        raise
+
+    worker = track_auxiliary_worker(
+        asyncio.create_task(
+            run_lyrics_job(request_youtube_subtitle, url, extension)
+        )
+    )
+
+    def subtitle_finished(task: asyncio.Task[str | None]) -> None:
+        auxiliary_network_semaphore.release()
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            trip_youtube_circuit(error)
+
+    worker.add_done_callback(subtitle_finished)
+    try:
         lyrics = await asyncio.wait_for(
-            run_lyrics_job(request_youtube_subtitle, url, extension),
+            asyncio.shield(worker),
             timeout=LYRICS_REQUEST_TIMEOUT_SECONDS + 2,
         )
     except Exception as error:
@@ -4112,8 +4776,6 @@ async def get_selected_youtube_subtitle(
         if isinstance(error, YouTubeCircuitOpenError):
             raise
         raise YouTubeSubtitleError(str(error)) from error
-    finally:
-        ytdl_semaphore.release()
 
     if lyrics:
         logger.info(
@@ -4123,6 +4785,27 @@ async def get_selected_youtube_subtitle(
             purpose,
         )
     return lyrics
+
+
+async def get_selected_youtube_subtitle(
+    track: Track,
+    selected: tuple[str, str, str] | None,
+    *,
+    purpose: str,
+) -> str | None:
+    if bot_shutdown_started:
+        raise asyncio.CancelledError
+    if selected is None:
+        return None
+    operation_task = track_auxiliary_operation()
+    try:
+        return await _get_selected_youtube_subtitle_operation(
+            track,
+            selected,
+            purpose=purpose,
+        )
+    finally:
+        auxiliary_operation_tasks.discard(operation_task)
 
 
 async def get_youtube_manual_lyrics(track: Track) -> str | None:
@@ -4732,7 +5415,7 @@ def schedule_lyrics_message_cleanup(guild_id: int, state: GuildMusicState) -> No
     message = state.lyrics_message
     state.lyrics_message = None
     replace_lyrics_view(state, None)
-    if message is not None:
+    if message is not None and not bot_shutdown_started:
         asyncio.create_task(delete_music_channel_message(guild_id, message))
 
 
@@ -5035,7 +5718,9 @@ async def upsert_lyrics_message(
 def schedule_lyrics_publish(
     guild_id: int,
     track: Track,
-) -> tuple[asyncio.Task[None], bool]:
+) -> tuple[asyncio.Task[None] | None, bool]:
+    if bot_shutdown_started:
+        return None, False
     state = get_state(guild_id)
     if state.lyrics_task and not state.lyrics_task.done():
         if state.current is track:
@@ -5286,6 +5971,7 @@ async def resolve_track_stream(track: Track) -> None:
         YTDL_OPTIONS,
         track.source_url,
         "audio stream resolve",
+        job_kind=YtdlJobKind.PLAYBACK_STREAM,
         use_cache=False,
         minimum_interval_seconds=0.0,
     )
@@ -5335,7 +6021,10 @@ async def extract_tracks(
 ) -> list[Track]:
     resolved_query = resolve_query(query, search_kind)
     info = await extract_ytdl_info(
-        YTDL_PLAYLIST_OPTIONS, resolved_query, "playlist or album search"
+        YTDL_PLAYLIST_OPTIONS,
+        resolved_query,
+        "playlist or album search",
+        job_kind=YtdlJobKind.PLAYLIST_ALBUM,
     )
 
     if is_playlist_search_url(resolved_query):
@@ -5345,7 +6034,10 @@ async def extract_tracks(
 
         first_result_url = get_playlist_result_url(search_entries[0])
         info = await extract_ytdl_info(
-            YTDL_PLAYLIST_OPTIONS, first_result_url, "playlist or album resolve"
+            YTDL_PLAYLIST_OPTIONS,
+            first_result_url,
+            "playlist or album resolve",
+            job_kind=YtdlJobKind.PLAYLIST_ALBUM,
         )
 
     entries = [entry for entry in info.get("entries", []) if entry]
@@ -5365,13 +6057,36 @@ def build_youtube_radio_url(track: Track) -> str | None:
     return f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
 
 
+def get_autoplay_search_limit(
+    count: int,
+    job_kind: YtdlJobKind,
+) -> int:
+    auto_count = clamp_auto_count(count)
+    if job_kind == YtdlJobKind.AUTOPLAY:
+        return auto_count
+    return auto_count * 3
+
+
+def get_autoplay_playlist_options(count: int) -> dict:
+    return {
+        **YTDL_PLAYLIST_OPTIONS,
+        "playlistend": clamp_auto_count(count),
+    }
+
+
 async def extract_auto_tracks_from_seed(
     seed_track: Track,
     requester: str,
     count: int,
     requester_id: int | None = None,
+    *,
+    job_kind: YtdlJobKind = YtdlJobKind.USER_REQUEST,
 ) -> list[Track]:
     auto_count = clamp_auto_count(count)
+    if auto_count == 1:
+        return [seed_track]
+
+    search_limit = get_autoplay_search_limit(auto_count, job_kind)
 
     entries: list[dict] = []
     fallback_url = seed_track.webpage_url or seed_track.source_url
@@ -5380,19 +6095,23 @@ async def extract_auto_tracks_from_seed(
         fallback_url = radio_url
         try:
             radio_info = await extract_ytdl_info(
-                YTDL_PLAYLIST_OPTIONS, radio_url, "YouTube radio mix"
+                get_autoplay_playlist_options(auto_count),
+                radio_url,
+                "YouTube radio mix",
+                job_kind=job_kind,
             )
             entries = [entry for entry in radio_info.get("entries", []) if entry]
         except Exception:
             logger.exception("Failed to extract YouTube radio mix for %s", seed_track.title)
 
     if not entries:
-        search_query = f"ytsearch{auto_count * 3}:{seed_track.title} radio mix"
+        search_query = f"ytsearch{search_limit}:{seed_track.title} radio mix"
         fallback_url = search_query
         info = await extract_ytdl_info(
             YTDL_SEARCH_OPTIONS,
             search_query,
             "auto fallback search",
+            job_kind=job_kind,
         )
         entries = [entry for entry in info.get("entries", []) if entry]
 
@@ -5418,11 +6137,12 @@ async def extract_auto_tracks_from_seed(
             break
 
     if len(tracks) < auto_count and fallback_url.startswith("https://www.youtube.com/watch"):
-        search_query = f"ytsearch{auto_count * 3}:{seed_track.title} radio mix"
+        search_query = f"ytsearch{search_limit}:{seed_track.title} radio mix"
         info = await extract_ytdl_info(
             YTDL_SEARCH_OPTIONS,
             search_query,
             "auto supplemental search",
+            job_kind=job_kind,
         )
         for entry in [entry for entry in info.get("entries", []) if entry]:
             track = make_track_from_info(entry, requester, search_query, requester_id)
@@ -5454,6 +6174,7 @@ async def extract_auto_tracks(
         requester,
         count,
         requester_id,
+        job_kind=YtdlJobKind.USER_REQUEST,
     )
 
 
@@ -5528,6 +6249,8 @@ def get_autoplay_retry_delay(failure_count: int) -> int:
 def schedule_autoplay_refill(
     guild_id: int,
 ) -> tuple[asyncio.Task[None] | None, bool]:
+    if bot_shutdown_started:
+        return None, False
     state = get_state(guild_id)
     if not autoplay_can_refill(state, state.playback_generation):
         return None, False
@@ -5561,7 +6284,7 @@ async def refill_autoplay_queue(
     initial_seed_keys = get_track_identity_keys(fallback_seed)
     added_track = False
     failure_count = 0
-    candidate_count = clamp_auto_count(max(DEFAULT_AUTO_TRACKS, 5))
+    candidate_count = clamp_auto_count(AUTOPLAY_REFILL_CANDIDATES)
 
     try:
         while autoplay_can_refill(state, generation):
@@ -5572,6 +6295,7 @@ async def refill_autoplay_queue(
                     seed,
                     "자동재생",
                     candidate_count,
+                    job_kind=YtdlJobKind.AUTOPLAY,
                 )
             except asyncio.CancelledError:
                 raise
@@ -5665,7 +6389,11 @@ async def refill_autoplay_queue(
         if state.autoplay_task is current_task:
             state.autoplay_task = None
             current_track_id = state.current.track_id if state.current else None
-            if added_track and current_track_id != starting_track_id:
+            if (
+                not bot_shutdown_started
+                and added_track
+                and current_track_id != starting_track_id
+            ):
                 schedule_autoplay_refill(guild_id)
 
 
@@ -5679,7 +6407,9 @@ def cancel_noncritical_tasks(state: GuildMusicState) -> None:
 def schedule_noncritical_tasks(
     guild_id: int,
     track: Track,
-) -> tuple[asyncio.Task[None], bool]:
+) -> tuple[asyncio.Task[None] | None, bool]:
+    if bot_shutdown_started:
+        return None, False
     state = get_state(guild_id)
     if state.noncritical_task and not state.noncritical_task.done():
         return state.noncritical_task, False
@@ -5787,6 +6517,8 @@ async def use_connected_voice(
     channel: discord.abc.Connectable,
     state: GuildMusicState,
 ) -> tuple[bool, str | None]:
+    if bot_shutdown_started:
+        return False, "The bot is shutting down."
     if voice.channel == channel:
         return True, None
     if state.current or state.queue or voice.is_playing() or voice.is_paused():
@@ -5795,16 +6527,59 @@ async def use_connected_voice(
             f"봇이 이미 {voice.channel.mention}에서 재생 중이에요. "
             "같은 음성 채널에 들어와 주세요.",
         )
+    if bot_shutdown_started:
+        return False, "The bot is shutting down."
     await voice.move_to(channel)
+    if bot_shutdown_started:
+        return False, "The bot is shutting down."
     return True, None
 
 
-async def ensure_voice_channel(
+async def cleanup_voice_connected_during_shutdown(
+    voice: discord.VoiceProtocol,
+) -> None:
+    async def cleanup() -> None:
+        try:
+            await asyncio.wait_for(
+                voice.disconnect(force=True),
+                timeout=VOICE_DISCONNECT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Timed out disconnecting a late voice connection")
+        except Exception:
+            logger.warning(
+                "Failed to disconnect a late voice connection",
+                exc_info=True,
+            )
+        finally:
+            cleanup_callback = getattr(voice, "cleanup", None)
+            if callable(cleanup_callback):
+                try:
+                    cleanup_callback()
+                except Exception:
+                    logger.warning(
+                        "Failed to clean up a late voice connection",
+                        exc_info=True,
+                    )
+
+    cleanup_task = asyncio.create_task(cleanup())
+    cancellation_received, cleanup_error = (
+        await wait_for_task_completion_despite_cancellation(cleanup_task)
+    )
+    if cleanup_error is not None:
+        raise cleanup_error
+    if cancellation_received:
+        raise asyncio.CancelledError
+
+
+async def _ensure_voice_channel(
     guild: discord.Guild,
     channel: discord.abc.Connectable,
     state: GuildMusicState,
 ) -> tuple[bool, str | None]:
     async with state.voice_connect_lock:
+        if bot_shutdown_started:
+            return False, "The bot is shutting down."
         for attempt in range(2):
             registered_voice = getattr(guild, "voice_client", None)
             if registered_voice is not None:
@@ -5831,6 +6606,8 @@ async def ensure_voice_channel(
                     )
                     return False, "음성 채널 이동에 실패했어요. 잠시 후 다시 시도해 주세요."
 
+            if bot_shutdown_started:
+                return False, "The bot is shutting down."
             try:
                 voice = await channel.connect()
             except discord.ClientException as error:
@@ -5854,10 +6631,27 @@ async def ensure_voice_channel(
                 )
                 return False, "음성 채널 연결에 실패했어요. 잠시 후 다시 시도해 주세요."
 
+            if bot_shutdown_started:
+                await cleanup_voice_connected_during_shutdown(voice)
+                return False, "The bot is shutting down."
             state.voice = voice
             return True, None
 
     return False, "음성 채널 연결에 실패했어요. 잠시 후 다시 시도해 주세요."
+
+
+async def ensure_voice_channel(
+    guild: discord.Guild,
+    channel: discord.abc.Connectable,
+    state: GuildMusicState,
+) -> tuple[bool, str | None]:
+    if bot_shutdown_started:
+        return False, "The bot is shutting down."
+    operation_task = track_voice_operation()
+    try:
+        return await _ensure_voice_channel(guild, channel, state)
+    finally:
+        voice_operation_tasks.discard(operation_task)
 
 
 async def ensure_voice(interaction: discord.Interaction, state: GuildMusicState) -> bool:
@@ -5978,6 +6772,8 @@ async def disconnect_from_empty_channel(guild_id: int, channel_id: int) -> None:
 
 
 def update_empty_channel_disconnect(state: GuildMusicState, guild_id: int) -> None:
+    if bot_shutdown_started:
+        return
     voice = state.voice
     if voice is None or not voice.is_connected():
         cancel_empty_channel_disconnect(state)
@@ -5999,7 +6795,9 @@ def schedule_play_next(
     guild_id: int,
     *,
     announce: bool = True,
-) -> tuple[asyncio.Task[None], bool]:
+) -> tuple[asyncio.Task[None] | None, bool]:
+    if bot_shutdown_started:
+        return None, False
     state = get_state(guild_id)
     if state.advance_task and not state.advance_task.done():
         return state.advance_task, False
@@ -6026,7 +6824,7 @@ def complete_pending_playback_advance(
     generation = state.pending_advance_generation
     announce = state.pending_advance_announce
     clear_pending_playback_advance(state)
-    if generation != state.playback_generation:
+    if bot_shutdown_started or generation != state.playback_generation:
         return
     if announce:
         schedule_play_next(guild_id)
@@ -6040,6 +6838,8 @@ def schedule_play_next_after_current(
     *,
     announce: bool = True,
 ) -> tuple[asyncio.Task[None] | None, bool]:
+    if bot_shutdown_started:
+        return None, False
     state = get_state(guild_id)
     if generation != state.playback_generation:
         return state.advance_task, False
@@ -6721,7 +7521,7 @@ async def on_ready() -> None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if message.author.bot or message.guild is None:
+    if bot_shutdown_started or message.author.bot or message.guild is None:
         return
 
     music_channel_id = get_music_channel_id(message.guild.id)
