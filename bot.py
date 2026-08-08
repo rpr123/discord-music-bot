@@ -33,6 +33,11 @@ import requests
 from discord import app_commands
 from discord.ext import commands
 from music_models import AUTOPLAY_HISTORY_SIZE, GuildMusicState, Track
+from music_queue import (
+    remove_queued_track,
+    remove_queued_track_by_id,
+    remove_queued_track_range_by_ids,
+)
 from music_search_scoring import (
     ALTERNATE_VERSION_SEARCH_RE,
     ARTIST_CHANNEL_SUFFIX_RE,
@@ -2055,41 +2060,6 @@ def make_queue_embed(state: GuildMusicState) -> discord.Embed:
 
 def truncate_option_text(value: str, limit: int = 100) -> str:
     return truncate_text(value, limit)
-
-
-def remove_queued_track(state: GuildMusicState, index: int) -> Track | None:
-    if index < 0 or index >= len(state.queue):
-        return None
-
-    tracks = list(state.queue)
-    removed = tracks.pop(index)
-    state.queue = deque(tracks)
-    return removed
-
-
-def remove_queued_track_by_id(state: GuildMusicState, track_id: str) -> Track | None:
-    for index, track in enumerate(state.queue):
-        if track.track_id == track_id:
-            return remove_queued_track(state, index)
-    return None
-
-
-def remove_queued_track_range_by_ids(
-    state: GuildMusicState,
-    first_track_id: str,
-    second_track_id: str,
-) -> tuple[list[Track], int, int] | None:
-    tracks = list(state.queue)
-    positions = {track.track_id: index for index, track in enumerate(tracks)}
-    if first_track_id not in positions or second_track_id not in positions:
-        return None
-
-    start_index, end_index = sorted(
-        (positions[first_track_id], positions[second_track_id])
-    )
-    removed = tracks[start_index : end_index + 1]
-    state.queue = deque(tracks[:start_index] + tracks[end_index + 1 :])
-    return removed, start_index, end_index
 
 
 def describe_queue_selection(state: GuildMusicState, track_id: str | None) -> str:
