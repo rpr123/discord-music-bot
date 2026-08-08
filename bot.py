@@ -118,6 +118,10 @@ from music_namuwiki_readings import (
     get_hiragana_reading_source_lyrics,
     split_namuwiki_lyrics_groups,
 )
+from music_namuwiki_validation import (
+    is_usable_namuwiki_lyrics,
+    is_valid_korean_translation,
+)
 from music_request_parsing import (
     YOUTUBE_HOSTS,
     YOUTUBE_PLAYLIST_SEARCH_FILTER,
@@ -2766,39 +2770,6 @@ def normalize_namuwiki_table_text(value: str) -> str:
     while normalized_lines and not normalized_lines[-1]:
         normalized_lines.pop()
     return "\n".join(normalized_lines).strip()
-
-
-def is_valid_korean_translation(value: str) -> bool:
-    hangul_count = sum(
-        bool(HANGUL_RE.fullmatch(character))
-        for character in value
-    )
-    nonempty_lines = [line for line in value.splitlines() if line.strip()]
-    return hangul_count >= 8 and (
-        len(nonempty_lines) >= 2 or len(value) >= 30
-    )
-
-
-def is_usable_namuwiki_lyrics(value: str) -> bool:
-    groups = [
-        group.strip()
-        for group in re.split(r"\n\s*\n", value)
-        if group.strip()
-    ]
-    nonempty_lines = [
-        line.strip()
-        for group in groups
-        for line in group.splitlines()
-        if line.strip()
-    ]
-    if len(groups) < 2 and len(nonempty_lines) < 6:
-        return False
-
-    foreign_letter_count = sum(
-        character.isalpha() and not HANGUL_RE.fullmatch(character)
-        for character in value
-    )
-    return foreign_letter_count >= 2 and is_valid_korean_translation(value)
 
 
 def extract_interleaved_namuwiki_groups(
