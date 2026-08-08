@@ -4324,8 +4324,187 @@ class YtdlPrioritySchedulerTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class HousekeepingTaskTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        bot.housekeeping_tasks.clear()
+        bot.bot_shutdown_started = False
+        bot.auxiliary_workers_closing = False
+        bot.lyrics_executor_closing = False
+        bot.bot._discord_close_task = None
+
+    async def asyncTearDown(self) -> None:
+        tasks = list(bot.housekeeping_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        bot.housekeeping_tasks.clear()
+        bot.bot_shutdown_started = False
+        bot.auxiliary_workers_closing = False
+        bot.lyrics_executor_closing = False
+        discord_close_task = bot.bot._discord_close_task
+        if discord_close_task is not None and not discord_close_task.done():
+            discord_close_task.cancel()
+            await asyncio.gather(discord_close_task, return_exceptions=True)
+        bot.bot._discord_close_task = None
+
+    async def test_housekeeping_task_is_removed_after_completion(self) -> None:
+        completed = asyncio.Event()
+
+        async def work() -> None:
+            completed.set()
+
+        task = bot.create_housekeeping_task(work())
+
+        self.assertIsNotNone(task)
+        self.assertIn(task, bot.housekeeping_tasks)
+        await completed.wait()
+        await task
+        await asyncio.sleep(0)
+
+        self.assertNotIn(task, bot.housekeeping_tasks)
+
+    async def test_shutdown_removes_done_task_before_done_callback_runs(
+        self,
+    ) -> None:
+        async def work() -> None:
+            return None
+
+        task = asyncio.create_task(work())
+        await task
+        bot.housekeeping_tasks.add(task)
+        task.add_done_callback(bot.finish_housekeeping_task)
+
+        await bot.shutdown_housekeeping_tasks()
+
+        self.assertFalse(bot.housekeeping_tasks)
+
+    async def test_shutdown_rejects_new_housekeeping_task(self) -> None:
+        coroutine = MagicMock()
+        bot.begin_bot_shutdown()
+
+        task = bot.create_housekeeping_task(coroutine)
+
+        self.assertIsNone(task)
+        coroutine.close.assert_called_once_with()
+        self.assertFalse(bot.housekeeping_tasks)
+
+    async def test_close_cancels_delayed_housekeeping_task(self) -> None:
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        order: list[str] = []
+
+        async def work() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                order.append("housekeeping")
+                cancelled.set()
+                raise
+
+        async def base_close(_self: object) -> None:
+            order.append("discord")
+
+        task = bot.create_housekeeping_task(work())
+        await started.wait()
+
+        with (
+            patch.object(
+                bot,
+                "cancel_music_background_tasks_for_shutdown",
+                new=AsyncMock(),
+            ),
+            patch.object(bot, "shutdown_voice_operations", new=AsyncMock()),
+            patch.object(bot, "shutdown_auxiliary_operations", new=AsyncMock()),
+            patch.object(bot.ytdl_scheduler, "shutdown", new=AsyncMock()),
+            patch.object(bot, "shutdown_auxiliary_workers", new=AsyncMock()),
+            patch.object(bot, "shutdown_lyrics_executor", new=AsyncMock()),
+            patch.object(bot.commands.Bot, "close", new=base_close),
+        ):
+            await bot.MusicBot.close(bot.bot)
+
+        self.assertTrue(cancelled.is_set())
+        self.assertTrue(task.cancelled())
+        self.assertFalse(bot.housekeeping_tasks)
+        self.assertEqual(order, ["housekeeping", "discord"])
+
+    async def test_housekeeping_exception_is_retrieved(self) -> None:
+        async def fail() -> None:
+            raise RuntimeError("delete failed")
+
+        with patch.object(bot.logger, "warning") as warning:
+            task = bot.create_housekeeping_task(fail())
+            results = await asyncio.gather(task, return_exceptions=True)
+            await asyncio.sleep(0)
+
+        self.assertIsInstance(results[0], RuntimeError)
+        self.assertFalse(bot.housekeeping_tasks)
+        warning.assert_called_once()
+        self.assertIn("Housekeeping task failed", warning.call_args.args[0])
+
+    async def test_concurrent_close_does_not_double_cancel_housekeeping(
+        self,
+    ) -> None:
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        cancellation_count = 0
+        base_close_calls = 0
+
+        async def work() -> None:
+            nonlocal cancellation_count
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_count += 1
+                cancellation_seen.set()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_count += 1
+                    raise
+                raise
+
+        async def base_close(_self: object) -> None:
+            nonlocal base_close_calls
+            base_close_calls += 1
+
+        task = bot.create_housekeeping_task(work())
+        await started.wait()
+
+        with (
+            patch.object(
+                bot,
+                "cancel_music_background_tasks_for_shutdown",
+                new=AsyncMock(),
+            ),
+            patch.object(bot, "shutdown_voice_operations", new=AsyncMock()),
+            patch.object(bot, "shutdown_auxiliary_operations", new=AsyncMock()),
+            patch.object(bot.ytdl_scheduler, "shutdown", new=AsyncMock()),
+            patch.object(bot, "shutdown_auxiliary_workers", new=AsyncMock()),
+            patch.object(bot, "shutdown_lyrics_executor", new=AsyncMock()),
+            patch.object(bot.commands.Bot, "close", new=base_close),
+        ):
+            first = asyncio.create_task(bot.MusicBot.close(bot.bot))
+            await cancellation_seen.wait()
+            second = asyncio.create_task(bot.MusicBot.close(bot.bot))
+            await asyncio.sleep(0)
+
+            self.assertFalse(first.done())
+            self.assertFalse(second.done())
+            release.set()
+            await asyncio.gather(first, second)
+
+        self.assertTrue(task.cancelled())
+        self.assertEqual(cancellation_count, 1)
+        self.assertEqual(base_close_calls, 1)
+        self.assertFalse(bot.housekeeping_tasks)
+
+
 class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
+        bot.housekeeping_tasks.clear()
         bot.auxiliary_operation_tasks.clear()
         bot.auxiliary_worker_tasks.clear()
         bot.auxiliary_workers_closing = False
@@ -4341,13 +4520,15 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         tasks = list(
-            bot.auxiliary_operation_tasks
+            bot.housekeeping_tasks
+            | bot.auxiliary_operation_tasks
             | bot.auxiliary_worker_tasks
             | bot.voice_operation_tasks
         )
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        bot.housekeeping_tasks.clear()
         bot.auxiliary_operation_tasks.clear()
         bot.auxiliary_worker_tasks.clear()
         bot.voice_operation_tasks.clear()

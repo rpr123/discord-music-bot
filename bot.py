@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Callable, Deque, TypeVar
+from typing import Callable, Coroutine, Deque, TypeVar
 
 import discord
 import requests
@@ -331,6 +331,7 @@ lyrics_executor_closing = False
 lyrics_executor_shutdown_task: asyncio.Task[None] | None = None
 bot_shutdown_started = False
 voice_operation_tasks: set[asyncio.Task] = set()
+housekeeping_tasks: set[asyncio.Task] = set()
 YOUTUBE_BLOCK_ERROR_MARKERS = (
     "http error 429",
     "too many requests",
@@ -617,6 +618,52 @@ async def wait_for_task_completion_despite_cancellation(
     if task.cancelled():
         return cancellation_received, asyncio.CancelledError()
     return cancellation_received, task.exception()
+
+
+def finish_housekeeping_task(task: asyncio.Task) -> None:
+    housekeeping_tasks.discard(task)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.warning(
+            "Housekeeping task failed: %s",
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
+def create_housekeeping_task(
+    coroutine: Coroutine[object, object, T],
+) -> asyncio.Task[T] | None:
+    if bot_shutdown_started:
+        coroutine.close()
+        return None
+    task = asyncio.create_task(coroutine)
+    housekeeping_tasks.add(task)
+    task.add_done_callback(finish_housekeeping_task)
+    return task
+
+
+async def shutdown_housekeeping_tasks() -> None:
+    cancellation_received = False
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        housekeeping_tasks.discard(current_task)
+
+    while housekeeping_tasks:
+        tasks = list(housekeeping_tasks)
+        for task in tasks:
+            if not task.done() and task.cancelling() == 0:
+                task.cancel()
+            task_cancelled, _ = (
+                await wait_for_task_completion_despite_cancellation(task)
+            )
+            cancellation_received = cancellation_received or task_cancelled
+            housekeeping_tasks.discard(task)
+
+    if cancellation_received:
+        raise asyncio.CancelledError
 
 
 async def cleanup_ytdl_process(
@@ -1582,7 +1629,10 @@ class MusicBot(commands.Bot):
                 try:
                     await shutdown_lyrics_executor()
                 finally:
-                    await self._shutdown_discord_client()
+                    try:
+                        await shutdown_housekeeping_tasks()
+                    finally:
+                        await self._shutdown_discord_client()
 
 
 bot = MusicBot(command_prefix="!", intents=intents)
@@ -1686,7 +1736,7 @@ def schedule_private_lyrics_cleanup(
 
     for message in messages:
         if not bot_shutdown_started:
-            asyncio.create_task(delete_private_interaction_message(message))
+            create_housekeeping_task(delete_private_interaction_message(message))
 
 
 async def delete_queue_message_after(
@@ -5416,7 +5466,7 @@ def schedule_lyrics_message_cleanup(guild_id: int, state: GuildMusicState) -> No
     state.lyrics_message = None
     replace_lyrics_view(state, None)
     if message is not None and not bot_shutdown_started:
-        asyncio.create_task(delete_music_channel_message(guild_id, message))
+        create_housekeeping_task(delete_music_channel_message(guild_id, message))
 
 
 def make_lyrics_file(lyrics: str, filename: str = "lyrics.txt") -> discord.File:
@@ -5548,7 +5598,7 @@ class LyricsVariantView(discord.ui.View):
                 embed=None,
                 attachments=[],
             )
-            asyncio.create_task(
+            create_housekeeping_task(
                 delete_message_later(message, EPHEMERAL_RESPONSE_DELETE_SECONDS)
             )
             return
@@ -5559,7 +5609,7 @@ class LyricsVariantView(discord.ui.View):
                 embed=None,
                 attachments=[],
             )
-            asyncio.create_task(
+            create_housekeeping_task(
                 delete_message_later(message, EPHEMERAL_RESPONSE_DELETE_SECONDS)
             )
             return
@@ -6896,12 +6946,12 @@ async def enqueue_tracks(
                 pass
             except discord.HTTPException as error:
                 log_discord_http_error("editing music feedback", error)
-                asyncio.create_task(
+                create_housekeeping_task(
                     delete_message_later(initial_response, MUSIC_FEEDBACK_DELETE_SECONDS)
                 )
             else:
                 if view is None or private:
-                    asyncio.create_task(
+                    create_housekeeping_task(
                         delete_message_later(
                             initial_response,
                             MUSIC_FEEDBACK_DELETE_SECONDS,
@@ -6920,7 +6970,9 @@ async def enqueue_tracks(
             log_discord_http_error("sending music feedback", error)
             return None
         if view is None or private:
-            asyncio.create_task(delete_message_later(message, MUSIC_FEEDBACK_DELETE_SECONDS))
+            create_housekeeping_task(
+                delete_message_later(message, MUSIC_FEEDBACK_DELETE_SECONDS)
+            )
         return message
 
     try:
@@ -7540,7 +7592,7 @@ async def on_message(message: discord.Message) -> None:
     if not ok:
         error_message = await send_music_request_reply(message, error)
         if error_message is not None:
-            asyncio.create_task(
+            create_housekeeping_task(
                 delete_message_later(error_message, MUSIC_FEEDBACK_DELETE_SECONDS)
             )
         await delete_music_request_message(message)
@@ -7558,7 +7610,7 @@ async def on_message(message: discord.Message) -> None:
     except discord.HTTPException as error:
         log_discord_http_error("processing a music request", error)
         if loading_message is not None:
-            asyncio.create_task(
+            create_housekeeping_task(
                 delete_message_later(loading_message, MUSIC_FEEDBACK_DELETE_SECONDS)
             )
     finally:
