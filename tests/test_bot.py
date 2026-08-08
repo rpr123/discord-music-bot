@@ -6080,6 +6080,144 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(voice.channel, new_channel)
         self.assertIsNone(state.empty_channel_task)
 
+    async def test_leave_does_not_disconnect_voice_moved_during_panel_update(
+        self,
+    ) -> None:
+        guild_id = 816
+        panel_started = asyncio.Event()
+        release_panel = asyncio.Event()
+
+        class Channel:
+            def __init__(self, channel_id: int) -> None:
+                self.id = channel_id
+                self.mention = f"<#{channel_id}>"
+
+        old_channel = Channel(1101)
+        new_channel = Channel(1102)
+
+        class Voice:
+            def __init__(self) -> None:
+                self.channel = old_channel
+                self.connected = True
+                self.playing = True
+                self.move_to = AsyncMock(side_effect=self._move_to)
+                self.disconnect = AsyncMock(side_effect=self._disconnect)
+
+            def is_connected(self) -> bool:
+                return self.connected
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            def stop(self) -> None:
+                self.playing = False
+
+            async def _move_to(self, channel: Channel) -> None:
+                self.channel = channel
+
+            async def _disconnect(self) -> None:
+                self.connected = False
+
+        voice = Voice()
+
+        class Guild:
+            id = guild_id
+            voice_client = voice
+
+        guild = Guild()
+
+        class Response:
+            def __init__(self) -> None:
+                self.send_message = AsyncMock()
+
+            def is_done(self) -> bool:
+                return False
+
+        class User:
+            voice = type("MemberVoice", (), {"channel": old_channel})()
+
+        class Interaction:
+            pass
+
+        interaction = Interaction()
+        interaction.guild_id = guild_id
+        interaction.guild = guild
+        interaction.user = User()
+        interaction.response = Response()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        state.current = make_track("current")
+        state.queue.append(make_track("queued"))
+
+        def discard_housekeeping(coroutine) -> None:
+            coroutine.close()
+
+        async def block_idle_panel(
+            requested_guild_id: int,
+            requested_state: bot.GuildMusicState,
+        ) -> None:
+            self.assertEqual(requested_guild_id, guild_id)
+            self.assertIs(requested_state, state)
+            panel_started.set()
+            await release_panel.wait()
+
+        leave_task = None
+        with (
+            patch.object(
+                bot,
+                "show_idle_panel",
+                new=AsyncMock(side_effect=block_idle_panel),
+            ) as show_idle_panel,
+            patch.object(
+                bot,
+                "create_housekeeping_task",
+                side_effect=discard_housekeeping,
+            ),
+        ):
+            try:
+                leave_task = asyncio.create_task(bot.leave.callback(interaction))
+                await asyncio.wait_for(panel_started.wait(), timeout=1)
+
+                self.assertIsNone(state.current)
+                self.assertFalse(state.queue)
+                self.assertFalse(voice.is_playing())
+                self.assertFalse(leave_task.done())
+
+                result = await asyncio.wait_for(
+                    bot.ensure_voice_channel(guild, new_channel, state),
+                    timeout=1,
+                )
+
+                self.assertEqual(result, (True, None))
+                voice.move_to.assert_awaited_once_with(new_channel)
+                voice.disconnect.assert_not_awaited()
+                self.assertIs(state.voice, voice)
+                self.assertIs(voice.channel, new_channel)
+
+                release_panel.set()
+                await asyncio.wait_for(leave_task, timeout=1)
+            finally:
+                release_panel.set()
+                if leave_task is not None and not leave_task.done():
+                    leave_task.cancel()
+                if leave_task is not None:
+                    await asyncio.gather(leave_task, return_exceptions=True)
+                bot.cancel_empty_channel_disconnect(state)
+                bot.music_states.pop(guild_id, None)
+
+        show_idle_panel.assert_awaited_once_with(guild_id, state)
+        voice.disconnect.assert_not_awaited()
+        self.assertTrue(voice.is_connected())
+        self.assertIs(state.voice, voice)
+        self.assertIs(voice.channel, new_channel)
+        interaction.response.send_message.assert_awaited_once_with(
+            "재생은 중지했지만 봇의 음성 채널이 변경되어 연결 해제를 취소했어요.",
+            ephemeral=True,
+        )
+
     async def test_stale_registered_voice_is_cleaned_before_reconnecting(self) -> None:
         class Guild:
             id = 812

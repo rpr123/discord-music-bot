@@ -5556,17 +5556,55 @@ async def leave(interaction: discord.Interaction) -> None:
     state = get_state(interaction.guild_id)
     if not await ensure_same_voice_channel(interaction, state):
         return
-    cancel_empty_channel_disconnect(state)
-    stop_playback(state, interaction.guild_id)
 
-    if state.voice and state.voice.is_connected():
-        await show_idle_panel(interaction.guild_id, state)
-        await state.voice.disconnect()
-        state.voice = None
-        await interaction.response.send_message("음성 채널에서 나왔어요.")
+    voice_to_disconnect: discord.VoiceProtocol | None = None
+    original_channel: discord.abc.Connectable | None = None
+    async with state.voice_connect_lock:
+        voice = state.voice
+        member_channel = getattr(
+            getattr(interaction.user, "voice", None),
+            "channel",
+            None,
+        )
+        if (
+            voice is not None
+            and voice.is_connected()
+            and member_channel == voice.channel
+        ):
+            voice_to_disconnect = voice
+            original_channel = voice.channel
+            cancel_empty_channel_disconnect(state)
+            stop_playback(state, interaction.guild_id)
+
+    if voice_to_disconnect is None or original_channel is None:
+        await send_ephemeral_response(
+            interaction,
+            "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
+        )
         return
 
-    await send_ephemeral_response(interaction, "이미 음성 채널에 없어요.")
+    await show_idle_panel(interaction.guild_id, state)
+
+    disconnected = False
+    async with state.voice_connect_lock:
+        if (
+            state.voice is voice_to_disconnect
+            and voice_to_disconnect.is_connected()
+            and voice_to_disconnect.channel == original_channel
+        ):
+            await voice_to_disconnect.disconnect()
+            if state.voice is voice_to_disconnect:
+                state.voice = None
+            disconnected = True
+
+    if not disconnected:
+        await send_ephemeral_response(
+            interaction,
+            "재생은 중지했지만 봇의 음성 채널이 변경되어 연결 해제를 취소했어요.",
+        )
+        return
+
+    await interaction.response.send_message("음성 채널에서 나왔어요.")
 
 
 def main() -> None:
