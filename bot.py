@@ -4073,6 +4073,8 @@ async def use_connected_voice(
     await voice.move_to(channel)
     if bot_shutdown_started:
         return False, "The bot is shutting down."
+    if not voice.is_connected() or voice.channel != channel:
+        raise asyncio.TimeoutError("Voice client did not reach the target channel.")
     return True, None
 
 

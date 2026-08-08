@@ -6064,6 +6064,116 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel.connect_calls, 1)
         self.assertIs(state.voice, voice)
 
+    async def test_swallowed_move_timeout_does_not_accept_request(self) -> None:
+        class Channel:
+            def __init__(self, channel_id: int) -> None:
+                self.id = channel_id
+                self.members = []
+                self.mention = f"<#{channel_id}>"
+
+        cases = (
+            ("old channel remains connected", 819, False),
+            ("target channel becomes disconnected", 820, True),
+        )
+        for case_name, guild_id, disconnect_at_target in cases:
+            with self.subTest(case=case_name):
+                old_channel = Channel(guild_id + 600)
+                target_channel = Channel(guild_id + 700)
+
+                class Voice:
+                    def __init__(self) -> None:
+                        self.channel = old_channel
+                        self.connected = True
+                        self.move_to = AsyncMock(side_effect=self._move_to)
+
+                    async def _move_to(self, channel: Channel) -> None:
+                        if disconnect_at_target:
+                            self.channel = channel
+                            self.connected = False
+
+                    def is_connected(self) -> bool:
+                        return self.connected
+
+                    def is_playing(self) -> bool:
+                        return False
+
+                    def is_paused(self) -> bool:
+                        return False
+
+                voice = Voice()
+
+                class Guild:
+                    id = guild_id
+                    voice_client = voice
+
+                guild = Guild()
+
+                class Requester:
+                    bot = False
+                    voice = type(
+                        "MemberVoice",
+                        (),
+                        {"channel": target_channel},
+                    )()
+
+                requester = Requester()
+                requester.guild = guild
+                target_channel.members.append(requester)
+                state = bot.get_state(guild_id)
+                state.voice = voice
+                original_generation = state.playback_generation
+                timer = None
+
+                try:
+                    with (
+                        patch.object(
+                            bot,
+                            "cancel_empty_channel_disconnect",
+                        ) as cancel_timer,
+                        patch.object(
+                            bot,
+                            "update_empty_channel_disconnect",
+                        ) as update_timer,
+                    ):
+                        result = await asyncio.wait_for(
+                            bot.ensure_voice_for_member(requester, state),
+                            timeout=1,
+                        )
+                        timer = state.empty_channel_task
+
+                        self.assertEqual(
+                            result,
+                            (
+                                False,
+                                "음성 채널 이동에 실패했어요. "
+                                "잠시 후 다시 시도해 주세요.",
+                            ),
+                        )
+                        cancel_timer.assert_not_called()
+                        update_timer.assert_not_called()
+
+                    voice.move_to.assert_awaited_once_with(target_channel)
+                    self.assertIs(state.voice, voice)
+                    expected_channel = (
+                        target_channel if disconnect_at_target else old_channel
+                    )
+                    self.assertIs(voice.channel, expected_channel)
+                    self.assertIsNone(state.current)
+                    self.assertFalse(state.queue)
+                    self.assertEqual(
+                        state.playback_generation,
+                        original_generation,
+                    )
+                    self.assertIsNone(state.empty_channel_task)
+                    self.assertFalse(bot.voice_operation_tasks)
+                finally:
+                    if timer is None:
+                        timer = state.empty_channel_task
+                    bot.cancel_empty_channel_disconnect(state)
+                    if timer is not None:
+                        await asyncio.gather(timer, return_exceptions=True)
+                    bot.music_states.pop(guild_id, None)
+
     async def test_voice_move_replaces_empty_timer_after_member_leaves(
         self,
     ) -> None:
