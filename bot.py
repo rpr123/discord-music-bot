@@ -4616,6 +4616,7 @@ async def enqueue_tracks(
     auto_count: int | None = None,
 ) -> bool:
     state = get_state(guild_id)
+    request_generation = state.playback_generation
     state.announcement_channel = text_channel
 
     async def send_feedback(
@@ -4688,6 +4689,12 @@ async def enqueue_tracks(
 
     if not tracks:
         await send_feedback(content="추가할 곡을 찾지 못했어요.")
+        return False
+
+    if state.playback_generation != request_generation:
+        await send_feedback(
+            content="곡을 찾는 동안 재생이 중지되어 요청을 취소했어요."
+        )
         return False
 
     state.queue.extend(tracks)

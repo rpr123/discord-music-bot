@@ -760,6 +760,107 @@ class QueueFeedbackLatencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
         schedule_refill.assert_not_called()
 
+    async def test_stop_during_search_does_not_enqueue_or_restart_playback(
+        self,
+    ) -> None:
+        class Requester:
+            display_name = "tester"
+            id = 123
+
+        class Voice:
+            def __init__(self) -> None:
+                self.playing = True
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            def stop(self) -> None:
+                self.playing = False
+
+        def discard_housekeeping(coroutine) -> None:
+            coroutine.close()
+
+        guild_id = 655
+        state = bot.get_state(guild_id)
+        state.voice = Voice()
+        state.current = make_track("current")
+        late_track = make_track("late")
+        initial_response = MagicMock()
+        initial_response.edit = AsyncMock()
+        channel = MagicMock()
+        search_started = asyncio.Event()
+        release_search = asyncio.Event()
+
+        async def delayed_extract(*args, **kwargs) -> bot.Track:
+            search_started.set()
+            await release_search.wait()
+            return late_track
+
+        enqueue_task = None
+        with (
+            patch.object(bot, "extract_track", new=delayed_extract),
+            patch.object(
+                bot,
+                "schedule_play_next",
+                return_value=(None, False),
+            ) as schedule_play_next,
+            patch.object(bot, "schedule_autoplay_refill") as schedule_autoplay_refill,
+            patch.object(
+                bot,
+                "create_housekeeping_task",
+                side_effect=discard_housekeeping,
+            ),
+        ):
+            try:
+                enqueue_task = asyncio.create_task(
+                    bot.enqueue_tracks(
+                        guild_id,
+                        channel,
+                        Requester(),
+                        "late song",
+                        initial_response=initial_response,
+                    )
+                )
+                await asyncio.wait_for(search_started.wait(), timeout=1)
+
+                original_generation = state.playback_generation
+                bot.stop_playback(state, guild_id)
+
+                self.assertEqual(
+                    state.playback_generation,
+                    original_generation + 1,
+                )
+                self.assertIsNone(state.current)
+                self.assertFalse(state.queue)
+
+                release_search.set()
+                result = await asyncio.wait_for(enqueue_task, timeout=1)
+            finally:
+                release_search.set()
+                if enqueue_task is not None and not enqueue_task.done():
+                    enqueue_task.cancel()
+                if enqueue_task is not None:
+                    await asyncio.gather(enqueue_task, return_exceptions=True)
+                bot.music_states.pop(guild_id, None)
+
+        self.assertFalse(result)
+        self.assertEqual(list(state.queue), [])
+        self.assertIsNone(state.current)
+        self.assertEqual(
+            state.playback_generation,
+            original_generation + 1,
+        )
+        schedule_play_next.assert_not_called()
+        schedule_autoplay_refill.assert_not_called()
+        initial_response.edit.assert_awaited_once_with(
+            content="곡을 찾는 동안 재생이 중지되어 요청을 취소했어요.",
+            embed=None,
+            view=None,
+        )
+
 
 class AutoRequestParsingTests(unittest.TestCase):
     def test_auto_without_count_uses_default(self) -> None:
