@@ -4727,7 +4727,18 @@ async def enqueue_tracks(
     playback_task: asyncio.Task[None] | None = None
     started_playback = False
     if should_start:
-        playback_task, started_playback = schedule_play_next(guild_id, announce=False)
+        active_advance = state.advance_task
+        if active_advance is not None and not active_advance.done():
+            playback_task, started_playback = schedule_play_next_after_current(
+                guild_id,
+                request_generation,
+                announce=True,
+            )
+        else:
+            playback_task, started_playback = schedule_play_next(
+                guild_id,
+                announce=False,
+            )
     else:
         schedule_autoplay_refill(guild_id)
 

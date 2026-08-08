@@ -6773,6 +6773,147 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(state.advance_task)
         self.assertIsNone(state.pending_advance_task)
 
+    async def test_enqueue_during_idle_cleanup_starts_followup_playback(
+        self,
+    ) -> None:
+        guild_id = 126
+        idle_panel_started = asyncio.Event()
+        release_idle_panel = asyncio.Event()
+        playback_started = asyncio.Event()
+
+        class FakeVoice:
+            def __init__(self) -> None:
+                self.playing = False
+                self.play = MagicMock(side_effect=self._play)
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            def _play(self, source: object, *, after: object) -> None:
+                self.playing = True
+                playback_started.set()
+
+        class Requester:
+            display_name = "tester"
+            id = 1260
+
+        voice = FakeVoice()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        track = make_track("followup")
+        track.stream_url = "https://example.test/followup.opus"
+        track.audio_codec = "opus"
+        loading_message = MagicMock()
+        loading_message.edit = AsyncMock()
+
+        async def block_idle_panel(
+            requested_guild_id: int,
+            requested_state: bot.GuildMusicState,
+        ) -> None:
+            self.assertEqual(requested_guild_id, guild_id)
+            self.assertIs(requested_state, state)
+            idle_panel_started.set()
+            await release_idle_panel.wait()
+
+        def discard_housekeeping(coroutine) -> None:
+            coroutine.close()
+
+        first_task = None
+        with (
+            patch.object(bot, "ffmpeg_is_available", return_value=True),
+            patch.object(
+                bot,
+                "show_idle_panel",
+                new=AsyncMock(side_effect=block_idle_panel),
+            ) as show_idle_panel,
+            patch.object(
+                bot,
+                "extract_track",
+                new=AsyncMock(return_value=track),
+            ),
+            patch.object(bot, "resolve_track_stream", new=AsyncMock()),
+            patch.object(
+                bot.discord,
+                "FFmpegOpusAudio",
+                return_value=MagicMock(),
+            ),
+            patch.object(
+                bot,
+                "update_control_panel",
+                new=AsyncMock(),
+            ) as update_control_panel,
+            patch.object(bot, "schedule_noncritical_tasks"),
+            patch.object(bot, "schedule_autoplay_refill") as schedule_autoplay_refill,
+            patch.object(
+                bot,
+                "create_housekeeping_task",
+                side_effect=discard_housekeeping,
+            ),
+        ):
+            try:
+                first_task, first_created = bot.schedule_play_next(
+                    guild_id,
+                    announce=False,
+                )
+                self.assertTrue(first_created)
+                self.assertIsNotNone(first_task)
+                await asyncio.wait_for(idle_panel_started.wait(), timeout=1)
+
+                enqueue_result = await bot.enqueue_tracks(
+                    guild_id,
+                    MagicMock(),
+                    Requester(),
+                    "followup song",
+                    initial_response=loading_message,
+                )
+
+                self.assertTrue(enqueue_result)
+                self.assertEqual(list(state.queue), [track])
+                self.assertIs(state.pending_advance_task, first_task)
+                self.assertTrue(state.pending_advance_announce)
+                self.assertFalse(playback_started.is_set())
+
+                release_idle_panel.set()
+                await asyncio.wait_for(first_task, timeout=1)
+                await asyncio.wait_for(playback_started.wait(), timeout=1)
+                await asyncio.sleep(0)
+            finally:
+                release_idle_panel.set()
+                bot.clear_pending_playback_advance(state)
+                tasks = {
+                    task
+                    for task in (first_task, state.advance_task)
+                    if task is not None
+                }
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.sleep(0)
+                late_advance = state.advance_task
+                if late_advance is not None and late_advance not in tasks:
+                    if not late_advance.done():
+                        late_advance.cancel()
+                    await asyncio.gather(late_advance, return_exceptions=True)
+                bot.clear_pending_playback_advance(state)
+                bot.cancel_empty_channel_disconnect(state)
+                bot.music_states.pop(guild_id, None)
+
+        self.assertIs(state.current, track)
+        self.assertFalse(state.queue)
+        self.assertTrue(voice.is_playing())
+        voice.play.assert_called_once()
+        show_idle_panel.assert_awaited_once_with(guild_id, state)
+        update_control_panel.assert_awaited_once_with(guild_id, state)
+        schedule_autoplay_refill.assert_not_called()
+
     async def test_concurrent_start_requests_only_pop_one_track(self) -> None:
         class FakeVoice:
             def __init__(self) -> None:
