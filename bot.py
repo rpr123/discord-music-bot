@@ -53,6 +53,16 @@ from music_queue import (
     remove_queued_track_by_id,
     remove_queued_track_range_by_ids,
 )
+from music_request_parsing import (
+    YOUTUBE_HOSTS,
+    YOUTUBE_PLAYLIST_SEARCH_FILTER,
+    build_youtube_playlist_search_url,
+    get_playlist_result_url,
+    is_bulk_youtube_url,
+    is_playlist_search_url,
+    is_youtube_search_query,
+    parse_music_request,
+)
 from music_search_scoring import (
     ALTERNATE_VERSION_SEARCH_RE,
     ARTIST_CHANNEL_SUFFIX_RE,
@@ -184,10 +194,6 @@ MUSIC_CHANNEL_DELETE_REQUESTS = os.getenv("MUSIC_CHANNEL_DELETE_REQUESTS", "true
     "off",
 }
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE")
-YOUTUBE_HOSTS = {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
-YOUTUBE_PLAYLIST_SEARCH_FILTER = "EgIQAw%253D%253D"
-
-
 def parse_positive_int_env(name: str, default: int) -> int:
     try:
         return max(1, int(os.getenv(name, str(default))))
@@ -2523,10 +2529,6 @@ def build_youtube_search_query(
     return f"ytsearch{YOUTUBE_SEARCH_CANDIDATES}:{search_text}"
 
 
-def is_youtube_search_query(query: str) -> bool:
-    return bool(re.match(r"^ytsearch(?:\d+)?:", query, flags=re.IGNORECASE))
-
-
 def select_youtube_search_result(
     query: str,
     entries: list[dict],
@@ -2569,15 +2571,6 @@ def select_youtube_search_result(
         score,
     )
     return selected
-
-
-def build_youtube_playlist_search_url(query: str, search_kind: str) -> str:
-    search_text = f"{query} full album" if search_kind == "album" else query
-    encoded_query = urllib.parse.quote_plus(search_text)
-    return (
-        "https://www.youtube.com/results?"
-        f"search_query={encoded_query}&sp={YOUTUBE_PLAYLIST_SEARCH_FILTER}"
-    )
 
 
 def resolve_query(query: str, search_kind: str | None = None) -> str:
@@ -4889,59 +4882,6 @@ async def publish_current_lyrics(guild_id: int, track: Track) -> None:
     finally:
         if state.lyrics_task is current_task:
             state.lyrics_task = None
-
-
-def is_playlist_search_url(url: str) -> bool:
-    parsed = urllib.parse.urlparse(url)
-    host = parsed.netloc.lower().removeprefix("www.")
-    return host == "youtube.com" and parsed.path == "/results"
-
-
-def get_playlist_result_url(info: dict) -> str:
-    raw_url = info.get("webpage_url") or info.get("url") or ""
-    if raw_url:
-        parsed = urllib.parse.urlparse(raw_url)
-        if parsed.scheme in {"http", "https"}:
-            params = urllib.parse.parse_qs(parsed.query)
-            if parsed.path == "/playlist" or "list" in params:
-                return raw_url
-
-    playlist_id = info.get("playlist_id") or info.get("id")
-    if playlist_id and not re.fullmatch(r"[\w-]{11}", str(playlist_id)):
-        return f"https://www.youtube.com/playlist?list={playlist_id}"
-
-    raise ValueError("No YouTube playlist was found in the search results.")
-
-
-def is_bulk_youtube_url(query: str) -> bool:
-    parsed = urllib.parse.urlparse(query.strip())
-    if parsed.scheme not in {"http", "https"}:
-        return False
-
-    host = parsed.netloc.lower().removeprefix("www.")
-    if host not in YOUTUBE_HOSTS:
-        return False
-
-    return parsed.path == "/playlist"
-
-
-def parse_music_request(query: str) -> tuple[str, str | None, bool]:
-    query = query.strip()
-    lowered = query.lower()
-    prefixes: dict[str, tuple[str, bool]] = {
-        "album:": ("album", True),
-        "album ": ("album", True),
-        "playlist:": ("playlist", True),
-        "playlist ": ("playlist", True),
-        "list:": ("playlist", True),
-        "list ": ("playlist", True),
-    }
-
-    for prefix, (search_kind, bulk) in prefixes.items():
-        if lowered.startswith(prefix):
-            return query[len(prefix):].strip(), search_kind, bulk
-
-    return query, None, is_bulk_youtube_url(query)
 
 
 def clamp_auto_count(count: int) -> int:
