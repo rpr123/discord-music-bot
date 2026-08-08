@@ -1933,19 +1933,21 @@ class QueueRemoveSelect(discord.ui.Select):
             return
 
         schedule_autoplay_refill(self.guild_id)
-        if state.current:
-            await update_control_panel(self.guild_id, state)
-
-        await interaction.response.edit_message(
-            content=f"대기열에서 `{removed.title}`을 삭제했어요.",
-            embed=make_queue_embed(state),
-            view=QueueManageView(self.guild_id) if state.queue else None,
-        )
-        schedule_queue_message_cleanup(
-            state,
-            interaction.message,
-            QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
-        )
+        refresh_panel = state.current is not None
+        try:
+            await interaction.response.edit_message(
+                content=f"대기열에서 `{removed.title}`을 삭제했어요.",
+                embed=make_queue_embed(state),
+                view=QueueManageView(self.guild_id) if state.queue else None,
+            )
+            schedule_queue_message_cleanup(
+                state,
+                interaction.message,
+                QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
+            )
+        finally:
+            if refresh_panel:
+                await update_control_panel(self.guild_id, state)
 
 
 class QueueManageView(discord.ui.View):
@@ -2075,22 +2077,24 @@ class QueueRangeDeleteView(discord.ui.View):
 
         removed, start_index, end_index = result
         schedule_autoplay_refill(self.guild_id)
-        if state.current:
-            await update_control_panel(self.guild_id, state)
-
-        await interaction.response.edit_message(
-            content=(
-                f"대기열 {start_index + 1}~{end_index + 1}번, "
-                f"{len(removed)}곡을 삭제했어요."
-            ),
-            embed=make_queue_embed(state),
-            view=None,
-        )
-        schedule_queue_message_cleanup(
-            state,
-            interaction.message,
-            QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
-        )
+        refresh_panel = state.current is not None
+        try:
+            await interaction.response.edit_message(
+                content=(
+                    f"대기열 {start_index + 1}~{end_index + 1}번, "
+                    f"{len(removed)}곡을 삭제했어요."
+                ),
+                embed=make_queue_embed(state),
+                view=None,
+            )
+            schedule_queue_message_cleanup(
+                state,
+                interaction.message,
+                QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
+            )
+        finally:
+            if refresh_panel:
+                await update_control_panel(self.guild_id, state)
 
 
 class MusicControlView(discord.ui.View):

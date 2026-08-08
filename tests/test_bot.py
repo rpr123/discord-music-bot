@@ -6290,6 +6290,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         guild_id = 988
         tracks = [make_track(f"track-{index}") for index in range(1, 21)]
         state = bot.get_state(guild_id)
+        state.current = make_track("current")
         state.queue.extend(tracks)
         view = bot.QueueRangeDeleteView(guild_id)
         view.start_track_id = tracks[4].track_id
@@ -6299,15 +6300,37 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         interaction.response.edit_message = AsyncMock()
         interaction.message = MagicMock()
         interaction.message.id = 989
+        operation_order: list[str] = []
+        cleanup_error = RuntimeError("queue cleanup scheduling failed")
+
+        def fail_cleanup(*_args: object, **_kwargs: object) -> None:
+            operation_order.append("cleanup")
+            raise cleanup_error
+
+        interaction.response.edit_message.side_effect = (
+            lambda **_kwargs: operation_order.append("response")
+        )
 
         with (
             patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
             patch.object(
                 bot,
                 "schedule_queue_message_cleanup",
+                side_effect=fail_cleanup,
             ) as schedule_cleanup,
+            patch.object(
+                bot,
+                "update_control_panel",
+                new=AsyncMock(
+                    side_effect=lambda *_args, **_kwargs: operation_order.append("panel")
+                ),
+            ) as update_control_panel,
         ):
-            await view.confirm_button.callback(interaction)
+            with self.assertRaises(RuntimeError) as raised:
+                await view.confirm_button.callback(interaction)
+
+        self.assertIs(raised.exception, cleanup_error)
+        self.assertEqual(operation_order, ["response", "cleanup", "panel"])
 
         self.assertEqual(len(state.queue), 11)
         self.assertEqual(list(state.queue), tracks[:4] + tracks[13:])
@@ -6322,6 +6345,53 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             interaction.message,
             bot.QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
         )
+        update_control_panel.assert_awaited_once_with(guild_id, state)
+
+    async def test_range_delete_response_failure_still_refreshes_panel(self) -> None:
+        guild_id = 995
+        tracks = [make_track("first"), make_track("second"), make_track("third")]
+        state = bot.get_state(guild_id)
+        state.current = make_track("current")
+        state.queue.extend(tracks)
+        view = bot.QueueRangeDeleteView(guild_id)
+        view.start_track_id = tracks[0].track_id
+        view.end_track_id = tracks[1].track_id
+        view.confirm_button.disabled = False
+        interaction = MagicMock()
+        interaction.response.edit_message = AsyncMock()
+        operation_order: list[str] = []
+        response = MagicMock(status=500, reason="Internal Server Error")
+        response_error = bot.discord.DiscordServerError(
+            response,
+            "<html>temporary failure</html>",
+        )
+
+        def fail_response(**_kwargs: object) -> None:
+            operation_order.append("response")
+            raise response_error
+
+        interaction.response.edit_message.side_effect = fail_response
+        with (
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+            patch.object(bot, "schedule_queue_message_cleanup") as schedule_cleanup,
+            patch.object(
+                bot,
+                "update_control_panel",
+                new=AsyncMock(
+                    side_effect=lambda *_args, **_kwargs: operation_order.append("panel")
+                ),
+            ) as update_control_panel,
+        ):
+            with self.assertRaises(bot.discord.DiscordServerError) as raised:
+                await view.confirm_button.callback(interaction)
+
+        self.assertIs(raised.exception, response_error)
+        self.assertEqual(operation_order, ["response", "panel"])
+        self.assertEqual(list(state.queue), [tracks[2]])
+        schedule_refill.assert_called_once_with(guild_id)
+        interaction.response.edit_message.assert_awaited_once()
+        schedule_cleanup.assert_not_called()
+        update_control_panel.assert_awaited_once_with(guild_id, state)
 
     async def test_single_delete_resets_queue_message_expiry(self) -> None:
         guild_id = 990
@@ -6333,8 +6403,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         select._values = [first.track_id]
         interaction = MagicMock()
         interaction.response.edit_message = AsyncMock()
-        interaction.message = MagicMock()
-        interaction.message.id = 991
+        interaction.message = MagicMock(id=991)
 
         with (
             patch.object(bot, "schedule_autoplay_refill"),
@@ -6346,11 +6415,71 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             await select.callback(interaction)
 
         self.assertEqual(list(state.queue), [second])
+        interaction.response.edit_message.assert_awaited_once()
         schedule_cleanup.assert_called_once_with(
             state,
             interaction.message,
             bot.QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
         )
+
+    async def test_single_delete_response_failure_still_refreshes_panel(self) -> None:
+        guild_id = 990
+        first = make_track("first")
+        second = make_track("second")
+        third = make_track("third")
+        state = bot.get_state(guild_id)
+        state.current = make_track("current")
+        state.queue.extend([third, first, second])
+        select = bot.QueueRemoveSelect(guild_id)
+        select._values = [second.track_id]
+        interaction = MagicMock()
+        interaction.response.edit_message = AsyncMock()
+        interaction.message = MagicMock()
+        interaction.message.id = 991
+        operation_order: list[str] = []
+        response = MagicMock(status=500, reason="Internal Server Error")
+        response_error = bot.discord.DiscordServerError(
+            response,
+            "<html>temporary failure</html>",
+        )
+
+        def edit_response(**_kwargs: object) -> None:
+            operation_order.append("response")
+            raise response_error
+
+        interaction.response.edit_message.side_effect = edit_response
+
+        with (
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+            patch.object(
+                bot,
+                "schedule_queue_message_cleanup",
+            ) as schedule_cleanup,
+            patch.object(
+                bot,
+                "update_control_panel",
+                new=AsyncMock(
+                    side_effect=lambda *_args, **_kwargs: operation_order.append("panel")
+                ),
+            ) as update_control_panel,
+        ):
+            with self.assertRaises(bot.discord.DiscordServerError) as raised:
+                await select.callback(interaction)
+
+        self.assertIs(raised.exception, response_error)
+        self.assertEqual(operation_order, ["response", "panel"])
+        self.assertEqual(list(state.queue), [third, first])
+        schedule_refill.assert_called_once_with(guild_id)
+        interaction.response.edit_message.assert_awaited_once()
+        response_kwargs = interaction.response.edit_message.await_args.kwargs
+        self.assertIn(second.title, response_kwargs["content"])
+        self.assertEqual(
+            response_kwargs["embed"].to_dict(),
+            bot.make_queue_embed(state).to_dict(),
+        )
+        self.assertIsInstance(response_kwargs["view"], bot.QueueManageView)
+        schedule_cleanup.assert_not_called()
+        update_control_panel.assert_awaited_once_with(guild_id, state)
 
 
 class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
