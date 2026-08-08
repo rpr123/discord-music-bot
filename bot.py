@@ -36,19 +36,22 @@ from music_autoplay_policy import (
     get_autoplay_retry_delay,
     get_autoplay_seed,
 )
-from music_explicit_readings import (
-    EXPLICIT_READING_BRACKETS,
-    find_explicit_reading_base_start,
-    find_explicit_reading_replacements,
-    protect_explicit_readings,
-    replace_explicit_readings,
-)
 from music_japanese_reading import (
+    EXPLICIT_READING_BRACKETS,
+    HANGUL_RE,
+    JAPANESE_HAN_RE,
+    JAPANESE_KANA_RE,
     JAPANESE_READING_RE,
     annotate_japanese_reading,
+    find_explicit_reading_base_start,
+    find_explicit_reading_replacements,
     get_reading_surface_segment_kind,
     katakana_to_hiragana,
+    lyrics_are_japanese,
+    lyrics_are_primarily_korean,
     normalize_japanese_reading,
+    protect_explicit_readings,
+    replace_explicit_readings,
     split_reading_surface,
 )
 from music_lyrics_display import (
@@ -159,13 +162,6 @@ from music_request_parsing import (
     is_playlist_search_url,
     is_youtube_search_query,
     parse_music_request,
-)
-from music_script_detection import (
-    HANGUL_RE,
-    JAPANESE_HAN_RE,
-    JAPANESE_KANA_RE,
-    lyrics_are_japanese,
-    lyrics_are_primarily_korean,
 )
 from music_search_scoring import (
     ALTERNATE_VERSION_SEARCH_RE,

@@ -6,14 +6,14 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Callable
 
-from music_japanese_reading import annotate_japanese_reading
-from music_models import Track
-from music_script_detection import (
+from music_japanese_reading import (
     HANGUL_RE,
     JAPANESE_HAN_RE,
     JAPANESE_KANA_RE,
+    annotate_japanese_reading,
     lyrics_are_japanese,
 )
+from music_models import Track
 
 
 NAMUMARK_STYLE_PREFIX_RE = re.compile(r"^(?:\s*<[^>\n]*>)+")

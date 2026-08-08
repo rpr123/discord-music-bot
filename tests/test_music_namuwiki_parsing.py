@@ -51,7 +51,6 @@ class MusicNamuWikiParsingTests(unittest.TestCase):
                 "html.parser",
                 "music_japanese_reading",
                 "music_models",
-                "music_script_detection",
                 "re",
                 "typing",
             },
