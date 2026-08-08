@@ -57,7 +57,19 @@ from music_japanese_reading import (
     replace_explicit_readings,
     split_reading_surface,
 )
-from music_models import AUTOPLAY_HISTORY_SIZE, GuildMusicState, Track
+from music_models import (
+    AUTOPLAY_HISTORY_SIZE,
+    MAX_PLAYBACK_ATTEMPTS,
+    GuildMusicState,
+    Track,
+    invalidate_track_stream,
+    remove_queued_track,
+    remove_queued_track_by_id,
+    remove_queued_track_range_by_ids,
+    requeue_track_after_playback_error,
+    reset_track_playback_attempts,
+    reset_track_playback_state,
+)
 from music_discord_display import (
     CONTROL_PANEL_TITLES,
     DISCORD_EMBED_FIELD_LIMIT,
@@ -79,13 +91,6 @@ from music_discord_display import (
     single_line,
     truncate_option_text,
     truncate_text,
-)
-from music_playback_state import (
-    MAX_PLAYBACK_ATTEMPTS,
-    invalidate_track_stream,
-    requeue_track_after_playback_error,
-    reset_track_playback_attempts,
-    reset_track_playback_state,
 )
 from music_lyrics_matching import (
     LRC_METADATA_RE,
@@ -109,11 +114,6 @@ from music_namuwiki_matching import (
     get_namuwiki_track_artists,
     namuwiki_artist_matches_track,
     parse_namuwiki_candidate,
-)
-from music_queue import (
-    remove_queued_track,
-    remove_queued_track_by_id,
-    remove_queued_track_range_by_ids,
 )
 from music_namuwiki_parsing import (
     NAMUMARK_FOOTNOTE_RE,

@@ -10,6 +10,7 @@ import discord
 
 
 AUTOPLAY_HISTORY_SIZE = 50
+MAX_PLAYBACK_ATTEMPTS = 2
 
 
 @dataclass
@@ -90,3 +91,81 @@ class GuildMusicState:
     queue_cleanup_tasks: dict[int, asyncio.Task[None]] = field(default_factory=dict)
     empty_channel_task: asyncio.Task[None] | None = None
     playback_generation: int = 0
+
+
+def remove_queued_track(state: GuildMusicState, index: int) -> Track | None:
+    if index < 0 or index >= len(state.queue):
+        return None
+
+    tracks = list(state.queue)
+    removed = tracks.pop(index)
+    state.queue = deque(tracks)
+    return removed
+
+
+def remove_queued_track_by_id(
+    state: GuildMusicState,
+    track_id: str,
+) -> Track | None:
+    for index, track in enumerate(state.queue):
+        if track.track_id == track_id:
+            return remove_queued_track(state, index)
+    return None
+
+
+def remove_queued_track_range_by_ids(
+    state: GuildMusicState,
+    first_track_id: str,
+    second_track_id: str,
+) -> tuple[list[Track], int, int] | None:
+    tracks = list(state.queue)
+    positions = {track.track_id: index for index, track in enumerate(tracks)}
+    if first_track_id not in positions or second_track_id not in positions:
+        return None
+
+    start_index, end_index = sorted(
+        (positions[first_track_id], positions[second_track_id])
+    )
+    removed = tracks[start_index : end_index + 1]
+    state.queue = deque(tracks[:start_index] + tracks[end_index + 1 :])
+    return removed, start_index, end_index
+
+
+def reset_track_playback_attempts(track: Track) -> None:
+    track.playback_attempts = 0
+
+
+def reset_track_playback_state(track: Track) -> None:
+    reset_track_playback_attempts(track)
+    track.force_transcode = False
+
+
+def invalidate_track_stream(track: Track) -> None:
+    track.stream_url = None
+    track.stream_resolved_at = None
+
+
+def requeue_track_after_playback_error(
+    state: GuildMusicState,
+    track: Track,
+    *,
+    used_opus_copy: bool,
+) -> bool:
+    can_retry = (
+        state.current is track
+        and not state.skip_requested
+        and not state.stop_requested
+        and track.playback_attempts < MAX_PLAYBACK_ATTEMPTS
+    )
+    if not can_retry:
+        reset_track_playback_state(track)
+        if state.current is track:
+            state.current = None
+        return False
+
+    invalidate_track_stream(track)
+    if used_opus_copy:
+        track.force_transcode = True
+    state.queue.appendleft(track)
+    state.current = None
+    return True
