@@ -828,6 +828,60 @@ class AutoRequestParsingTests(unittest.TestCase):
         self.assertIsNone(bot.parse_auto_request("automatic playlist"))
 
 
+class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auto_count_request_routes_to_auto_extractor_and_enqueues_all_tracks(
+        self,
+    ) -> None:
+        class Requester:
+            display_name = "tester"
+            id = 123
+
+        def discard_housekeeping(coroutine) -> None:
+            coroutine.close()
+
+        guild_id = 6541
+        self.addCleanup(bot.music_states.pop, guild_id, None)
+        channel = MagicMock()
+        initial_response = MagicMock()
+        initial_response.edit = AsyncMock()
+        tracks = [make_track("seed"), make_track("related")]
+
+        with (
+            patch.object(bot, "MAX_AUTO_TRACKS", 25),
+            patch.object(
+                bot,
+                "extract_auto_tracks",
+                new=AsyncMock(return_value=tracks),
+            ) as extract_auto_tracks,
+            patch.object(bot, "extract_track", new=AsyncMock()) as extract_track,
+            patch.object(bot, "extract_tracks", new=AsyncMock()) as extract_tracks,
+            patch.object(bot, "schedule_autoplay_refill"),
+            patch.object(
+                bot,
+                "create_housekeeping_task",
+                side_effect=discard_housekeeping,
+            ),
+        ):
+            result = await bot.enqueue_tracks(
+                guild_id,
+                channel,
+                Requester(),
+                "auto5: back number",
+                initial_response=initial_response,
+            )
+
+        self.assertTrue(result)
+        extract_auto_tracks.assert_awaited_once_with(
+            "back number",
+            "tester",
+            5,
+            123,
+        )
+        extract_track.assert_not_awaited()
+        extract_tracks.assert_not_awaited()
+        self.assertEqual(list(bot.get_state(guild_id).queue), tracks)
+
+
 class TrackIdentityTests(unittest.TestCase):
     def make_identity_track(
         self,
