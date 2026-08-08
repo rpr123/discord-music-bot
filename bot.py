@@ -676,6 +676,7 @@ async def shutdown_auxiliary_workers() -> None:
                 await wait_for_task_completion_despite_cancellation(task)
             )
             cancellation_received = cancellation_received or task_cancelled
+            auxiliary_worker_tasks.discard(task)
     if cancellation_received:
         raise asyncio.CancelledError
 

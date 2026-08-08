@@ -4764,6 +4764,40 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(worker.done())
         self.assertFalse(bot.auxiliary_worker_tasks)
 
+    async def test_shutdown_removes_done_worker_before_done_callback_runs(
+        self,
+    ) -> None:
+        completed = asyncio.Event()
+
+        async def work() -> None:
+            completed.set()
+
+        worker = bot.track_auxiliary_worker(asyncio.create_task(work()))
+        await completed.wait()
+
+        self.assertTrue(worker.done())
+        self.assertIn(worker, bot.auxiliary_worker_tasks)
+
+        original_wait = bot.wait_for_task_completion_despite_cancellation
+        wait_count = 0
+
+        async def wait_once(task: asyncio.Task) -> tuple[bool, BaseException | None]:
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count > 1:
+                raise AssertionError("completed auxiliary worker was revisited")
+            return await original_wait(task)
+
+        with patch.object(
+            bot,
+            "wait_for_task_completion_despite_cancellation",
+            new=wait_once,
+        ):
+            await bot.shutdown_auxiliary_workers()
+
+        self.assertEqual(wait_count, 1)
+        self.assertFalse(bot.auxiliary_worker_tasks)
+
     async def test_cancelled_auxiliary_shutdown_still_waits_for_worker(self) -> None:
         started = asyncio.Event()
         release = asyncio.Event()
