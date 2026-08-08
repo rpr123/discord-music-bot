@@ -58,22 +58,28 @@ from music_japanese_reading import (
     replace_explicit_readings,
     split_reading_surface,
 )
-from music_lyrics_display import (
+from music_models import AUTOPLAY_HISTORY_SIZE, GuildMusicState, Track
+from music_discord_display import (
+    CONTROL_PANEL_TITLES,
+    DISCORD_EMBED_FIELD_LIMIT,
+    IDLE_PANEL_TITLE,
     LYRICS_INLINE_LIMIT,
+    PLAYING_PANEL_TITLE,
+    describe_queue_selection,
+    format_duration,
+    make_idle_player_embed,
     make_lyrics_embed,
     make_lyrics_file,
     make_lyrics_variant_embed,
-)
-from music_models import AUTOPLAY_HISTORY_SIZE, GuildMusicState, Track
-from music_player_embeds import (
-    CONTROL_PANEL_TITLES,
-    IDLE_PANEL_TITLE,
-    PLAYING_PANEL_TITLE,
-    describe_queue_selection,
-    make_idle_player_embed,
     make_player_embed,
+    make_queue_line,
     make_queue_embed,
+    make_track_link,
     make_track_embed,
+    requester_label,
+    single_line,
+    truncate_option_text,
+    truncate_text,
 )
 from music_playback_state import (
     MAX_PLAYBACK_ATTEMPTS,
@@ -81,16 +87,6 @@ from music_playback_state import (
     requeue_track_after_playback_error,
     reset_track_playback_attempts,
     reset_track_playback_state,
-)
-from music_text import (
-    DISCORD_EMBED_FIELD_LIMIT,
-    format_duration,
-    make_queue_line,
-    make_track_link,
-    requester_label,
-    single_line,
-    truncate_option_text,
-    truncate_text,
 )
 from music_lyrics_matching import (
     LRC_METADATA_RE,

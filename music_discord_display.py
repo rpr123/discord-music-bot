@@ -1,21 +1,63 @@
 from __future__ import annotations
 
+import io
+
 import discord
 
 from music_models import GuildMusicState, Track
-from music_text import (
-    DISCORD_EMBED_FIELD_LIMIT,
-    format_duration,
-    make_queue_line,
-    make_track_link,
-    requester_label,
-    truncate_text,
-)
 
 
+DISCORD_EMBED_FIELD_LIMIT = 1024
 PLAYING_PANEL_TITLE = "💿 지금 재생 중"
 IDLE_PANEL_TITLE = "🎵 재생 대기 중"
 CONTROL_PANEL_TITLES = frozenset({PLAYING_PANEL_TITLE, IDLE_PANEL_TITLE})
+LYRICS_INLINE_LIMIT = 3900
+
+
+def format_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "live"
+
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{sec:02d}"
+    return f"{minutes}:{sec:02d}"
+
+
+def requester_label(track: Track) -> str:
+    if track.requester_id is None:
+        return track.requester
+    return f"<@{track.requester_id}>"
+
+
+def single_line(value: str) -> str:
+    return " ".join(value.split())
+
+
+def truncate_text(value: str, limit: int) -> str:
+    value = single_line(value)
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
+
+
+def make_track_link(track: Track, limit: int = DISCORD_EMBED_FIELD_LIMIT) -> str:
+    title = truncate_text(track.title, 120)
+    if not track.webpage_url:
+        return title
+    value = f"[{title}]({track.webpage_url})"
+    if len(value) <= limit:
+        return value
+    return truncate_text(track.title, limit)
+
+
+def make_queue_line(index: int, track: Track) -> str:
+    return f"{index}. {truncate_text(track.title, 72)} - {format_duration(track.duration)}"
+
+
+def truncate_option_text(value: str, limit: int = 100) -> str:
+    return truncate_text(value, limit)
 
 
 def make_track_embed(track: Track, title: str) -> discord.Embed:
@@ -104,3 +146,48 @@ def describe_queue_selection(state: GuildMusicState, track_id: str | None) -> st
         if track.track_id == track_id:
             return f"{index}. {truncate_text(track.title, 72)}"
     return "대기열에서 찾을 수 없음"
+
+
+def make_lyrics_embed(track: Track, description: str) -> discord.Embed:
+    song_title = track.song_name or track.title
+    embed = discord.Embed(
+        title=f"가사 · {truncate_text(song_title, 220)}",
+        description=description,
+        color=discord.Color.blurple(),
+    )
+    artist = track.artist or track.uploader
+    if artist:
+        embed.set_author(name=truncate_text(artist, 200))
+
+    source = track.lyrics_source or "LRCLIB → YouTube 수동 자막"
+    embed.set_footer(text=f"{source} · 원문 가사")
+    return embed
+
+
+def make_lyrics_variant_embed(
+    track: Track,
+    label: str,
+    description: str,
+    source: str,
+    source_url: str | None = None,
+) -> discord.Embed:
+    song_title = track.song_name or track.title
+    embed = discord.Embed(
+        title=f"{label} · {truncate_text(song_title, 220)}",
+        description=description,
+        color=discord.Color.blurple(),
+    )
+    artist = track.artist or track.uploader
+    if artist:
+        embed.set_author(name=truncate_text(artist, 200))
+    if source_url:
+        embed.url = source_url
+    embed.set_footer(text=source)
+    return embed
+
+
+def make_lyrics_file(lyrics: str, filename: str = "lyrics.txt") -> discord.File:
+    return discord.File(
+        io.BytesIO(lyrics.encode("utf-8")),
+        filename=filename,
+    )
