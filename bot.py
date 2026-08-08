@@ -5424,6 +5424,8 @@ async def leave(interaction: discord.Interaction) -> None:
     if not await ensure_same_voice_channel(interaction, state):
         return
 
+    await interaction.response.defer()
+
     disconnected = False
     async with state.voice_connect_lock:
         voice = state.voice
@@ -5445,14 +5447,15 @@ async def leave(interaction: discord.Interaction) -> None:
             disconnected = True
 
     if not disconnected:
-        await send_ephemeral_response(
-            interaction,
-            "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
+        await interaction.edit_original_response(
+            content="봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
         )
         return
 
-    await show_idle_panel(interaction.guild_id, state)
-    await interaction.response.send_message("음성 채널에서 나왔어요.")
+    try:
+        await interaction.edit_original_response(content="음성 채널에서 나왔어요.")
+    finally:
+        await show_idle_panel(interaction.guild_id, state)
 
 
 def main() -> None:

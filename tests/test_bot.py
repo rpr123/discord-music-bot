@@ -7300,11 +7300,23 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         requester.guild = guild
         channel.members = [requester]
 
+        defer_lock_states: list[bool] = []
+
+        async def record_defer() -> None:
+            defer_lock_states.append(state.voice_connect_lock.locked())
+
+        edit_response = MagicMock(status=500, reason="Internal Server Error")
+        edit_error = bot.discord.DiscordServerError(
+            edit_response,
+            "<html>temporary failure</html>",
+        )
         interaction = MagicMock()
         interaction.guild_id = guild_id
         interaction.user = requester
+        interaction.response.defer = AsyncMock(side_effect=record_defer)
         interaction.response.send_message = AsyncMock()
         interaction.response.is_done.return_value = False
+        interaction.edit_original_response = AsyncMock(side_effect=edit_error)
 
         state = bot.get_state(guild_id)
         state.voice = old_voice
@@ -7336,6 +7348,10 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
                 leave_task = asyncio.create_task(bot.leave.callback(interaction))
                 await asyncio.wait_for(disconnect_started.wait(), timeout=1)
 
+                interaction.response.defer.assert_awaited_once_with()
+                self.assertEqual(defer_lock_states, [False])
+                interaction.response.send_message.assert_not_awaited()
+                interaction.edit_original_response.assert_not_awaited()
                 self.assertEqual(
                     state.playback_generation,
                     original_generation + 1,
@@ -7353,6 +7369,11 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
 
                 release_disconnect.set()
                 await asyncio.wait_for(panel_started.wait(), timeout=1)
+                interaction.edit_original_response.assert_awaited_once_with(
+                    content="음성 채널에서 나왔어요."
+                )
+                interaction.response.send_message.assert_not_awaited()
+                self.assertFalse(leave_task.done())
                 result, request_generation = await asyncio.wait_for(
                     request_task,
                     timeout=1,
@@ -7367,7 +7388,9 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(state.voice, new_voice)
 
                 release_panel.set()
-                await asyncio.wait_for(leave_task, timeout=1)
+                with self.assertRaises(bot.discord.DiscordServerError) as raised:
+                    await asyncio.wait_for(leave_task, timeout=1)
+                self.assertIs(raised.exception, edit_error)
             finally:
                 release_disconnect.set()
                 release_panel.set()
@@ -7391,8 +7414,9 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(new_voice.is_connected())
         self.assertIs(state.voice, new_voice)
         self.assertIsNone(state.empty_channel_task)
-        interaction.response.send_message.assert_awaited_once_with(
-            "음성 채널에서 나왔어요."
+        interaction.response.send_message.assert_not_awaited()
+        interaction.edit_original_response.assert_awaited_once_with(
+            content="음성 채널에서 나왔어요."
         )
 
     async def test_stale_registered_voice_is_cleaned_before_reconnecting(self) -> None:
