@@ -101,6 +101,13 @@ from music_request_parsing import (
     is_youtube_search_query,
     parse_music_request,
 )
+from music_script_detection import (
+    HANGUL_RE,
+    JAPANESE_HAN_RE,
+    JAPANESE_KANA_RE,
+    lyrics_are_japanese,
+    lyrics_are_primarily_korean,
+)
 from music_search_scoring import (
     ALTERNATE_VERSION_SEARCH_RE,
     ARTIST_CHANNEL_SUFFIX_RE,
@@ -2560,14 +2567,9 @@ class LyricsReadingError(RuntimeError):
     pass
 
 
-JAPANESE_KANA_RE = re.compile(r"[\u3041-\u309f\u30a0-\u30ff]")
 JAPANESE_READING_RE = re.compile(
     r"^[\u3041-\u309f\u30a0-\u30ff\u30fc\u3005\u30fb\uff65\s]+$"
 )
-JAPANESE_HAN_RE = re.compile(
-    r"[\u3005\u3007\u303b\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"
-)
-HANGUL_RE = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
 EXPLICIT_READING_BRACKETS = (
     ("(", ")"),
     ("（", "）"),
@@ -3819,21 +3821,6 @@ async def get_track_lyrics(track: Track) -> str | None:
     track.lyrics = lyrics
     track.lyrics_loaded = True
     return lyrics
-
-
-def lyrics_are_japanese(track: Track, lyrics: str) -> bool:
-    language = (track.subtitle_language or "").lower()
-    if language == "ja" or language.startswith("ja-"):
-        return True
-    return bool(JAPANESE_KANA_RE.search(lyrics) or JAPANESE_KANA_RE.search(track.title))
-
-
-def lyrics_are_primarily_korean(lyrics: str) -> bool:
-    letters = [character for character in lyrics if character.isalpha()]
-    if not letters:
-        return False
-    hangul_characters = sum(bool(HANGUL_RE.fullmatch(character)) for character in letters)
-    return hangul_characters / len(letters) >= 0.5
 
 
 def can_show_korean_lyrics(track: Track, lyrics: str) -> bool:
