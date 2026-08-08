@@ -1,6 +1,7 @@
 import ast
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 import bot
 import music_request_parsing
@@ -44,7 +45,81 @@ class MusicRequestParsingTests(unittest.TestCase):
 
         self.assertEqual(
             imported_modules,
-            {"__future__", "re", "urllib.parse"},
+            {"__future__", "collections.abc", "re", "urllib.parse"},
+        )
+
+    def test_auto_request_parser_accepts_supported_count_syntax(self) -> None:
+        cases = {
+            "auto5: back number": ("back number", 5),
+            "auto 5: back number": ("back number", 5),
+            "AUTO12 : lofi chill": ("lofi chill", 12),
+        }
+
+        for request, expected in cases.items():
+            with self.subTest(request=request):
+                self.assertEqual(
+                    music_request_parsing.parse_auto_request(
+                        request,
+                        default_count=3,
+                        clamp_count=lambda count: count,
+                    ),
+                    expected,
+                )
+
+    def test_auto_request_parser_uses_default_count(self) -> None:
+        self.assertEqual(
+            music_request_parsing.parse_auto_request(
+                "auto: back number",
+                default_count=7,
+                clamp_count=lambda count: count,
+            ),
+            ("back number", 7),
+        )
+
+    def test_auto_request_parser_uses_supplied_clamp_callback(self) -> None:
+        clamp_count = Mock(return_value=9)
+
+        self.assertEqual(
+            music_request_parsing.parse_auto_request(
+                "auto999: lofi chill",
+                default_count=3,
+                clamp_count=clamp_count,
+            ),
+            ("lofi chill", 9),
+        )
+        clamp_count.assert_called_once_with(999)
+        self.assertEqual(music_request_parsing.clamp_auto_count(0, 25), 1)
+        self.assertEqual(music_request_parsing.clamp_auto_count(999, 25), 25)
+
+    def test_auto_request_parser_preserves_existing_validation_errors(self) -> None:
+        cases = {
+            "auto:": "auto: 뒤에 곡명이나 아티스트를 입력해 주세요.",
+            "auto5:": (
+                "auto5: 또는 auto 5: 뒤에 곡명이나 아티스트를 입력해 주세요."
+            ),
+            "auto:5 back number": (
+                "곡 개수는 `auto5: 곡명` 또는 `auto 5: 곡명`처럼 "
+                "콜론 앞에 입력해 주세요."
+            ),
+        }
+
+        for request, expected in cases.items():
+            with self.subTest(request=request):
+                with self.assertRaises(ValueError) as raised:
+                    music_request_parsing.parse_auto_request(
+                        request,
+                        default_count=3,
+                        clamp_count=lambda count: count,
+                    )
+                self.assertEqual(str(raised.exception), expected)
+
+    def test_auto_request_parser_ignores_unrelated_requests(self) -> None:
+        self.assertIsNone(
+            music_request_parsing.parse_auto_request(
+                "automatic playlist",
+                default_count=3,
+                clamp_count=lambda count: count,
+            )
         )
 
     def test_album_and_playlist_prefixes_preserve_the_request(self) -> None:
