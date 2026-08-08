@@ -134,6 +134,13 @@ from music_namuwiki_interleaved import (
     extract_interleaved_namuwiki_lyrics,
     normalize_namuwiki_table_text,
 )
+from music_namuwiki_parsing import (
+    NamuWikiLyricsError,
+    NamuWikiPageBlockedError,
+    extract_namuwiki_lyrics_from_html,
+    extract_namuwiki_lyrics_from_namumark,
+    parse_namuwiki_html_tables,
+)
 from music_namuwiki_readings import (
     extract_namuwiki_annotated_reading,
     extract_namuwiki_original_lyrics,
@@ -2609,14 +2616,6 @@ class KoreanLyricsError(RuntimeError):
     pass
 
 
-class NamuWikiLyricsError(RuntimeError):
-    pass
-
-
-class NamuWikiPageBlockedError(NamuWikiLyricsError):
-    pass
-
-
 class LyricsReadingError(RuntimeError):
     pass
 
@@ -2644,26 +2643,6 @@ NAMUWIKI_BLOCKED_MARKERS = (
     "비정상적인 접근",
     "차단되었습니다",
 )
-
-
-def parse_namuwiki_html_tables(source: str) -> list[list[list[str]]]:
-    parser = NamuWikiHTMLTableParser()
-    try:
-        parser.feed(source)
-        parser.close()
-    except Exception as error:
-        raise NamuWikiLyricsError(f"Could not parse NamuWiki HTML: {error}") from error
-    return parser.tables
-
-
-def extract_namuwiki_lyrics_from_namumark(source: str) -> str | None:
-    return extract_namuwiki_lyrics_from_tables(parse_namumark_tables(source))
-
-
-def extract_namuwiki_lyrics_from_html(source: str) -> str | None:
-    return extract_namuwiki_lyrics_from_tables(
-        parse_namuwiki_html_tables(source)
-    )
 
 
 def get_namuwiki_override(track: Track) -> str | None:
