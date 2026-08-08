@@ -1554,7 +1554,10 @@ async def delete_music_request_message(message: discord.Message) -> None:
         log_discord_http_error("deleting a music request", error)
 
 
-async def delete_message_later(message: discord.Message, delay_seconds: int) -> None:
+async def delete_message_later(
+    message: discord.Message,
+    delay_seconds: float,
+) -> None:
     await asyncio.sleep(delay_seconds)
     try:
         await message.delete()
@@ -1562,6 +1565,22 @@ async def delete_message_later(message: discord.Message, delay_seconds: int) -> 
         pass
     except discord.HTTPException as error:
         log_discord_http_error("deleting temporary music feedback", error)
+
+
+async def delete_interaction_response_later(
+    interaction: discord.Interaction,
+    delay_seconds: float,
+) -> None:
+    await asyncio.sleep(delay_seconds)
+    try:
+        await interaction.delete_original_response()
+    except discord.NotFound:
+        pass
+    except discord.HTTPException as error:
+        log_discord_http_error(
+            "deleting a temporary interaction response",
+            error,
+        )
 
 
 async def notify_playback_error(state: GuildMusicState, content: str) -> None:
@@ -1759,17 +1778,18 @@ async def send_ephemeral_response(
     *,
     embed: discord.Embed | None = None,
     view: discord.ui.View | None = None,
-    delete_after: float = EPHEMERAL_RESPONSE_DELETE_SECONDS,
+    delete_after: float | None = EPHEMERAL_RESPONSE_DELETE_SECONDS,
 ) -> None:
-    options: dict[str, object] = {
-        "ephemeral": True,
-        "delete_after": delete_after,
-    }
+    options: dict[str, object] = {"ephemeral": True}
     if embed is not None:
         options["embed"] = embed
     if view is not None:
         options["view"] = view
     await interaction.response.send_message(content, **options)
+    if delete_after is not None:
+        create_housekeeping_task(
+            delete_interaction_response_later(interaction, delete_after)
+        )
 
 
 async def send_ephemeral_followup(
@@ -1793,7 +1813,7 @@ async def send_ephemeral_followup(
         options["view"] = view
     message = await interaction.followup.send(content, **options)
     if message is not None and delete_after is not None:
-        await message.delete(delay=delete_after)
+        create_housekeeping_task(delete_message_later(message, delete_after))
     return message
 
 

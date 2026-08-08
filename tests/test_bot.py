@@ -2902,32 +2902,60 @@ class CommandSurfaceTests(unittest.TestCase):
 
 
 class EphemeralResponseTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        bot.housekeeping_tasks.clear()
+        bot.bot_shutdown_started = False
+        bot.auxiliary_workers_closing = False
+        bot.lyrics_executor_closing = False
+
     async def asyncTearDown(self) -> None:
+        tasks = list(bot.housekeeping_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        bot.housekeeping_tasks.clear()
+        bot.bot_shutdown_started = False
+        bot.auxiliary_workers_closing = False
+        bot.lyrics_executor_closing = False
         for state in bot.music_states.values():
             bot.cancel_queue_message_cleanups(state)
             bot.schedule_private_lyrics_cleanup(state)
         await asyncio.sleep(0)
         bot.music_states.clear()
 
-    async def test_standard_private_response_uses_common_expiry(self) -> None:
+    async def test_standard_private_response_uses_managed_expiry(self) -> None:
         interaction = MagicMock()
         interaction.response.send_message = AsyncMock()
+        interaction.delete_original_response = AsyncMock()
 
-        await bot.send_ephemeral_response(interaction, "완료")
+        tasks_before = set(bot.housekeeping_tasks)
+        with patch.object(bot.asyncio, "sleep", new=AsyncMock()) as sleep:
+            await bot.send_ephemeral_response(interaction, "완료")
+            tasks = bot.housekeeping_tasks - tasks_before
+            self.assertEqual(len(tasks), 1)
+            await next(iter(tasks))
+        await asyncio.sleep(0)
 
         interaction.response.send_message.assert_awaited_once_with(
             "완료",
             ephemeral=True,
-            delete_after=bot.EPHEMERAL_RESPONSE_DELETE_SECONDS,
         )
+        sleep.assert_awaited_once_with(bot.EPHEMERAL_RESPONSE_DELETE_SECONDS)
+        interaction.delete_original_response.assert_awaited_once_with()
 
-    async def test_private_followup_schedules_common_expiry(self) -> None:
+    async def test_private_followup_uses_managed_expiry(self) -> None:
         interaction = MagicMock()
         message = MagicMock()
         message.delete = AsyncMock()
         interaction.followup.send = AsyncMock(return_value=message)
 
-        result = await bot.send_ephemeral_followup(interaction, "완료")
+        tasks_before = set(bot.housekeeping_tasks)
+        with patch.object(bot.asyncio, "sleep", new=AsyncMock()) as sleep:
+            result = await bot.send_ephemeral_followup(interaction, "완료")
+            tasks = bot.housekeeping_tasks - tasks_before
+            self.assertEqual(len(tasks), 1)
+            await next(iter(tasks))
+        await asyncio.sleep(0)
 
         self.assertIs(result, message)
         interaction.followup.send.assert_awaited_once_with(
@@ -2935,9 +2963,58 @@ class EphemeralResponseTests(unittest.IsolatedAsyncioTestCase):
             ephemeral=True,
             wait=True,
         )
-        message.delete.assert_awaited_once_with(
-            delay=bot.EPHEMERAL_RESPONSE_DELETE_SECONDS
+        sleep.assert_awaited_once_with(bot.EPHEMERAL_RESPONSE_DELETE_SECONDS)
+        message.delete.assert_awaited_once_with()
+
+    async def test_ephemeral_expiry_tasks_are_cancelled_on_shutdown(self) -> None:
+        interaction = MagicMock()
+        interaction.response.send_message = AsyncMock()
+        interaction.delete_original_response = AsyncMock()
+        message = MagicMock()
+        message.delete = AsyncMock()
+        interaction.followup.send = AsyncMock(return_value=message)
+
+        await bot.send_ephemeral_response(interaction, "응답", delete_after=60)
+        await bot.send_ephemeral_followup(interaction, "후속", delete_after=60)
+        tasks = set(bot.housekeeping_tasks)
+        self.assertEqual(len(tasks), 2)
+
+        bot.begin_bot_shutdown()
+        await bot.shutdown_housekeeping_tasks()
+
+        self.assertTrue(all(task.cancelled() for task in tasks))
+        self.assertFalse(bot.housekeeping_tasks)
+        interaction.delete_original_response.assert_not_awaited()
+        message.delete.assert_not_awaited()
+
+    async def test_ephemeral_delete_after_none_schedules_nothing(self) -> None:
+        interaction = MagicMock()
+        interaction.response.send_message = AsyncMock()
+        interaction.delete_original_response = AsyncMock()
+        message = MagicMock()
+        message.delete = AsyncMock()
+        interaction.followup.send = AsyncMock(return_value=message)
+
+        await bot.send_ephemeral_response(interaction, "응답", delete_after=None)
+        result = await bot.send_ephemeral_followup(
+            interaction,
+            "후속",
+            delete_after=None,
         )
+
+        self.assertIs(result, message)
+        self.assertFalse(bot.housekeeping_tasks)
+        interaction.response.send_message.assert_awaited_once_with(
+            "응답",
+            ephemeral=True,
+        )
+        interaction.followup.send.assert_awaited_once_with(
+            "후속",
+            ephemeral=True,
+            wait=True,
+        )
+        interaction.delete_original_response.assert_not_awaited()
+        message.delete.assert_not_awaited()
 
     async def test_queue_response_starts_with_common_expiry(self) -> None:
         guild_id = 701
