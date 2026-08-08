@@ -112,6 +112,11 @@ from music_namuwiki_artists import (
     get_namuwiki_track_artists,
     namuwiki_artist_matches_track,
 )
+from music_namuwiki_candidates import (
+    build_namuwiki_document_candidates,
+    find_namuwiki_override,
+    parse_namuwiki_candidate,
+)
 from music_namuwiki_html_tables import (
     NAMUWIKI_IGNORED_HTML_TAGS,
     NAMUWIKI_VOID_HTML_TAGS,
@@ -2646,113 +2651,19 @@ NAMUWIKI_BLOCKED_MARKERS = (
 
 
 def get_namuwiki_override(track: Track) -> str | None:
-    if not NAMUWIKI_DOCUMENT_OVERRIDES:
-        return None
-
-    keys: list[str] = []
-    video_id = get_track_video_id(track)
-    if video_id:
-        keys.extend((f"video:{video_id}", video_id))
-    keys.extend(
-        value
-        for value in (
-            normalize_track_key(track),
-            track.song_name,
-            track.title,
-        )
-        if value
-    )
-    normalized_overrides = {
-        key.casefold(): value
-        for key, value in NAMUWIKI_DOCUMENT_OVERRIDES.items()
-    }
-    for key in keys:
-        override = normalized_overrides.get(key.casefold())
-        if override:
-            return override
-    return None
+    return find_namuwiki_override(track, NAMUWIKI_DOCUMENT_OVERRIDES)
 
 
 def get_namuwiki_document_candidates(track: Track) -> list[str]:
-    candidates: list[str] = []
-    artists = get_namuwiki_track_artists(track)
-
-    def add(value: str | None) -> None:
-        if not value:
-            return
-        candidate = value.strip().strip("\"'")
-        if (
-            not candidate
-            or "\n" in candidate
-            or len(candidate) > 1000
-            or candidate in candidates
-        ):
-            return
-        candidates.append(candidate)
-
-    def add_title(value: str | None) -> None:
-        if not value:
-            return
-        title = value.strip().strip("\"'")
-        add(title)
-        for artist in artists:
-            add(f"{title}({artist})")
-
-    add(get_namuwiki_override(track))
-    add_title(track.song_name)
-
-    quoted_match = QUOTED_TRACK_TITLE_RE.match(track.title)
-    if quoted_match:
-        add_title(quoted_match.group("title"))
-
-    raw_parts = re.split(
-        r"\s+(?:-|–|—|\|)\s+",
-        track.title,
-        maxsplit=1,
+    return build_namuwiki_document_candidates(
+        track,
+        get_namuwiki_override(track),
+        NAMUWIKI_MAX_DOCUMENT_CANDIDATES,
     )
-    if len(raw_parts) == 2:
-        cleaned_part = clean_track_title_preserving_case(raw_parts[1])
-        add_title(cleaned_part)
-        add_title(strip_edge_title_tags(cleaned_part))
-        add_title(raw_parts[1])
-    else:
-        cleaned_title = clean_track_title_preserving_case(track.title)
-        add_title(cleaned_title)
-        add_title(strip_edge_title_tags(cleaned_title))
-
-    track_name, _ = get_lyrics_search_terms(track)
-    add_title(track_name)
-    add_title(clean_track_title(track.title))
-    return candidates[:NAMUWIKI_MAX_DOCUMENT_CANDIDATES]
 
 
 def split_namuwiki_candidate(candidate: str) -> tuple[str, str]:
-    parsed = urllib.parse.urlparse(candidate)
-    if parsed.scheme:
-        if parsed.scheme not in {"http", "https"}:
-            raise NamuWikiLyricsError("NamuWiki override URL must use HTTP or HTTPS.")
-        marker = "/w/"
-        if marker not in parsed.path:
-            raise NamuWikiLyricsError("NamuWiki override URL must point to a /w/ page.")
-        path_prefix, encoded_document = parsed.path.split(marker, 1)
-        document = urllib.parse.unquote(encoded_document).strip()
-        encoded_path = (
-            f"{path_prefix}{marker}"
-            f"{urllib.parse.quote(document, safe='')}"
-        )
-        page_url = urllib.parse.urlunparse(
-            (parsed.scheme, parsed.netloc, encoded_path, "", "", "")
-        )
-    else:
-        document = candidate.strip()
-        page_url = (
-            f"{NAMUWIKI_PAGE_BASE_URL}/"
-            f"{urllib.parse.quote(document, safe='')}"
-        )
-
-    if not document or "\n" in document or len(document) > 255:
-        raise NamuWikiLyricsError("NamuWiki document title is invalid.")
-    return document, page_url
+    return parse_namuwiki_candidate(candidate, NAMUWIKI_PAGE_BASE_URL)
 
 
 def wait_for_namuwiki_interval() -> None:
