@@ -16,7 +16,7 @@ from music_search_scoring import (
     normalize_identity_component,
     strip_edge_title_tags,
 )
-from music_track_identity import get_track_video_id, normalize_track_key
+from music_track_metadata import get_track_video_id, normalize_track_key
 
 
 def extract_namuwiki_primary_artist_from_tables(

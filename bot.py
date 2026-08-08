@@ -210,19 +210,17 @@ from music_subtitles import (
     select_korean_manual_subtitle,
     select_manual_subtitle,
 )
-from music_track_identity import (
-    get_track_identity_keys,
-    get_track_video_id,
-    get_video_id,
-    normalize_track_key,
-)
-from music_track_factory import (
+from music_track_metadata import (
     get_audio_codec,
     get_entry_url,
     get_manual_subtitles,
     get_resolved_stream_url,
     get_thumbnail_url,
+    get_track_identity_keys,
+    get_track_video_id,
+    get_video_id,
     make_track_from_info,
+    normalize_track_key,
 )
 from ytmusicapi import YTMusic
 from ytmusicapi.auth.oauth import OAuthCredentials

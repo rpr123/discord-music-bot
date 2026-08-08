@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Deque
 
 from music_models import GuildMusicState, Track
-from music_track_identity import (
+from music_track_metadata import (
     get_track_identity_keys,
     get_track_video_id,
     normalize_track_key,

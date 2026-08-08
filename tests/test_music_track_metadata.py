@@ -3,30 +3,34 @@ import unittest
 from pathlib import Path
 
 import bot
-import music_track_factory
+import music_track_metadata
 
 
 MOVED_FUNCTION_NAMES = (
+    "get_video_id",
+    "normalize_track_key",
+    "get_track_video_id",
+    "get_track_identity_keys",
+    "get_resolved_stream_url",
     "get_audio_codec",
+    "get_thumbnail_url",
     "get_entry_url",
     "get_manual_subtitles",
-    "get_resolved_stream_url",
-    "get_thumbnail_url",
     "make_track_from_info",
 )
 
 
-class MusicTrackFactoryTests(unittest.TestCase):
-    def test_bot_reexports_moved_factory_functions(self) -> None:
+class MusicTrackMetadataTests(unittest.TestCase):
+    def test_bot_reexports_moved_track_metadata_functions(self) -> None:
         for name in MOVED_FUNCTION_NAMES:
             with self.subTest(name=name):
                 self.assertIs(
                     getattr(bot, name),
-                    getattr(music_track_factory, name),
+                    getattr(music_track_metadata, name),
                 )
 
-    def test_module_does_not_import_bot(self) -> None:
-        source = Path(music_track_factory.__file__).read_text(encoding="utf-8")
+    def test_module_has_only_the_expected_import_dependencies(self) -> None:
+        source = Path(music_track_metadata.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
         imported_modules = {
             node.module
@@ -46,7 +50,8 @@ class MusicTrackFactoryTests(unittest.TestCase):
                 "__future__",
                 "copy",
                 "music_models",
-                "music_track_identity",
+                "music_search_scoring",
+                "re",
                 "time",
                 "urllib.parse",
             },
@@ -74,7 +79,7 @@ class MusicTrackFactoryTests(unittest.TestCase):
             "_music_bot_extracted_at": 123.5,
         }
 
-        track = music_track_factory.make_track_from_info(
+        track = music_track_metadata.make_track_from_info(
             info,
             "requester",
             "fallback",
@@ -112,9 +117,9 @@ class MusicTrackFactoryTests(unittest.TestCase):
             "formats": [{"acodec": "opus"}],
         }
 
-        self.assertIsNone(music_track_factory.get_resolved_stream_url(info))
+        self.assertIsNone(music_track_metadata.get_resolved_stream_url(info))
         self.assertIsNone(
-            music_track_factory.get_resolved_stream_url(
+            music_track_metadata.get_resolved_stream_url(
                 {"url": "https://stream.example.test/audio"}
             )
         )

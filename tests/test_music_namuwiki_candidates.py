@@ -44,7 +44,7 @@ class MusicNamuWikiCandidatesTests(unittest.TestCase):
                 "music_models",
                 "music_namuwiki_parsing",
                 "music_search_scoring",
-                "music_track_identity",
+                "music_track_metadata",
                 "re",
                 "unicodedata",
                 "urllib.parse",

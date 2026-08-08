@@ -5,7 +5,7 @@ from pathlib import Path
 
 import bot
 import music_autoplay_policy
-import music_track_identity
+import music_track_metadata
 from music_models import GuildMusicState, Track
 
 
@@ -64,7 +64,7 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             {
                 "__future__",
                 "music_models",
-                "music_track_identity",
+                "music_track_metadata",
                 "typing",
             },
         )
@@ -84,11 +84,11 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
 
         self.assertEqual(
             list(state.recent_track_keys),
-            [music_track_identity.normalize_track_key(track)],
+            [music_track_metadata.normalize_track_key(track)],
         )
         self.assertEqual(
             list(state.recent_video_ids),
-            [music_track_identity.get_track_video_id(track)],
+            [music_track_metadata.get_track_video_id(track)],
         )
 
     def test_autoplay_excluded_keys_include_recent_current_and_queue(self) -> None:
@@ -104,10 +104,10 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
         self.assertIn("song:recent", excluded)
         self.assertIn("video:abcdefghijk", excluded)
         self.assertTrue(
-            music_track_identity.get_track_identity_keys(current).issubset(excluded)
+            music_track_metadata.get_track_identity_keys(current).issubset(excluded)
         )
         self.assertTrue(
-            music_track_identity.get_track_identity_keys(queued).issubset(excluded)
+            music_track_metadata.get_track_identity_keys(queued).issubset(excluded)
         )
 
     def test_select_autoplay_candidate_respects_all_exclusions_and_order(
@@ -123,10 +123,10 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
         state = GuildMusicState(current=current)
         state.queue.append(queued)
         state.recent_track_keys.append(
-            music_track_identity.normalize_track_key(recent_key)
+            music_track_metadata.normalize_track_key(recent_key)
         )
         state.recent_video_ids.append("vvvvvvvvvvv")
-        extra_excluded = music_track_identity.get_track_identity_keys(extra)
+        extra_excluded = music_track_metadata.get_track_identity_keys(extra)
         candidates = [
             recent_key,
             recent_video,
@@ -148,10 +148,10 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
 
         all_excluded = set(extra_excluded)
         all_excluded.update(
-            music_track_identity.get_track_identity_keys(first_valid)
+            music_track_metadata.get_track_identity_keys(first_valid)
         )
         all_excluded.update(
-            music_track_identity.get_track_identity_keys(second_valid)
+            music_track_metadata.get_track_identity_keys(second_valid)
         )
         self.assertIsNone(
             music_autoplay_policy.select_autoplay_candidate(
