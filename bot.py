@@ -5,7 +5,6 @@ import concurrent.futures
 import copy
 import functools
 import html
-import io
 import json
 import logging
 import math
@@ -32,6 +31,12 @@ import discord
 import requests
 from discord import app_commands
 from discord.ext import commands
+from music_lyrics_display import (
+    LYRICS_INLINE_LIMIT,
+    make_lyrics_embed,
+    make_lyrics_file,
+    make_lyrics_variant_embed,
+)
 from music_models import AUTOPLAY_HISTORY_SIZE, GuildMusicState, Track
 from music_player_embeds import (
     CONTROL_PANEL_TITLES,
@@ -286,7 +291,6 @@ YOUTUBE_LYRICS_FALLBACK = os.getenv("YOUTUBE_LYRICS_FALLBACK", "true").lower() n
     "no",
     "off",
 }
-LYRICS_INLINE_LIMIT = 3900
 NAMUWIKI_LYRICS_ENABLED = os.getenv(
     "NAMUWIKI_LYRICS_ENABLED", "true"
 ).lower() not in {
@@ -1986,44 +1990,6 @@ def make_bulk_embed(tracks: list[Track], title: str) -> discord.Embed:
     embed.description = "\n".join(preview)
     embed.add_field(name="Added", value=str(len(tracks)), inline=True)
     embed.add_field(name="Limit", value=str(MAX_BULK_TRACKS), inline=True)
-    return embed
-
-
-def make_lyrics_embed(track: Track, description: str) -> discord.Embed:
-    song_title = track.song_name or track.title
-    embed = discord.Embed(
-        title=f"가사 · {truncate_text(song_title, 220)}",
-        description=description,
-        color=discord.Color.blurple(),
-    )
-    artist = track.artist or track.uploader
-    if artist:
-        embed.set_author(name=truncate_text(artist, 200))
-
-    source = track.lyrics_source or "LRCLIB → YouTube 수동 자막"
-    embed.set_footer(text=f"{source} · 원문 가사")
-    return embed
-
-
-def make_lyrics_variant_embed(
-    track: Track,
-    label: str,
-    description: str,
-    source: str,
-    source_url: str | None = None,
-) -> discord.Embed:
-    song_title = track.song_name or track.title
-    embed = discord.Embed(
-        title=f"{label} · {truncate_text(song_title, 220)}",
-        description=description,
-        color=discord.Color.blurple(),
-    )
-    artist = track.artist or track.uploader
-    if artist:
-        embed.set_author(name=truncate_text(artist, 200))
-    if source_url:
-        embed.url = source_url
-    embed.set_footer(text=source)
     return embed
 
 
@@ -4407,13 +4373,6 @@ def schedule_lyrics_message_cleanup(guild_id: int, state: GuildMusicState) -> No
     replace_lyrics_view(state, None)
     if message is not None and not bot_shutdown_started:
         create_housekeeping_task(delete_music_channel_message(guild_id, message))
-
-
-def make_lyrics_file(lyrics: str, filename: str = "lyrics.txt") -> discord.File:
-    return discord.File(
-        io.BytesIO(lyrics.encode("utf-8")),
-        filename=filename,
-    )
 
 
 def track_is_current(guild_id: int, track: Track) -> bool:
