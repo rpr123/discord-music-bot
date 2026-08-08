@@ -5385,14 +5385,16 @@ async def remove_from_queue(interaction: discord.Interaction, position: int) -> 
         return
 
     schedule_autoplay_refill(interaction.guild_id)
-    if state.current:
-        await update_control_panel(interaction.guild_id, state)
-
-    await send_ephemeral_response(
-        interaction,
-        f"대기열에서 `{removed.title}`을 삭제했어요.",
-        delete_after=QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
-    )
+    refresh_panel = state.current is not None
+    try:
+        await send_ephemeral_response(
+            interaction,
+            f"대기열에서 `{removed.title}`을 삭제했어요.",
+            delete_after=QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
+        )
+    finally:
+        if refresh_panel:
+            await update_control_panel(interaction.guild_id, state)
 
 
 @bot.tree.command(name="nowplaying", description="Show the current track.")

@@ -3629,6 +3629,159 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(edited_view, bot.MusicControlView)
         self.assertTrue(all(not item.disabled for item in edited_view.children))
 
+    async def test_remove_responds_before_blocked_panel_and_converges_after_response_failure(
+        self,
+    ) -> None:
+        guild_id = 324
+        response_attempted = asyncio.Event()
+
+        class Guild:
+            id = guild_id
+
+        class VoiceChannel:
+            id = 657
+
+        voice_channel = VoiceChannel()
+
+        class TextChannel:
+            id = 658
+            guild = Guild()
+
+            def __init__(self) -> None:
+                self.send = AsyncMock()
+
+        text_channel = TextChannel()
+
+        class Message:
+            id = 991
+
+            def __init__(self) -> None:
+                self.channel = text_channel
+                self.edit = AsyncMock()
+
+        message = Message()
+
+        class Voice:
+            channel = voice_channel
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return True
+
+            def is_paused(self) -> bool:
+                return False
+
+        class User:
+            voice = type("MemberVoice", (), {"channel": voice_channel})()
+
+        response = MagicMock(status=500, reason="Internal Server Error")
+        response_error = bot.discord.DiscordServerError(
+            response,
+            "<html>temporary failure</html>",
+        )
+
+        async def fail_response(*_args: object, **_kwargs: object) -> None:
+            response_attempted.set()
+            raise response_error
+
+        interaction = MagicMock()
+        interaction.guild_id = guild_id
+        interaction.user = User()
+        interaction.response.send_message = AsyncMock(side_effect=fail_response)
+        interaction.response.is_done.return_value = False
+
+        current = make_track("now-playing")
+        first = make_track("remove-first")
+        second = make_track("keep-second")
+        state = bot.get_state(guild_id)
+        state.voice = Voice()
+        state.current = current
+        state.queue.extend([first, second])
+        state.autoplay_enabled = False
+        state.control_message = message
+        state.announcement_channel = text_channel
+        remove_task = None
+        test_holds_lock = False
+
+        expected_content = f"대기열에서 `{first.title}`을 삭제했어요."
+        with (
+            patch.object(bot, "get_music_channel_id", return_value=None),
+            patch.object(
+                bot,
+                "send_ephemeral_response",
+                wraps=bot.send_ephemeral_response,
+            ) as send_ephemeral_response,
+        ):
+            try:
+                await asyncio.wait_for(state.control_panel_lock.acquire(), timeout=1)
+                test_holds_lock = True
+                remove_task = asyncio.create_task(
+                    bot.remove_from_queue.callback(interaction, 1)
+                )
+                await asyncio.wait_for(response_attempted.wait(), timeout=1)
+
+                send_ephemeral_response.assert_awaited_once_with(
+                    interaction,
+                    expected_content,
+                    delete_after=bot.QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
+                )
+                interaction.response.send_message.assert_awaited_once_with(
+                    expected_content,
+                    ephemeral=True,
+                )
+                self.assertEqual(list(state.queue), [second])
+                self.assertIs(state.current, current)
+                self.assertFalse(remove_task.done())
+                message.edit.assert_not_awaited()
+
+                state.control_panel_lock.release()
+                test_holds_lock = False
+                with self.assertRaises(bot.discord.DiscordServerError) as raised:
+                    await asyncio.wait_for(remove_task, timeout=1)
+                self.assertIs(raised.exception, response_error)
+            finally:
+                if test_holds_lock:
+                    state.control_panel_lock.release()
+                if remove_task is not None and not remove_task.done():
+                    remove_task.cancel()
+                if remove_task is not None:
+                    await asyncio.wait_for(
+                        asyncio.gather(remove_task, return_exceptions=True),
+                        timeout=1,
+                    )
+                autoplay_task = state.autoplay_task
+                bot.cancel_autoplay_refill(state)
+                if autoplay_task is not None:
+                    await asyncio.wait_for(
+                        asyncio.gather(autoplay_task, return_exceptions=True),
+                        timeout=1,
+                    )
+                empty_timer = state.empty_channel_task
+                bot.cancel_empty_channel_disconnect(state)
+                if empty_timer is not None:
+                    await asyncio.wait_for(
+                        asyncio.gather(empty_timer, return_exceptions=True),
+                        timeout=1,
+                    )
+                bot.music_states.pop(guild_id, None)
+
+        message.edit.assert_awaited_once()
+        edit_kwargs = message.edit.await_args.kwargs
+        self.assertIsNone(edit_kwargs["content"])
+        self.assertEqual(
+            edit_kwargs["embed"].to_dict(),
+            bot.make_player_embed(current, state).to_dict(),
+        )
+        panel_text = str(edit_kwargs["embed"].to_dict())
+        self.assertIn(second.title, panel_text)
+        self.assertNotIn(first.title, panel_text)
+        active_view = edit_kwargs["view"]
+        self.assertIsInstance(active_view, bot.MusicControlView)
+        self.assertTrue(all(not item.disabled for item in active_view.children))
+        text_channel.send.assert_not_awaited()
+
     async def test_idle_panel_becomes_playing_without_creating_another_message(self) -> None:
         class Guild:
             id = 321
