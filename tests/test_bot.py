@@ -5904,11 +5904,12 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         voice = Voice(channel)
 
         class Member:
-            pass
+            bot = False
 
         member = Member()
         member.guild = guild
         member.voice = type("MemberVoice", (), {"channel": channel})()
+        channel.members = [member]
         state = bot.GuildMusicState()
 
         first = asyncio.create_task(bot.ensure_voice_for_member(member, state))
@@ -5923,6 +5924,122 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results, [(True, None), (True, None)])
         self.assertEqual(channel.connect_calls, 1)
         self.assertIs(state.voice, voice)
+
+    async def test_voice_move_replaces_empty_timer_after_member_leaves(
+        self,
+    ) -> None:
+        guild_id = 817
+        move_started = asyncio.Event()
+        release_move = asyncio.Event()
+
+        class Member:
+            def __init__(self, *, bot_member: bool) -> None:
+                self.bot = bot_member
+
+        class Channel:
+            def __init__(
+                self,
+                channel_id: int,
+                members: list[Member],
+            ) -> None:
+                self.id = channel_id
+                self.members = members
+                self.mention = f"<#{channel_id}>"
+
+        old_channel = Channel(1201, [Member(bot_member=True)])
+        new_channel = Channel(1202, [])
+
+        class Voice:
+            def __init__(self) -> None:
+                self.channel = old_channel
+                self.move_to = AsyncMock(side_effect=self._move_to)
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return False
+
+            def is_paused(self) -> bool:
+                return False
+
+            async def _move_to(self, channel: Channel) -> None:
+                move_started.set()
+                await release_move.wait()
+                self.channel = channel
+
+        voice = Voice()
+
+        class Guild:
+            id = guild_id
+            voice_client = voice
+
+        guild = Guild()
+
+        class Requester(Member):
+            pass
+
+        requester = Requester(bot_member=False)
+        requester.guild = guild
+        requester.voice = type("MemberVoice", (), {"channel": new_channel})()
+        new_channel.members.append(requester)
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        movement = None
+        old_timer = None
+        new_timer = None
+
+        with patch.object(bot, "EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS", 60):
+            try:
+                bot.update_empty_channel_disconnect(state, guild_id)
+                old_timer = state.empty_channel_task
+                self.assertIsNotNone(old_timer)
+
+                movement = asyncio.create_task(
+                    bot.ensure_voice_for_member(requester, state)
+                )
+                await asyncio.wait_for(move_started.wait(), timeout=1)
+
+                new_channel.members.clear()
+                requester.voice = type("MemberVoice", (), {"channel": None})()
+                before = type("VoiceState", (), {"channel": new_channel})()
+                after = type("VoiceState", (), {"channel": None})()
+                await bot.on_voice_state_update(requester, before, after)
+                self.assertIs(state.empty_channel_task, old_timer)
+
+                release_move.set()
+                result = await asyncio.wait_for(movement, timeout=1)
+
+                self.assertEqual(result, (True, None))
+                voice.move_to.assert_awaited_once_with(new_channel)
+                self.assertIs(voice.channel, new_channel)
+                self.assertFalse(new_channel.members)
+                new_timer = state.empty_channel_task
+                self.assertIsNotNone(new_timer)
+                self.assertIsNot(new_timer, old_timer)
+                self.assertFalse(new_timer.done())
+            finally:
+                release_move.set()
+                if movement is not None and not movement.done():
+                    movement.cancel()
+                if movement is not None:
+                    await asyncio.gather(movement, return_exceptions=True)
+                timers = {
+                    task
+                    for task in (
+                        old_timer,
+                        new_timer,
+                        state.empty_channel_task,
+                    )
+                    if task is not None
+                }
+                bot.cancel_empty_channel_disconnect(state)
+                for task in timers:
+                    if not task.done():
+                        task.cancel()
+                if timers:
+                    await asyncio.gather(*timers, return_exceptions=True)
+                bot.music_states.pop(guild_id, None)
 
     async def test_connect_race_adopts_discord_registered_voice_client(self) -> None:
         class Guild:
@@ -5961,11 +6078,12 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         voice = Voice(channel)
 
         class Member:
-            pass
+            bot = False
 
         member = Member()
         member.guild = guild
         member.voice = type("MemberVoice", (), {"channel": channel})()
+        channel.members = [member]
         state = bot.GuildMusicState()
 
         result = await bot.ensure_voice_for_member(member, state)
@@ -6065,7 +6183,10 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(voice.channel, new_channel)
 
                 release_panel.set()
-                await asyncio.wait_for(timer, timeout=1)
+                await asyncio.wait_for(
+                    asyncio.gather(timer, return_exceptions=True),
+                    timeout=1,
+                )
             finally:
                 release_panel.set()
                 bot.cancel_empty_channel_disconnect(state)
@@ -6266,11 +6387,12 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         guild.voice_client = stale_voice
 
         class Member:
-            pass
+            bot = False
 
         member = Member()
         member.guild = guild
         member.voice = type("MemberVoice", (), {"channel": channel})()
+        channel.members = [member]
         state = bot.GuildMusicState(voice=stale_voice)
 
         with patch.object(

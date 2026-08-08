@@ -4372,7 +4372,11 @@ async def ensure_voice_channel(
         return False, "The bot is shutting down."
     operation_task = track_voice_operation()
     try:
-        return await _ensure_voice_channel(guild, channel, state)
+        result = await _ensure_voice_channel(guild, channel, state)
+        if result[0]:
+            cancel_empty_channel_disconnect(state)
+            update_empty_channel_disconnect(state, guild.id)
+        return result
     finally:
         voice_operation_tasks.discard(operation_task)
 
