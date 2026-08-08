@@ -1,9 +1,11 @@
 import ast
 import unittest
+from collections import deque
 from pathlib import Path
 
 import bot
 import music_autoplay_policy
+import music_track_identity
 from music_models import GuildMusicState, Track
 
 
@@ -11,17 +13,23 @@ MOVED_NAMES = (
     "AUTOPLAY_QUEUE_TARGET",
     "AUTOPLAY_RETRY_DELAYS_SECONDS",
     "autoplay_can_refill",
+    "get_autoplay_excluded_keys",
     "get_autoplay_retry_delay",
     "get_autoplay_seed",
+    "remember_autoplay_track",
+    "remember_recent_value",
+    "select_autoplay_candidate",
 )
 
 
-def make_track(title: str) -> Track:
+def make_track(title: str, *, video_id: str | None = None) -> Track:
+    video_id = video_id or f"{title:0<11}"[:11]
+    url = f"https://www.youtube.com/watch?v={video_id}"
     return Track(
         title=title,
-        webpage_url=f"https://www.youtube.com/watch?v={title:0<11}"[:43],
+        webpage_url=url,
         requester="tester",
-        source_url=f"https://www.youtube.com/watch?v={title:0<11}"[:43],
+        source_url=url,
     )
 
 
@@ -42,7 +50,7 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
                     getattr(music_autoplay_policy, name),
                 )
 
-    def test_module_depends_only_on_music_models(self) -> None:
+    def test_module_dependencies_are_limited(self) -> None:
         source = Path(music_autoplay_policy.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
         imported_modules = {
@@ -51,7 +59,107 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             if isinstance(node, ast.ImportFrom) and node.module
         }
 
-        self.assertEqual(imported_modules, {"__future__", "music_models"})
+        self.assertEqual(
+            imported_modules,
+            {
+                "__future__",
+                "music_models",
+                "music_track_identity",
+                "typing",
+            },
+        )
+
+    def test_remember_recent_value_moves_duplicates_to_the_end(self) -> None:
+        values = deque(("first", "second", "third"), maxlen=3)
+
+        music_autoplay_policy.remember_recent_value(values, "first")
+
+        self.assertEqual(list(values), ["second", "third", "first"])
+
+    def test_remember_autoplay_track_records_key_and_video_history(self) -> None:
+        state = GuildMusicState()
+        track = make_track("played")
+
+        music_autoplay_policy.remember_autoplay_track(state, track)
+
+        self.assertEqual(
+            list(state.recent_track_keys),
+            [music_track_identity.normalize_track_key(track)],
+        )
+        self.assertEqual(
+            list(state.recent_video_ids),
+            [music_track_identity.get_track_video_id(track)],
+        )
+
+    def test_autoplay_excluded_keys_include_recent_current_and_queue(self) -> None:
+        current = make_track("current")
+        queued = make_track("queued")
+        state = GuildMusicState(current=current)
+        state.queue.append(queued)
+        state.recent_track_keys.append("song:recent")
+        state.recent_video_ids.append("abcdefghijk")
+
+        excluded = music_autoplay_policy.get_autoplay_excluded_keys(state)
+
+        self.assertIn("song:recent", excluded)
+        self.assertIn("video:abcdefghijk", excluded)
+        self.assertTrue(
+            music_track_identity.get_track_identity_keys(current).issubset(excluded)
+        )
+        self.assertTrue(
+            music_track_identity.get_track_identity_keys(queued).issubset(excluded)
+        )
+
+    def test_select_autoplay_candidate_respects_all_exclusions_and_order(
+        self,
+    ) -> None:
+        recent_key = make_track("recent key")
+        recent_video = make_track("recent video", video_id="vvvvvvvvvvv")
+        current = make_track("current")
+        queued = make_track("queued")
+        extra = make_track("extra")
+        first_valid = make_track("first valid")
+        second_valid = make_track("second valid")
+        state = GuildMusicState(current=current)
+        state.queue.append(queued)
+        state.recent_track_keys.append(
+            music_track_identity.normalize_track_key(recent_key)
+        )
+        state.recent_video_ids.append("vvvvvvvvvvv")
+        extra_excluded = music_track_identity.get_track_identity_keys(extra)
+        candidates = [
+            recent_key,
+            recent_video,
+            current,
+            queued,
+            extra,
+            first_valid,
+            second_valid,
+        ]
+
+        self.assertIs(
+            music_autoplay_policy.select_autoplay_candidate(
+                state,
+                candidates,
+                extra_excluded,
+            ),
+            first_valid,
+        )
+
+        all_excluded = set(extra_excluded)
+        all_excluded.update(
+            music_track_identity.get_track_identity_keys(first_valid)
+        )
+        all_excluded.update(
+            music_track_identity.get_track_identity_keys(second_valid)
+        )
+        self.assertIsNone(
+            music_autoplay_policy.select_autoplay_candidate(
+                state,
+                candidates,
+                all_excluded,
+            )
+        )
 
     def test_autoplay_seed_prefers_queue_tail_then_current(self) -> None:
         current = make_track("current")

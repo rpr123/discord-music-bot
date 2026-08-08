@@ -33,8 +33,12 @@ from music_autoplay_policy import (
     AUTOPLAY_QUEUE_TARGET,
     AUTOPLAY_RETRY_DELAYS_SECONDS,
     autoplay_can_refill,
+    get_autoplay_excluded_keys,
     get_autoplay_retry_delay,
     get_autoplay_seed,
+    remember_autoplay_track,
+    remember_recent_value,
+    select_autoplay_candidate,
 )
 from music_japanese_reading import (
     EXPLICIT_READING_BRACKETS,
@@ -212,14 +216,10 @@ from music_subtitles import (
     select_manual_subtitle,
 )
 from music_track_identity import (
-    get_autoplay_excluded_keys,
     get_track_identity_keys,
     get_track_video_id,
     get_video_id,
     normalize_track_key,
-    remember_autoplay_track,
-    remember_recent_value,
-    select_autoplay_candidate,
 )
 from music_track_factory import (
     get_audio_codec,
