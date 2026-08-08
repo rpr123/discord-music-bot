@@ -462,6 +462,61 @@ class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
             "https://www.youtube.com/watch?v=abcdefghijk",
         )
 
+    async def test_auto_fallback_search_uses_flat_options(self) -> None:
+        seed = bot.Track(
+            title="Seed Song",
+            webpage_url="https://example.test/seed",
+            requester="tester",
+            source_url="https://example.test/seed",
+        )
+        candidate = {
+            "id": "candidate01",
+            "title": "Candidate Song",
+            "duration": 180,
+        }
+        extract = AsyncMock(return_value={"entries": [candidate]})
+
+        with patch.object(bot, "extract_ytdl_info", extract):
+            tracks = await bot.extract_auto_tracks_from_seed(seed, "tester", 2)
+
+        self.assertEqual([track.title for track in tracks], ["Seed Song", "Candidate Song"])
+        extract.assert_awaited_once_with(
+            bot.YTDL_SEARCH_OPTIONS,
+            "ytsearch6:Seed Song radio mix",
+            "auto fallback search",
+        )
+
+    async def test_auto_supplemental_search_uses_flat_options(self) -> None:
+        seed = bot.Track(
+            title="Seed Song",
+            webpage_url="https://www.youtube.com/watch?v=abcdefghijk",
+            requester="tester",
+            source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        )
+        supplemental = {
+            "id": "candidate01",
+            "title": "Candidate Song",
+            "duration": 180,
+        }
+        extract = AsyncMock(
+            side_effect=[
+                {"entries": [{"id": "abcdefghijk", "title": "Seed Song"}]},
+                {"entries": [supplemental]},
+            ]
+        )
+
+        with patch.object(bot, "extract_ytdl_info", extract):
+            tracks = await bot.extract_auto_tracks_from_seed(seed, "tester", 2)
+
+        self.assertEqual([track.title for track in tracks], ["Seed Song", "Candidate Song"])
+        self.assertEqual(extract.await_count, 2)
+        self.assertEqual(extract.await_args_list[0].args[0], bot.YTDL_PLAYLIST_OPTIONS)
+        self.assertEqual(extract.await_args_list[1].args[0], bot.YTDL_SEARCH_OPTIONS)
+        self.assertEqual(
+            extract.await_args_list[1].args[2],
+            "auto supplemental search",
+        )
+
 
 class DiscordHttpResilienceTests(unittest.IsolatedAsyncioTestCase):
     def make_server_error(self) -> bot.discord.DiscordServerError:
@@ -2930,6 +2985,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self) -> None:
                 self.fetch_message = AsyncMock()
                 self.send = AsyncMock()
+                self.history = MagicMock()
 
         class Message:
             id = 333
@@ -2951,6 +3007,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result, message)
         channel.fetch_message.assert_awaited_once_with(message.id)
+        channel.history.assert_not_called()
         channel.send.assert_not_awaited()
         message.edit.assert_awaited_once()
 
@@ -2972,7 +3029,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         panel.embeds[0].title = "Added to queue"
         self.assertFalse(bot.is_music_control_panel_message(panel, 77))
 
-    async def test_startup_keeps_latest_panel_and_cleans_channel(self) -> None:
+    async def test_recovery_only_deletes_duplicate_bot_panels(self) -> None:
         class Guild:
             id = 777
 
@@ -3022,7 +3079,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
-            patch.object(bot, "get_control_message_id", return_value=older.id),
+            patch.object(bot, "get_control_message_id", return_value=None),
             patch.object(bot, "set_control_message_id") as save_message_id,
             patch.object(
                 bot,
@@ -3034,18 +3091,17 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 777,
                 state,
                 channel=channel,
-                clean_channel=True,
             )
 
         self.assertIs(result, newest)
         self.assertIs(state.control_message, newest)
         self.assertTrue(channel.history_called)
-        self.assertIsNone(channel.history_limit)
-        channel.fetch_message.assert_awaited_once_with(older.id)
+        self.assertEqual(channel.history_limit, bot.CONTROL_PANEL_HISTORY_LIMIT)
+        channel.fetch_message.assert_not_awaited()
         channel.send.assert_not_awaited()
         older.delete.assert_awaited_once()
-        user_request.delete.assert_awaited_once()
-        temporary_feedback.delete.assert_awaited_once()
+        user_request.delete.assert_not_awaited()
+        temporary_feedback.delete.assert_not_awaited()
         newest.delete.assert_not_awaited()
         newest.edit.assert_awaited_once()
         save_message_id.assert_called_once_with(777, newest.id)
@@ -3112,6 +3168,33 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         unrelated.delete.assert_not_awaited()
         message.edit.assert_awaited_once()
         save_message_id.assert_called_once_with(778, message.id)
+
+    async def test_on_ready_restores_control_panels_only_once(self) -> None:
+        with (
+            patch.object(bot, "startup_initialized", False),
+            patch.object(bot, "commands_synced", False),
+            patch.object(bot, "startup_initialization_lock", asyncio.Lock()),
+            patch.object(bot, "DEV_GUILD_ID", None),
+            patch.object(bot, "load_music_channel_config") as load_config,
+            patch.object(
+                bot,
+                "restore_control_panels",
+                new=AsyncMock(),
+            ) as restore_panels,
+            patch.object(bot, "ffmpeg_is_available", return_value=True) as ffmpeg_check,
+            patch.object(
+                bot.bot.tree,
+                "sync",
+                new=AsyncMock(return_value=[]),
+            ) as sync_commands,
+        ):
+            await bot.on_ready()
+            await bot.on_ready()
+
+        load_config.assert_called_once_with()
+        restore_panels.assert_awaited_once_with()
+        ffmpeg_check.assert_called_once_with()
+        sync_commands.assert_awaited_once_with()
 
     async def test_autoplay_button_toggles_state_and_schedules_refill(self) -> None:
         guild_id = 444
@@ -3188,9 +3271,10 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 bot,
-                "extract_auto_tracks",
+                "extract_auto_tracks_from_seed",
                 new=AsyncMock(return_value=[queued, seed, recent, fresh]),
             ) as extract,
+            patch.object(bot, "extract_auto_tracks", new=AsyncMock()) as query_extract,
             patch.object(bot, "update_control_panel", new=AsyncMock()) as update_panel,
         ):
             await bot.refill_autoplay_queue(
@@ -3201,7 +3285,8 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(list(state.queue), [queued, fresh])
         extract.assert_awaited_once()
-        self.assertEqual(extract.await_args.args[0], queued.webpage_url)
+        self.assertIs(extract.await_args.args[0], queued)
+        query_extract.assert_not_awaited()
         update_panel.assert_awaited_once_with(guild_id, state)
 
     async def test_refill_restarts_playback_if_track_ends_during_search(self) -> None:
@@ -3220,7 +3305,11 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
             return [seed, fresh]
 
         with (
-            patch.object(bot, "extract_auto_tracks", side_effect=finish_current_during_search),
+            patch.object(
+                bot,
+                "extract_auto_tracks_from_seed",
+                side_effect=finish_current_during_search,
+            ),
             patch.object(bot, "schedule_play_next") as schedule_next,
         ):
             await bot.refill_autoplay_queue(
@@ -3244,7 +3333,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 bot,
-                "extract_auto_tracks",
+                "extract_auto_tracks_from_seed",
                 new=AsyncMock(side_effect=[RuntimeError("temporary"), [seed, fresh]]),
             ) as extract,
             patch.object(bot.asyncio, "sleep", new=AsyncMock()) as sleep,
@@ -3925,6 +4014,79 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
             gate.set()
             await first_task
 
+    async def test_duplicate_pending_advances_create_one_followup_task(self) -> None:
+        first_release = asyncio.Event()
+        second_started = asyncio.Event()
+        play_next_calls = 0
+
+        async def fake_play_next(guild_id: int, announce: bool = True) -> None:
+            nonlocal play_next_calls
+            play_next_calls += 1
+            if play_next_calls == 1:
+                await first_release.wait()
+            else:
+                second_started.set()
+
+        guild_id = 124
+        state = bot.get_state(guild_id)
+        generation = state.playback_generation
+
+        with patch.object(bot, "play_next", side_effect=fake_play_next):
+            first_task, first_created = bot.schedule_play_next(guild_id)
+            for _ in range(3):
+                pending_task, pending_created = bot.schedule_play_next_after_current(
+                    guild_id,
+                    generation,
+                )
+                self.assertIs(pending_task, first_task)
+                self.assertFalse(pending_created)
+
+            self.assertTrue(first_created)
+            self.assertIs(state.pending_advance_task, first_task)
+            first_release.set()
+            await first_task
+            await asyncio.wait_for(second_started.wait(), timeout=1)
+            followup_task = state.advance_task
+            self.assertIsNotNone(followup_task)
+            await followup_task
+
+        self.assertEqual(play_next_calls, 2)
+        self.assertIsNone(state.pending_advance_task)
+
+    async def test_stop_discards_pending_advance_from_old_generation(self) -> None:
+        first_started = asyncio.Event()
+        first_release = asyncio.Event()
+        play_next_calls = 0
+
+        async def fake_play_next(guild_id: int, announce: bool = True) -> None:
+            nonlocal play_next_calls
+            play_next_calls += 1
+            first_started.set()
+            await first_release.wait()
+
+        guild_id = 125
+        state = bot.get_state(guild_id)
+
+        with (
+            patch.object(bot, "play_next", side_effect=fake_play_next),
+            patch.object(bot, "schedule_lyrics_message_cleanup"),
+        ):
+            first_task, _ = bot.schedule_play_next(guild_id)
+            await first_started.wait()
+            bot.schedule_play_next_after_current(
+                guild_id,
+                state.playback_generation,
+            )
+            self.assertIs(state.pending_advance_task, first_task)
+
+            bot.stop_playback(state, guild_id)
+            await asyncio.gather(first_task, return_exceptions=True)
+            await asyncio.sleep(0)
+
+        self.assertEqual(play_next_calls, 1)
+        self.assertIsNone(state.advance_task)
+        self.assertIsNone(state.pending_advance_task)
+
     async def test_concurrent_start_requests_only_pop_one_track(self) -> None:
         class FakeVoice:
             def __init__(self) -> None:
@@ -3979,6 +4141,418 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ffmpeg_opus.call_args.kwargs["codec"], "copy")
         self.assertEqual(ffmpeg_opus.call_args.kwargs["bitrate"], 128)
         schedule_background.assert_called_once_with(guild_id, first)
+
+    async def test_repeat_one_preserves_a_fresh_stream_url(self) -> None:
+        class FakeVoice:
+            def __init__(self) -> None:
+                self.playing = False
+                self.after = None
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            def play(self, source: object, *, after: object) -> None:
+                self.playing = True
+                self.after = after
+
+        guild_id = 460
+        stream_url = "https://example.test/fresh.opus"
+        resolved_at = bot.time.monotonic()
+        track = make_track("repeat")
+        track.stream_url = stream_url
+        track.stream_resolved_at = resolved_at
+        track.audio_codec = "opus"
+        voice = FakeVoice()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        state.repeat_one = True
+        state.queue.append(track)
+        fake_bot = MagicMock()
+        fake_bot.loop = asyncio.get_running_loop()
+
+        with (
+            patch.object(bot, "ffmpeg_is_available", return_value=True),
+            patch.object(bot, "extract_ytdl_info", new=AsyncMock()) as extract,
+            patch.object(bot.discord, "FFmpegOpusAudio", return_value=MagicMock()),
+            patch.object(bot, "schedule_noncritical_tasks"),
+            patch.object(bot, "schedule_play_next") as schedule_next,
+            patch.object(bot, "bot", fake_bot),
+        ):
+            await bot.play_next(guild_id, announce=False)
+            voice.playing = False
+            self.assertIsNotNone(voice.after)
+            voice.after(None)
+            await asyncio.sleep(0)
+
+        extract.assert_not_awaited()
+        self.assertEqual(list(state.queue), [track])
+        self.assertEqual(track.stream_url, stream_url)
+        self.assertEqual(track.stream_resolved_at, resolved_at)
+        self.assertEqual(track.playback_attempts, 0)
+        self.assertFalse(track.force_transcode)
+        schedule_next.assert_called_once_with(guild_id)
+
+    async def test_playback_error_retries_once_then_stops_with_transcode_fallback(
+        self,
+    ) -> None:
+        class FakeVoice:
+            def __init__(self) -> None:
+                self.playing = False
+                self.after = None
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            def play(self, source: object, *, after: object) -> None:
+                self.playing = True
+                self.after = after
+
+        guild_id = 461
+        track = make_track("retry")
+        track.stream_url = "https://example.test/first.opus"
+        track.stream_resolved_at = bot.time.monotonic()
+        track.audio_codec = "opus"
+        voice = FakeVoice()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        state.queue.append(track)
+        fake_bot = MagicMock()
+        fake_bot.loop = asyncio.get_running_loop()
+
+        async def resolve_stream(target: bot.Track) -> None:
+            if target.stream_url is None:
+                target.stream_url = "https://example.test/refreshed.opus"
+                target.stream_resolved_at = bot.time.monotonic()
+                target.audio_codec = "opus"
+
+        with (
+            patch.object(bot, "ffmpeg_is_available", return_value=True),
+            patch.object(
+                bot,
+                "resolve_track_stream",
+                new=AsyncMock(side_effect=resolve_stream),
+            ) as resolve,
+            patch.object(
+                bot.discord,
+                "FFmpegOpusAudio",
+                side_effect=[MagicMock(), MagicMock()],
+            ) as ffmpeg_opus,
+            patch.object(bot, "schedule_noncritical_tasks"),
+            patch.object(bot, "schedule_play_next") as schedule_next,
+            patch.object(bot, "bot", fake_bot),
+        ):
+            await bot.play_next(guild_id, announce=False)
+            self.assertEqual(ffmpeg_opus.call_args_list[0].kwargs["codec"], "copy")
+
+            voice.playing = False
+            voice.after(RuntimeError("copy failed"))
+            await asyncio.sleep(0)
+
+            self.assertEqual(list(state.queue), [track])
+            self.assertIsNone(track.stream_url)
+            self.assertIsNone(track.stream_resolved_at)
+            self.assertEqual(track.playback_attempts, 1)
+            self.assertTrue(track.force_transcode)
+
+            await bot.play_next(guild_id, announce=False)
+            self.assertEqual(ffmpeg_opus.call_args_list[1].kwargs["codec"], None)
+
+            voice.playing = False
+            voice.after(RuntimeError("transcode failed"))
+            await asyncio.sleep(0)
+
+        self.assertEqual(resolve.await_count, 2)
+        self.assertEqual(ffmpeg_opus.call_count, 2)
+        self.assertEqual(list(state.queue), [])
+        self.assertIsNone(state.current)
+        self.assertEqual(track.playback_attempts, 0)
+        self.assertFalse(track.force_transcode)
+        self.assertEqual(schedule_next.call_count, 2)
+
+    async def test_immediate_error_defers_retry_until_active_advance_finishes(
+        self,
+    ) -> None:
+        panel_entered = asyncio.Event()
+        panel_release = asyncio.Event()
+        retry_started = asyncio.Event()
+
+        class FakeVoice:
+            def __init__(self) -> None:
+                self.playing = False
+                self.play_calls = 0
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            def play(self, source: object, *, after: object) -> None:
+                self.play_calls += 1
+                if self.play_calls == 1:
+                    self.playing = False
+                    after(RuntimeError("immediate copy failure"))
+                else:
+                    self.playing = True
+                    retry_started.set()
+
+        async def resolve_stream(target: bot.Track) -> None:
+            if target.stream_url is None:
+                target.stream_url = "https://example.test/refreshed.opus"
+                target.stream_resolved_at = bot.time.monotonic()
+                target.audio_codec = "opus"
+
+        panel_calls = 0
+
+        async def update_panel(*args: object, **kwargs: object) -> None:
+            nonlocal panel_calls
+            panel_calls += 1
+            if panel_calls == 1:
+                panel_entered.set()
+                await panel_release.wait()
+
+        guild_id = 462
+        track = make_track("fast-error")
+        track.stream_url = "https://example.test/first.opus"
+        track.stream_resolved_at = bot.time.monotonic()
+        track.audio_codec = "opus"
+        voice = FakeVoice()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        state.queue.append(track)
+        fake_bot = MagicMock()
+        fake_bot.loop = asyncio.get_running_loop()
+
+        with (
+            patch.object(bot, "ffmpeg_is_available", return_value=True),
+            patch.object(
+                bot,
+                "resolve_track_stream",
+                new=AsyncMock(side_effect=resolve_stream),
+            ),
+            patch.object(
+                bot.discord,
+                "FFmpegOpusAudio",
+                side_effect=[MagicMock(), MagicMock()],
+            ) as ffmpeg_opus,
+            patch.object(bot, "update_control_panel", new=AsyncMock(side_effect=update_panel)),
+            patch.object(bot, "schedule_noncritical_tasks"),
+            patch.object(bot, "bot", fake_bot),
+        ):
+            first_task, created = bot.schedule_play_next(guild_id)
+            await asyncio.wait_for(panel_entered.wait(), timeout=1)
+
+            self.assertTrue(created)
+            self.assertIs(state.advance_task, first_task)
+            self.assertIs(state.pending_advance_task, first_task)
+            self.assertEqual(list(state.queue), [track])
+
+            panel_release.set()
+            await first_task
+            await asyncio.wait_for(retry_started.wait(), timeout=1)
+            followup_task = state.advance_task
+            if followup_task is not None:
+                await followup_task
+
+        self.assertEqual(voice.play_calls, 2)
+        self.assertIs(state.current, track)
+        self.assertEqual(list(state.queue), [])
+        self.assertEqual(
+            [call.kwargs["codec"] for call in ffmpeg_opus.call_args_list],
+            ["copy", None],
+        )
+
+    async def test_final_playback_error_advances_to_the_next_track(self) -> None:
+        panel_entered = [asyncio.Event(), asyncio.Event()]
+        panel_release = [asyncio.Event(), asyncio.Event()]
+        next_track_started = asyncio.Event()
+        play_titles: list[str] = []
+
+        class FakeVoice:
+            def __init__(self) -> None:
+                self.playing = False
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            def play(self, source: object, *, after: object) -> None:
+                assert state.current is not None
+                play_titles.append(state.current.title)
+                if len(play_titles) <= 2:
+                    self.playing = False
+                    after(RuntimeError(f"failure {len(play_titles)}"))
+                else:
+                    self.playing = True
+                    next_track_started.set()
+
+        async def resolve_stream(target: bot.Track) -> None:
+            if target.stream_url is None:
+                target.stream_url = f"https://example.test/{target.title}.opus"
+                target.stream_resolved_at = bot.time.monotonic()
+                target.audio_codec = "opus"
+
+        panel_calls = 0
+
+        async def update_panel(*args: object, **kwargs: object) -> None:
+            nonlocal panel_calls
+            index = panel_calls
+            panel_calls += 1
+            if index < len(panel_entered):
+                panel_entered[index].set()
+                await panel_release[index].wait()
+
+        guild_id = 463
+        failed_track = make_track("fails-twice")
+        failed_track.stream_url = "https://example.test/first.opus"
+        failed_track.stream_resolved_at = bot.time.monotonic()
+        failed_track.audio_codec = "opus"
+        next_track = make_track("next-track")
+        next_track.stream_url = "https://example.test/next.opus"
+        next_track.stream_resolved_at = bot.time.monotonic()
+        next_track.audio_codec = "opus"
+        voice = FakeVoice()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        state.queue.extend([failed_track, next_track])
+        fake_bot = MagicMock()
+        fake_bot.loop = asyncio.get_running_loop()
+
+        with (
+            patch.object(bot, "ffmpeg_is_available", return_value=True),
+            patch.object(
+                bot,
+                "resolve_track_stream",
+                new=AsyncMock(side_effect=resolve_stream),
+            ),
+            patch.object(
+                bot.discord,
+                "FFmpegOpusAudio",
+                side_effect=[MagicMock(), MagicMock(), MagicMock()],
+            ) as ffmpeg_opus,
+            patch.object(bot, "update_control_panel", new=AsyncMock(side_effect=update_panel)),
+            patch.object(bot, "schedule_noncritical_tasks"),
+            patch.object(bot, "bot", fake_bot),
+        ):
+            active_task, _ = bot.schedule_play_next(guild_id)
+            for index in range(2):
+                await asyncio.wait_for(panel_entered[index].wait(), timeout=1)
+                self.assertIs(state.pending_advance_task, active_task)
+                panel_release[index].set()
+                await active_task
+                if index == 0:
+                    while state.advance_task is None:
+                        await asyncio.sleep(0)
+                    active_task = state.advance_task
+
+            await asyncio.wait_for(next_track_started.wait(), timeout=1)
+
+        self.assertEqual(play_titles, ["fails-twice", "fails-twice", "next-track"])
+        self.assertIs(state.current, next_track)
+        self.assertEqual(failed_track.playback_attempts, 0)
+        self.assertFalse(failed_track.force_transcode)
+        self.assertEqual(
+            [call.kwargs["codec"] for call in ffmpeg_opus.call_args_list],
+            ["copy", None, "copy"],
+        )
+
+    async def test_repeat_one_keeps_transcode_after_copy_failure(self) -> None:
+        third_play_started = asyncio.Event()
+        attempts_at_play: list[int] = []
+
+        class FakeVoice:
+            def __init__(self) -> None:
+                self.playing = False
+                self.play_calls = 0
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            def play(self, source: object, *, after: object) -> None:
+                self.play_calls += 1
+                assert state.current is track
+                attempts_at_play.append(track.playback_attempts)
+                if self.play_calls == 1:
+                    self.playing = False
+                    after(RuntimeError("copy failed"))
+                elif self.play_calls == 2:
+                    self.playing = False
+                    after(None)
+                else:
+                    self.playing = True
+                    third_play_started.set()
+
+        async def resolve_stream(target: bot.Track) -> None:
+            if target.stream_url is None:
+                target.stream_url = "https://example.test/refreshed.opus"
+                target.stream_resolved_at = bot.time.monotonic()
+                target.audio_codec = "opus"
+
+        guild_id = 464
+        track = make_track("repeat-transcode")
+        track.stream_url = "https://example.test/first.opus"
+        track.stream_resolved_at = bot.time.monotonic()
+        track.audio_codec = "opus"
+        voice = FakeVoice()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        state.repeat_one = True
+        state.queue.append(track)
+        fake_bot = MagicMock()
+        fake_bot.loop = asyncio.get_running_loop()
+
+        with (
+            patch.object(bot, "ffmpeg_is_available", return_value=True),
+            patch.object(
+                bot,
+                "resolve_track_stream",
+                new=AsyncMock(side_effect=resolve_stream),
+            ),
+            patch.object(
+                bot.discord,
+                "FFmpegOpusAudio",
+                side_effect=[MagicMock(), MagicMock(), MagicMock()],
+            ) as ffmpeg_opus,
+            patch.object(bot, "schedule_noncritical_tasks"),
+            patch.object(bot, "bot", fake_bot),
+        ):
+            first_task, _ = bot.schedule_play_next(guild_id, announce=False)
+            await first_task
+            await asyncio.wait_for(third_play_started.wait(), timeout=1)
+
+        self.assertEqual(voice.play_calls, 3)
+        self.assertEqual(attempts_at_play, [1, 2, 1])
+        self.assertTrue(track.force_transcode)
+        self.assertEqual(
+            [call.kwargs["codec"] for call in ffmpeg_opus.call_args_list],
+            ["copy", None, None],
+        )
 
     async def test_noncritical_work_is_scheduled_after_playback_starts(self) -> None:
         guild_id = 458

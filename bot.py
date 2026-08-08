@@ -210,6 +210,7 @@ YTDL_MAX_CONCURRENT_EXTRACTIONS = parse_positive_int_env(
     "YTDL_MAX_CONCURRENT_EXTRACTIONS", 1
 )
 STREAM_URL_MAX_AGE_SECONDS = parse_positive_int_env("STREAM_URL_MAX_AGE_SECONDS", 900)
+MAX_PLAYBACK_ATTEMPTS = 2
 YTDL_MIN_INTERVAL_SECONDS = parse_nonnegative_float_env("YTDL_MIN_INTERVAL_SECONDS", 6.0)
 YTDL_CACHE_TTL_SECONDS = parse_positive_int_env("YTDL_CACHE_TTL_SECONDS", 180)
 YTDL_CACHE_MAX_ENTRIES = parse_positive_int_env("YTDL_CACHE_MAX_ENTRIES", 16)
@@ -461,60 +462,106 @@ async def stop_ytdl_worker(process: asyncio.subprocess.Process) -> None:
     await process.wait()
 
 
+def classify_ytdl_job(label: str) -> tuple[str, str]:
+    normalized = label.casefold()
+    if "audio stream" in normalized:
+        return "playback", "high"
+    if "auto" in normalized or "radio" in normalized:
+        return "autoplay", "background"
+    if "playlist" in normalized or "album" in normalized:
+        return "bulk", "normal"
+    return "search", "normal"
+
+
 async def run_ytdl_worker(
     options: dict,
     query: str,
     timeout_seconds: float,
+    *,
+    label: str = "yt-dlp",
+    job_kind: str = "general",
+    priority: str = "normal",
+    queue_wait_seconds: float = 0.0,
 ) -> dict:
     if not YTDL_WORKER_PATH.is_file():
         raise RuntimeError(f"yt-dlp worker was not found: {YTDL_WORKER_PATH}")
 
-    process_options: dict[str, object] = {}
-    if os.name == "posix":
-        process_options["start_new_session"] = True
-
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        str(YTDL_WORKER_PATH),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        **process_options,
-    )
-    request = json.dumps(
-        {"options": options, "query": query},
-        ensure_ascii=False,
-    ).encode("utf-8")
-    communication = asyncio.create_task(process.communicate(request))
+    started_at = time.monotonic()
+    status = "failure"
+    response_bytes = 0
     try:
-        stdout, stderr = await asyncio.wait_for(
-            communication,
-            timeout=max(0.1, timeout_seconds),
+        process_options: dict[str, object] = {}
+        if os.name == "posix":
+            process_options["start_new_session"] = True
+
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(YTDL_WORKER_PATH),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            **process_options,
         )
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        await stop_ytdl_worker(process)
-        if not communication.done():
-            communication.cancel()
-        await asyncio.gather(communication, return_exceptions=True)
-        raise
+        request = json.dumps(
+            {"options": options, "query": query},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        communication = asyncio.create_task(process.communicate(request))
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                communication,
+                timeout=max(0.1, timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            status = "timeout"
+            await stop_ytdl_worker(process)
+            if not communication.done():
+                communication.cancel()
+            await asyncio.gather(communication, return_exceptions=True)
+            raise
+        except asyncio.CancelledError:
+            status = "cancelled"
+            await stop_ytdl_worker(process)
+            if not communication.done():
+                communication.cancel()
+            await asyncio.gather(communication, return_exceptions=True)
+            raise
 
-    stderr_text = stderr.decode("utf-8", errors="replace").strip()
-    try:
-        response = json.loads(stdout.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        detail = stderr_text or "yt-dlp worker returned an invalid response."
-        raise RuntimeError(detail) from error
+        response_bytes = len(stdout)
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        try:
+            response = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            detail = stderr_text or "yt-dlp worker returned an invalid response."
+            raise RuntimeError(detail) from error
 
-    if not isinstance(response, dict):
-        raise RuntimeError("yt-dlp worker returned an invalid response.")
-    error_message = response.get("error")
-    if process.returncode != 0 or error_message:
-        raise RuntimeError(str(error_message or stderr_text or "yt-dlp worker failed."))
+        if not isinstance(response, dict):
+            raise RuntimeError("yt-dlp worker returned an invalid response.")
+        error_message = response.get("error")
+        if process.returncode != 0 or error_message:
+            raise RuntimeError(
+                str(error_message or stderr_text or "yt-dlp worker failed.")
+            )
 
-    info = response.get("info")
-    if not isinstance(info, dict):
-        raise RuntimeError("yt-dlp worker returned invalid track information.")
-    return info
+        info = response.get("info")
+        if not isinstance(info, dict):
+            raise RuntimeError("yt-dlp worker returned invalid track information.")
+        status = "success"
+        return info
+    finally:
+        elapsed = time.monotonic() - started_at
+        log = logger.warning if status in {"failure", "timeout"} else logger.info
+        log(
+            "yt-dlp job: label=%s kind=%s priority=%s status=%s "
+            "queue_wait=%.3fs worker=%.3fs response_bytes=%s",
+            label,
+            job_kind,
+            priority,
+            status,
+            queue_wait_seconds,
+            elapsed,
+            response_bytes,
+        )
 
 
 async def extract_ytdl_info(
@@ -533,20 +580,29 @@ async def extract_ytdl_info(
             return cached
 
     ensure_youtube_circuit_closed()
-    logger.info("yt-dlp start: %s", label)
+    job_kind, priority = classify_ytdl_job(label)
     logger.debug("yt-dlp query for %s: %s", label, query)
 
     loop = asyncio.get_running_loop()
     started_at = loop.time()
+    queue_started_at = loop.time()
     try:
         await asyncio.wait_for(
             ytdl_semaphore.acquire(),
             timeout=YTDL_EXTRACT_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
-        logger.warning("yt-dlp queue timed out: %s", label)
+        logger.warning(
+            "yt-dlp job: label=%s kind=%s priority=%s status=queue_timeout "
+            "queue_wait=%.3fs worker=0.000s response_bytes=0",
+            label,
+            job_kind,
+            priority,
+            loop.time() - queue_started_at,
+        )
         raise
 
+    queue_wait_seconds = loop.time() - queue_started_at
     try:
         ensure_youtube_circuit_closed()
         await wait_for_ytdl_interval(minimum_interval_seconds)
@@ -554,7 +610,15 @@ async def extract_ytdl_info(
             0.1,
             YTDL_EXTRACT_TIMEOUT_SECONDS - (loop.time() - started_at),
         )
-        info = await run_ytdl_worker(options, query, remaining_timeout)
+        info = await run_ytdl_worker(
+            options,
+            query,
+            remaining_timeout,
+            label=label,
+            job_kind=job_kind,
+            priority=priority,
+            queue_wait_seconds=queue_wait_seconds,
+        )
     except asyncio.TimeoutError:
         logger.warning(
             "yt-dlp timed out after %s seconds: %s",
@@ -571,7 +635,7 @@ async def extract_ytdl_info(
     stamp_ytdl_info(info, loop.time())
     if use_cache:
         await cache_ytdl_info(cache_key, info)
-    logger.info("yt-dlp done: %s", label)
+    logger.debug("yt-dlp completed in %.3fs: %s", loop.time() - started_at, label)
     return info
 
 
@@ -821,6 +885,8 @@ class Track:
     uploader: str | None = None
     audio_codec: str | None = None
     stream_resolved_at: float | None = None
+    playback_attempts: int = 0
+    force_transcode: bool = False
     lyrics: str | None = None
     lyrics_loaded: bool = False
     lyrics_source: str | None = None
@@ -867,6 +933,9 @@ class GuildMusicState:
     voice_connect_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     control_panel_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     advance_task: asyncio.Task[None] | None = None
+    pending_advance_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    pending_advance_generation: int | None = None
+    pending_advance_announce: bool = False
     noncritical_task: asyncio.Task[None] | None = None
     autoplay_task: asyncio.Task[None] | None = None
     lyrics_task: asyncio.Task[None] | None = None
@@ -890,6 +959,8 @@ music_states: dict[int, GuildMusicState] = {}
 configured_music_channels: dict[int, int] = {}
 configured_control_messages: dict[int, int] = {}
 configured_autoplay_enabled: dict[int, bool] = {}
+startup_initialization_lock = asyncio.Lock()
+startup_initialized = False
 commands_synced = False
 
 
@@ -5161,6 +5232,46 @@ def parse_auto_request(query: str) -> tuple[str, int] | None:
     return rest, DEFAULT_AUTO_TRACKS
 
 
+def reset_track_playback_attempts(track: Track) -> None:
+    track.playback_attempts = 0
+
+
+def reset_track_playback_state(track: Track) -> None:
+    reset_track_playback_attempts(track)
+    track.force_transcode = False
+
+
+def invalidate_track_stream(track: Track) -> None:
+    track.stream_url = None
+    track.stream_resolved_at = None
+
+
+def requeue_track_after_playback_error(
+    state: GuildMusicState,
+    track: Track,
+    *,
+    used_opus_copy: bool,
+) -> bool:
+    can_retry = (
+        state.current is track
+        and not state.skip_requested
+        and not state.stop_requested
+        and track.playback_attempts < MAX_PLAYBACK_ATTEMPTS
+    )
+    if not can_retry:
+        reset_track_playback_state(track)
+        if state.current is track:
+            state.current = None
+        return False
+
+    invalidate_track_stream(track)
+    if used_opus_copy:
+        track.force_transcode = True
+    state.queue.appendleft(track)
+    state.current = None
+    return True
+
+
 async def resolve_track_stream(track: Track) -> None:
     stream_age = (
         time.monotonic() - track.stream_resolved_at
@@ -5170,8 +5281,7 @@ async def resolve_track_stream(track: Track) -> None:
     if track.stream_url and stream_age < STREAM_URL_MAX_AGE_SECONDS:
         return
 
-    track.stream_url = None
-    track.stream_resolved_at = None
+    invalidate_track_stream(track)
     info = await extract_ytdl_info(
         YTDL_OPTIONS,
         track.source_url,
@@ -5248,22 +5358,25 @@ async def extract_tracks(
     ]
 
 
-async def extract_auto_tracks(
-    query: str,
+def build_youtube_radio_url(track: Track) -> str | None:
+    video_id = get_track_video_id(track)
+    if not video_id:
+        return None
+    return f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+
+
+async def extract_auto_tracks_from_seed(
+    seed_track: Track,
     requester: str,
     count: int,
     requester_id: int | None = None,
 ) -> list[Track]:
     auto_count = clamp_auto_count(count)
-    seed_query = resolve_query(query)
-    seed_info = await extract_first_info(query, seed_query)
-    seed_track = make_track_from_info(seed_info, requester, seed_query, requester_id)
-    seed_id = get_video_id(seed_info, seed_track.webpage_url)
 
     entries: list[dict] = []
-    fallback_url = seed_query
-    if seed_id:
-        radio_url = f"https://www.youtube.com/watch?v={seed_id}&list=RD{seed_id}"
+    fallback_url = seed_track.webpage_url or seed_track.source_url
+    radio_url = build_youtube_radio_url(seed_track)
+    if radio_url:
         fallback_url = radio_url
         try:
             radio_info = await extract_ytdl_info(
@@ -5271,12 +5384,16 @@ async def extract_auto_tracks(
             )
             entries = [entry for entry in radio_info.get("entries", []) if entry]
         except Exception:
-            logger.exception("Failed to extract YouTube radio mix for %s", seed_id)
+            logger.exception("Failed to extract YouTube radio mix for %s", seed_track.title)
 
     if not entries:
         search_query = f"ytsearch{auto_count * 3}:{seed_track.title} radio mix"
         fallback_url = search_query
-        info = await extract_ytdl_info(YTDL_OPTIONS, search_query, "auto fallback search")
+        info = await extract_ytdl_info(
+            YTDL_SEARCH_OPTIONS,
+            search_query,
+            "auto fallback search",
+        )
         entries = [entry for entry in info.get("entries", []) if entry]
 
     tracks: list[Track] = []
@@ -5303,7 +5420,9 @@ async def extract_auto_tracks(
     if len(tracks) < auto_count and fallback_url.startswith("https://www.youtube.com/watch"):
         search_query = f"ytsearch{auto_count * 3}:{seed_track.title} radio mix"
         info = await extract_ytdl_info(
-            YTDL_OPTIONS, search_query, "auto supplemental search"
+            YTDL_SEARCH_OPTIONS,
+            search_query,
+            "auto supplemental search",
         )
         for entry in [entry for entry in info.get("entries", []) if entry]:
             track = make_track_from_info(entry, requester, search_query, requester_id)
@@ -5316,9 +5435,26 @@ async def extract_auto_tracks(
                 break
 
     if not tracks:
-        raise ValueError(f"관련 곡을 찾지 못했어요: {query}")
+        raise ValueError(f"관련 곡을 찾지 못했어요: {seed_track.title}")
 
     return tracks
+
+
+async def extract_auto_tracks(
+    query: str,
+    requester: str,
+    count: int,
+    requester_id: int | None = None,
+) -> list[Track]:
+    seed_query = resolve_query(query)
+    seed_info = await extract_first_info(query, seed_query)
+    seed_track = make_track_from_info(seed_info, requester, seed_query, requester_id)
+    return await extract_auto_tracks_from_seed(
+        seed_track,
+        requester,
+        count,
+        requester_id,
+    )
 
 
 def remember_recent_value(values: Deque[str], value: str) -> None:
@@ -5432,8 +5568,8 @@ async def refill_autoplay_queue(
             seed = get_autoplay_seed(state) or fallback_seed
             fallback_seed = seed
             try:
-                candidates = await extract_auto_tracks(
-                    seed.webpage_url,
+                candidates = await extract_auto_tracks_from_seed(
+                    seed,
                     "자동재생",
                     candidate_count,
                 )
@@ -5784,11 +5920,14 @@ def stop_playback(state: GuildMusicState, guild_id: int) -> None:
     state.stop_requested = True
     state.queue.clear()
     schedule_private_lyrics_cleanup(state)
+    if state.current is not None:
+        reset_track_playback_state(state.current)
     state.current = None
     cancel_noncritical_tasks(state)
     cancel_autoplay_refill(state)
     cancel_lyrics_publish(state)
     schedule_lyrics_message_cleanup(guild_id, state)
+    clear_pending_playback_advance(state)
 
     if state.advance_task and not state.advance_task.done():
         state.advance_task.cancel()
@@ -5868,6 +6007,65 @@ def schedule_play_next(
     task = asyncio.create_task(play_next(guild_id, announce=announce))
     state.advance_task = task
     return task, True
+
+
+def clear_pending_playback_advance(state: GuildMusicState) -> None:
+    state.pending_advance_task = None
+    state.pending_advance_generation = None
+    state.pending_advance_announce = False
+
+
+def complete_pending_playback_advance(
+    guild_id: int,
+    completed_task: asyncio.Task[None],
+) -> None:
+    state = get_state(guild_id)
+    if state.pending_advance_task is not completed_task:
+        return
+
+    generation = state.pending_advance_generation
+    announce = state.pending_advance_announce
+    clear_pending_playback_advance(state)
+    if generation != state.playback_generation:
+        return
+    if announce:
+        schedule_play_next(guild_id)
+    else:
+        schedule_play_next(guild_id, announce=False)
+
+
+def schedule_play_next_after_current(
+    guild_id: int,
+    generation: int,
+    *,
+    announce: bool = True,
+) -> tuple[asyncio.Task[None] | None, bool]:
+    state = get_state(guild_id)
+    if generation != state.playback_generation:
+        return state.advance_task, False
+
+    active_task = state.advance_task
+    if active_task and not active_task.done():
+        # Coalesce callbacks and advance only after the current scheduler task is done.
+        if state.pending_advance_task is not active_task:
+            state.pending_advance_task = active_task
+            state.pending_advance_generation = generation
+            state.pending_advance_announce = announce
+            active_task.add_done_callback(
+                lambda completed: complete_pending_playback_advance(
+                    guild_id,
+                    completed,
+                )
+            )
+        else:
+            state.pending_advance_announce = (
+                state.pending_advance_announce or announce
+            )
+        return active_task, False
+
+    if announce:
+        return schedule_play_next(guild_id)
+    return schedule_play_next(guild_id, announce=False)
 
 
 async def enqueue_tracks(
@@ -6037,8 +6235,6 @@ async def reconcile_control_panel_messages(
     guild_id: int,
     control_channel: discord.abc.Messageable,
     known_message: discord.Message | None,
-    *,
-    delete_non_panel_messages: bool = False,
 ) -> discord.Message | None:
     history = getattr(control_channel, "history", None)
     if history is None:
@@ -6049,20 +6245,13 @@ async def reconcile_control_panel_messages(
         candidates[known_message.id] = known_message
 
     bot_user_id = getattr(bot.user, "id", None)
-    deleted_message_count = 0
     try:
-        history_limit = None if delete_non_panel_messages else CONTROL_PANEL_HISTORY_LIMIT
-        async for message in history(limit=history_limit):
+        async for message in history(limit=CONTROL_PANEL_HISTORY_LIMIT):
             if (
                 message.id in candidates
                 or is_music_control_panel_message(message, bot_user_id)
             ):
                 candidates[message.id] = message
-            elif delete_non_panel_messages and await delete_music_channel_message(
-                guild_id,
-                message,
-            ):
-                deleted_message_count += 1
     except discord.Forbidden:
         logger.warning(
             "Missing permission to read music channel history in guild %s",
@@ -6077,12 +6266,6 @@ async def reconcile_control_panel_messages(
         return known_message
 
     if not candidates:
-        if deleted_message_count:
-            logger.info(
-                "Cleaned %s message(s) from the music channel in guild %s",
-                deleted_message_count,
-                guild_id,
-            )
         return None
 
     newest_message = max(candidates.values(), key=lambda message: message.id)
@@ -6093,12 +6276,10 @@ async def reconcile_control_panel_messages(
         if await delete_music_channel_message(guild_id, message):
             removed_panel_count += 1
 
-    if deleted_message_count or removed_panel_count:
+    if removed_panel_count:
         logger.info(
-            "Kept control panel %s and removed %s other message(s) and "
-            "%s duplicate panel(s) in guild %s",
+            "Kept control panel %s and removed %s duplicate panel(s) in guild %s",
             newest_message.id,
-            deleted_message_count,
             removed_panel_count,
             guild_id,
         )
@@ -6134,14 +6315,12 @@ async def update_control_panel(
     state: GuildMusicState,
     *,
     channel: discord.abc.Messageable | None = None,
-    clean_channel: bool = False,
 ) -> discord.Message | None:
     async with state.control_panel_lock:
         return await _update_control_panel(
             guild_id,
             state,
             channel=channel,
-            clean_channel=clean_channel,
         )
 
 
@@ -6150,7 +6329,6 @@ async def _update_control_panel(
     state: GuildMusicState,
     *,
     channel: discord.abc.Messageable | None = None,
-    clean_channel: bool = False,
 ) -> discord.Message | None:
     control_channel = channel or resolve_control_panel_channel(guild_id, state)
     if control_channel is None:
@@ -6172,8 +6350,7 @@ async def _update_control_panel(
             state.control_message = None
 
     recovering_panel = state.control_message is None
-    reconciling_panel = recovering_panel or clean_channel
-    saved_message_id = get_control_message_id(guild_id) if reconciling_panel else None
+    saved_message_id = get_control_message_id(guild_id) if recovering_panel else None
     if recovering_panel:
         fetch_message = getattr(control_channel, "fetch_message", None)
         if saved_message_id is not None and fetch_message is not None:
@@ -6194,12 +6371,13 @@ async def _update_control_panel(
                 )
                 return None
 
-    if reconciling_panel:
+    searched_history = False
+    if state.control_message is None:
+        searched_history = True
         state.control_message = await reconcile_control_panel_messages(
             guild_id,
             control_channel,
             state.control_message,
-            delete_non_panel_messages=clean_channel,
         )
 
     if state.current is None:
@@ -6212,7 +6390,7 @@ async def _update_control_panel(
     if state.control_message is not None:
         try:
             await state.control_message.edit(content=None, embed=embed, view=view)
-            if reconciling_panel and saved_message_id != state.control_message.id:
+            if searched_history and saved_message_id != state.control_message.id:
                 set_control_message_id(guild_id, state.control_message.id)
             return state.control_message
         except discord.NotFound:
@@ -6309,7 +6487,6 @@ async def restore_control_panels() -> None:
                 guild.id,
                 state,
                 channel=channel,
-                clean_channel=True,
             )
         except Exception:
             logger.exception("Failed to restore music control panel in guild %s", guild.id)
@@ -6354,6 +6531,7 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                     track = None
                 else:
                     track = state.queue.popleft()
+                    track.playback_attempts += 1
                     state.current = track
                     state.skip_requested = False
                     state.stop_requested = False
@@ -6369,25 +6547,44 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
             cancel_noncritical_tasks(state)
             cancel_lyrics_publish(state)
 
+            used_opus_copy = False
+            attempt_number = track.playback_attempts
             try:
                 await resolve_track_stream(track)
+                used_opus_copy = (
+                    not track.force_transcode
+                    and (track.audio_codec or "").casefold() in {"opus", "libopus"}
+                )
+                logger.info(
+                    "Playback start: title=%s codec=%s copy=%s transcode=%s retry=%s",
+                    track.title,
+                    track.audio_codec or "unknown",
+                    used_opus_copy,
+                    not used_opus_copy,
+                    max(0, attempt_number - 1),
+                )
                 source = discord.FFmpegOpusAudio(
                     track.stream_url,
                     bitrate=128,
-                    codec=(
-                        "copy"
-                        if (track.audio_codec or "").casefold() in {"opus", "libopus"}
-                        else None
-                    ),
+                    codec="copy" if used_opus_copy else None,
                     executable=FFMPEG_EXECUTABLE,
                     **FFMPEG_OPTIONS,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Failed to create FFmpeg source for %s", track.title)
-                if state.current is track and generation == state.playback_generation:
-                    state.current = None
+                retrying = requeue_track_after_playback_error(
+                    state,
+                    track,
+                    used_opus_copy=used_opus_copy,
+                )
+                logger.exception(
+                    "Failed to prepare playback for %s (attempt %s/%s, retry=%s)",
+                    track.title,
+                    attempt_number,
+                    MAX_PLAYBACK_ATTEMPTS,
+                    retrying,
+                )
                 continue
 
             try:
@@ -6406,9 +6603,6 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                         return
 
                     def after_playback(error: Exception | None) -> None:
-                        if error:
-                            logger.warning("Playback error: %s", error)
-
                         def advance() -> None:
                             if (
                                 generation != state.playback_generation
@@ -6419,12 +6613,36 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                             cancel_noncritical_tasks(state)
                             cancel_lyrics_publish(state)
                             schedule_private_lyrics_cleanup(state, track.track_id)
-                            if state.repeat_one and not state.skip_requested and not state.stop_requested:
-                                track.stream_url = None
-                                track.stream_resolved_at = None
-                                state.queue.appendleft(track)
-                            state.current = None
-                            schedule_play_next(guild_id)
+                            if error:
+                                retrying = requeue_track_after_playback_error(
+                                    state,
+                                    track,
+                                    used_opus_copy=used_opus_copy,
+                                )
+                                logger.warning(
+                                    "Playback error for %s (attempt %s/%s, retry=%s): %s",
+                                    track.title,
+                                    attempt_number,
+                                    MAX_PLAYBACK_ATTEMPTS,
+                                    retrying,
+                                    error,
+                                )
+                            else:
+                                repeating = (
+                                    state.repeat_one
+                                    and not state.skip_requested
+                                    and not state.stop_requested
+                                )
+                                if repeating:
+                                    reset_track_playback_attempts(track)
+                                    state.queue.appendleft(track)
+                                else:
+                                    reset_track_playback_state(track)
+                                state.current = None
+                            schedule_play_next_after_current(
+                                guild_id,
+                                generation,
+                            )
 
                         bot.loop.call_soon_threadsafe(advance)
 
@@ -6432,9 +6650,19 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                         voice.play(source, after=after_playback)
                     except Exception:
                         source.cleanup()
-                        logger.exception("Failed to start playback for %s", track.title)
-                        if state.current is track:
-                            state.current = None
+                        retrying = requeue_track_after_playback_error(
+                            state,
+                            track,
+                            used_opus_copy=used_opus_copy,
+                        )
+                        logger.exception(
+                            "Failed to start playback for %s "
+                            "(attempt %s/%s, retry=%s)",
+                            track.title,
+                            attempt_number,
+                            MAX_PLAYBACK_ATTEMPTS,
+                            retrying,
+                        )
                         continue
             except asyncio.CancelledError:
                 if not voice.is_playing():
@@ -6458,29 +6686,37 @@ def guild_only_error() -> str:
 
 @bot.event
 async def on_ready() -> None:
-    global commands_synced
-    load_music_channel_config()
+    global commands_synced, startup_initialized
     logger.info("Logged in as %s", bot.user)
-    if ffmpeg_is_available():
-        logger.info("Using FFmpeg executable: %s", FFMPEG_EXECUTABLE)
-    else:
-        logger.error(
-            "FFmpeg executable was not found. Set FFMPEG_PATH in .env or add ffmpeg to PATH."
-        )
-    await restore_control_panels()
+    async with startup_initialization_lock:
+        if not startup_initialized:
+            load_music_channel_config()
+            if ffmpeg_is_available():
+                logger.info("Using FFmpeg executable: %s", FFMPEG_EXECUTABLE)
+            else:
+                logger.error(
+                    "FFmpeg executable was not found. Set FFMPEG_PATH in .env "
+                    "or add ffmpeg to PATH."
+                )
+            await restore_control_panels()
+            startup_initialized = True
 
-    if commands_synced:
-        return
+        if commands_synced:
+            return
 
-    if DEV_GUILD_ID:
-        guild = discord.Object(id=int(DEV_GUILD_ID))
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        logger.info("Synced %s command(s) to dev guild %s", len(synced), DEV_GUILD_ID)
-    else:
-        synced = await bot.tree.sync()
-        logger.info("Synced %s global command(s)", len(synced))
-    commands_synced = True
+        if DEV_GUILD_ID:
+            guild = discord.Object(id=int(DEV_GUILD_ID))
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            logger.info(
+                "Synced %s command(s) to dev guild %s",
+                len(synced),
+                DEV_GUILD_ID,
+            )
+        else:
+            synced = await bot.tree.sync()
+            logger.info("Synced %s global command(s)", len(synced))
+        commands_synced = True
 
 
 @bot.event
