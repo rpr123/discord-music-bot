@@ -4299,10 +4299,10 @@ async def _ensure_voice_channel(
     guild: discord.Guild,
     channel: discord.abc.Connectable,
     state: GuildMusicState,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, bool]:
     async with state.voice_connect_lock:
         if bot_shutdown_started:
-            return False, "The bot is shutting down."
+            return False, "The bot is shutting down.", False
         for attempt in range(2):
             registered_voice = getattr(guild, "voice_client", None)
             if registered_voice is not None:
@@ -4320,17 +4320,26 @@ async def _ensure_voice_channel(
 
             if voice is not None and voice.is_connected():
                 try:
-                    return await use_connected_voice(voice, channel, state)
+                    original_channel = voice.channel
+                    ok, error = await use_connected_voice(voice, channel, state)
+                    moved = (
+                        ok
+                        and original_channel != channel
+                        and voice.channel == channel
+                    )
+                    if moved:
+                        stop_playback(state, guild.id)
+                    return ok, error, moved
                 except (asyncio.TimeoutError, discord.DiscordException):
                     logger.warning(
                         "Failed to move voice client in guild %s",
                         guild.id,
                         exc_info=True,
                     )
-                    return False, "음성 채널 이동에 실패했어요. 잠시 후 다시 시도해 주세요."
+                    return False, "음성 채널 이동에 실패했어요. 잠시 후 다시 시도해 주세요.", False
 
             if bot_shutdown_started:
-                return False, "The bot is shutting down."
+                return False, "The bot is shutting down.", False
             try:
                 voice = await channel.connect()
             except discord.ClientException as error:
@@ -4345,22 +4354,22 @@ async def _ensure_voice_channel(
                     guild.id,
                     error,
                 )
-                return False, "음성 채널 연결에 실패했어요. 잠시 후 다시 시도해 주세요."
+                return False, "음성 채널 연결에 실패했어요. 잠시 후 다시 시도해 주세요.", False
             except (asyncio.TimeoutError, discord.DiscordException):
                 logger.warning(
                     "Voice connection failed in guild %s",
                     guild.id,
                     exc_info=True,
                 )
-                return False, "음성 채널 연결에 실패했어요. 잠시 후 다시 시도해 주세요."
+                return False, "음성 채널 연결에 실패했어요. 잠시 후 다시 시도해 주세요.", False
 
             if bot_shutdown_started:
                 await cleanup_voice_connected_during_shutdown(voice)
-                return False, "The bot is shutting down."
+                return False, "The bot is shutting down.", False
             state.voice = voice
-            return True, None
+            return True, None, False
 
-    return False, "음성 채널 연결에 실패했어요. 잠시 후 다시 시도해 주세요."
+    return False, "음성 채널 연결에 실패했어요. 잠시 후 다시 시도해 주세요.", False
 
 
 async def ensure_voice_channel(
@@ -4372,11 +4381,13 @@ async def ensure_voice_channel(
         return False, "The bot is shutting down."
     operation_task = track_voice_operation()
     try:
-        result = await _ensure_voice_channel(guild, channel, state)
-        if result[0]:
+        ok, error, moved = await _ensure_voice_channel(guild, channel, state)
+        if ok:
             cancel_empty_channel_disconnect(state)
             update_empty_channel_disconnect(state, guild.id)
-        return result
+            if moved:
+                create_housekeeping_task(show_idle_panel(guild.id, state))
+        return ok, error
     finally:
         voice_operation_tasks.discard(operation_task)
 

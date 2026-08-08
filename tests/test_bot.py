@@ -6180,6 +6180,226 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.gather(*timers, return_exceptions=True)
                 bot.music_states.pop(guild_id, None)
 
+    async def test_cross_channel_move_resets_committed_request_and_updates_panel_in_background(
+        self,
+    ) -> None:
+        guild_id = 818
+        extract_started = asyncio.Event()
+        release_extract = asyncio.Event()
+        move_started = asyncio.Event()
+        release_move = asyncio.Event()
+        active_panel_recorded = asyncio.Event()
+        convergence_started = asyncio.Event()
+        release_convergence = asyncio.Event()
+
+        class Channel:
+            def __init__(self, channel_id: int) -> None:
+                self.id = channel_id
+                self.members = []
+                self.mention = f"<#{channel_id}>"
+
+        old_channel = Channel(1301)
+        new_channel = Channel(1302)
+
+        class Voice:
+            def __init__(self) -> None:
+                self.channel = old_channel
+                self.playing = False
+                self.move_to = AsyncMock(side_effect=self._move_to)
+                self.stop = MagicMock(side_effect=self._stop)
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            async def _move_to(self, channel: Channel) -> None:
+                move_started.set()
+                await release_move.wait()
+                self.channel = channel
+
+            def _stop(self) -> None:
+                self.playing = False
+
+        voice = Voice()
+
+        class Guild:
+            id = guild_id
+            voice_client = voice
+
+        guild = Guild()
+
+        class OldRequester:
+            display_name = "old-channel-requester"
+            id = 1818
+
+        class MovingMember:
+            bot = False
+            display_name = "new-channel-requester"
+            id = 2818
+            voice = type("MemberVoice", (), {"channel": new_channel})()
+
+        moving_member = MovingMember()
+        moving_member.guild = guild
+        new_channel.members.append(moving_member)
+
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        original_generation = state.playback_generation
+        track = make_track("old-channel-result")
+        loading_message = MagicMock()
+        loading_message.edit = AsyncMock()
+        panel_currents: list[bot.Track | None] = []
+        panel_lock_states: list[bool] = []
+        created_housekeeping_tasks: list[asyncio.Task] = []
+
+        async def delayed_extract(*_args: object) -> bot.Track:
+            extract_started.set()
+            await release_extract.wait()
+            return track
+
+        def commit_playback(
+            requested_guild_id: int,
+            *,
+            announce: bool = True,
+        ) -> tuple[None, bool]:
+            self.assertEqual(requested_guild_id, guild_id)
+            self.assertFalse(announce)
+            self.assertEqual(list(state.queue), [track])
+            state.current = state.queue.popleft()
+            voice.playing = True
+            return None, False
+
+        async def record_panel(
+            requested_guild_id: int,
+            requested_state: bot.GuildMusicState,
+            *,
+            channel: object = None,
+        ) -> None:
+            self.assertEqual(requested_guild_id, guild_id)
+            self.assertIs(requested_state, state)
+            self.assertIsNone(channel)
+            panel_currents.append(requested_state.current)
+            panel_lock_states.append(requested_state.voice_connect_lock.locked())
+            if len(panel_currents) == 1:
+                active_panel_recorded.set()
+                return
+            convergence_started.set()
+            await release_convergence.wait()
+
+        original_create_housekeeping_task = bot.create_housekeeping_task
+
+        def track_housekeeping(coroutine):
+            task = original_create_housekeeping_task(coroutine)
+            if task is not None:
+                created_housekeeping_tasks.append(task)
+            return task
+
+        async def move_and_capture() -> tuple[tuple[bool, str | None], int]:
+            result = await bot.ensure_voice_for_member(moving_member, state)
+            return result, state.playback_generation
+
+        request_task = None
+        movement = None
+        with (
+            patch.object(bot, "extract_track", side_effect=delayed_extract),
+            patch.object(bot, "schedule_play_next", side_effect=commit_playback),
+            patch.object(bot, "_update_control_panel", side_effect=record_panel),
+            patch.object(bot, "delete_message_later", new=AsyncMock()),
+            patch.object(
+                bot,
+                "create_housekeeping_task",
+                side_effect=track_housekeeping,
+            ),
+        ):
+            try:
+                request_task = asyncio.create_task(
+                    bot.enqueue_tracks(
+                        guild_id,
+                        MagicMock(),
+                        OldRequester(),
+                        "old channel song",
+                        initial_response=loading_message,
+                        request_generation=original_generation,
+                    )
+                )
+                await asyncio.wait_for(extract_started.wait(), timeout=1)
+
+                movement = asyncio.create_task(move_and_capture())
+                await asyncio.wait_for(move_started.wait(), timeout=1)
+
+                release_extract.set()
+                await asyncio.wait_for(active_panel_recorded.wait(), timeout=1)
+                self.assertTrue(await asyncio.wait_for(request_task, timeout=1))
+                self.assertIs(state.current, track)
+                self.assertTrue(voice.is_playing())
+                self.assertFalse(movement.done())
+
+                release_move.set()
+                await asyncio.wait_for(convergence_started.wait(), timeout=1)
+
+                self.assertTrue(movement.done())
+                move_result, move_generation = await movement
+                self.assertEqual(move_result, (True, None))
+                self.assertEqual(move_generation, original_generation + 1)
+                self.assertEqual(
+                    state.playback_generation,
+                    original_generation + 1,
+                )
+                self.assertIsNone(state.current)
+                self.assertFalse(state.queue)
+                self.assertFalse(voice.is_playing())
+                voice.stop.assert_called_once_with()
+                self.assertIs(voice.channel, new_channel)
+                self.assertFalse(state.voice_connect_lock.locked())
+                self.assertEqual(panel_currents, [track, None])
+                self.assertEqual(panel_lock_states, [True, False])
+
+                active_housekeeping = {
+                    task
+                    for task in created_housekeeping_tasks
+                    if task in bot.housekeeping_tasks and not task.done()
+                }
+                self.assertEqual(len(active_housekeeping), 1)
+                convergence_task = next(iter(active_housekeeping))
+                self.assertFalse(convergence_task.done())
+
+                release_convergence.set()
+                await asyncio.wait_for(convergence_task, timeout=1)
+                await asyncio.sleep(0)
+                self.assertNotIn(convergence_task, bot.housekeeping_tasks)
+            finally:
+                release_extract.set()
+                release_move.set()
+                release_convergence.set()
+                for task in (request_task, movement, *created_housekeeping_tasks):
+                    if task is not None and not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    *(
+                        task
+                        for task in (
+                            request_task,
+                            movement,
+                            *created_housekeeping_tasks,
+                        )
+                        if task is not None
+                    ),
+                    return_exceptions=True,
+                )
+                await asyncio.sleep(0)
+                bot.clear_pending_playback_advance(state)
+                bot.cancel_empty_channel_disconnect(state)
+                bot.music_states.pop(guild_id, None)
+
+        self.assertFalse(
+            set(created_housekeeping_tasks) & bot.housekeeping_tasks
+        )
+
     async def test_connect_race_adopts_discord_registered_voice_client(self) -> None:
         class Guild:
             id = 811
@@ -6296,6 +6516,9 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
             panel_started.set()
             await release_panel.wait()
 
+        def discard_housekeeping(coroutine) -> None:
+            coroutine.close()
+
         timer = None
         with (
             patch.object(bot, "EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS", 0),
@@ -6304,6 +6527,11 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
                 "show_idle_panel",
                 new=AsyncMock(side_effect=block_idle_panel),
             ) as show_idle_panel,
+            patch.object(
+                bot,
+                "create_housekeeping_task",
+                side_effect=discard_housekeeping,
+            ),
         ):
             try:
                 bot.update_empty_channel_disconnect(state, guild_id)
