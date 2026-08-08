@@ -6180,6 +6180,208 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.gather(*timers, return_exceptions=True)
                 bot.music_states.pop(guild_id, None)
 
+    async def test_external_bot_move_replaces_empty_channel_timer(self) -> None:
+        guild_id = 819
+        old_timer_started = asyncio.Event()
+        new_timer_started = asyncio.Event()
+        release_timers = asyncio.Event()
+        captured_channel_ids: list[int] = []
+
+        class Guild:
+            id = guild_id
+            voice_client = None
+
+        guild = Guild()
+
+        class Member:
+            bot = True
+            id = 9101
+
+        member = Member()
+        member.guild = guild
+
+        class Channel:
+            def __init__(self, channel_id: int) -> None:
+                self.id = channel_id
+                self.members: list[Member] = []
+
+        old_channel = Channel(1301)
+        new_channel = Channel(1302)
+        old_channel.members.append(member)
+
+        class Voice:
+            def __init__(self) -> None:
+                self.channel = old_channel
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return False
+
+            def is_paused(self) -> bool:
+                return False
+
+        voice = Voice()
+        guild.voice_client = voice
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        initial_generation = state.playback_generation
+        old_timer = None
+        new_timer = None
+
+        async def block_empty_disconnect(
+            requested_guild_id: int,
+            channel_id: int,
+        ) -> None:
+            self.assertEqual(requested_guild_id, guild_id)
+            captured_channel_ids.append(channel_id)
+            if len(captured_channel_ids) == 1:
+                old_timer_started.set()
+            elif len(captured_channel_ids) == 2:
+                new_timer_started.set()
+            await release_timers.wait()
+
+        with (
+            patch.object(
+                bot,
+                "disconnect_from_empty_channel",
+                new=AsyncMock(side_effect=block_empty_disconnect),
+            ) as disconnect_from_empty_channel,
+            patch.object(bot.bot._connection, "user", member),
+        ):
+            try:
+                bot.update_empty_channel_disconnect(state, guild_id)
+                old_timer = state.empty_channel_task
+                self.assertIsNotNone(old_timer)
+                await asyncio.wait_for(old_timer_started.wait(), timeout=1)
+
+                old_channel.members.clear()
+                new_channel.members.append(member)
+                voice.channel = new_channel
+                before = type("VoiceState", (), {"channel": old_channel})()
+                after = type("VoiceState", (), {"channel": new_channel})()
+
+                await asyncio.wait_for(
+                    bot.on_voice_state_update(member, before, after),
+                    timeout=1,
+                )
+                new_timer = state.empty_channel_task
+
+                self.assertIsNotNone(new_timer)
+                self.assertIsNot(new_timer, old_timer)
+                self.assertFalse(new_timer.done())
+                await asyncio.wait_for(new_timer_started.wait(), timeout=1)
+                await asyncio.wait_for(
+                    asyncio.gather(old_timer, return_exceptions=True),
+                    timeout=1,
+                )
+
+                self.assertTrue(old_timer.cancelled())
+                self.assertIs(state.empty_channel_task, new_timer)
+                self.assertFalse(new_timer.done())
+                self.assertEqual(captured_channel_ids, [1301, 1302])
+                self.assertEqual(disconnect_from_empty_channel.await_count, 2)
+                self.assertIs(bot.music_states[guild_id], state)
+                self.assertIs(state.voice, voice)
+                self.assertIs(voice.channel, new_channel)
+                self.assertEqual(state.playback_generation, initial_generation)
+            finally:
+                release_timers.set()
+                timers = {
+                    task
+                    for task in (
+                        old_timer,
+                        new_timer,
+                        state.empty_channel_task,
+                    )
+                    if task is not None
+                }
+                bot.cancel_empty_channel_disconnect(state)
+                for task in timers:
+                    if not task.done():
+                        task.cancel()
+                if timers:
+                    await asyncio.wait_for(
+                        asyncio.gather(*timers, return_exceptions=True),
+                        timeout=1,
+                    )
+                bot.music_states.pop(guild_id, None)
+
+    async def test_bot_disconnect_keeps_active_empty_channel_timer(self) -> None:
+        guild_id = 820
+        timer_started = asyncio.Event()
+        release_timer = asyncio.Event()
+
+        class Guild:
+            id = guild_id
+            voice_client = None
+
+        guild = Guild()
+
+        class Member:
+            bot = True
+            id = 9201
+
+        member = Member()
+        member.guild = guild
+
+        class Channel:
+            id = 1401
+
+            def __init__(self) -> None:
+                self.members = [member]
+
+        old_channel = Channel()
+
+        class Voice:
+            channel = old_channel
+
+            def is_connected(self) -> bool:
+                return False
+
+        voice = Voice()
+        guild.voice_client = voice
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        initial_generation = state.playback_generation
+
+        async def hold_active_timer() -> None:
+            timer_started.set()
+            await release_timer.wait()
+
+        timer = asyncio.create_task(hold_active_timer())
+        state.empty_channel_task = timer
+
+        with patch.object(bot.bot._connection, "user", member):
+            try:
+                await asyncio.wait_for(timer_started.wait(), timeout=1)
+                before = type("VoiceState", (), {"channel": old_channel})()
+                after = type("VoiceState", (), {"channel": None})()
+
+                await asyncio.wait_for(
+                    bot.on_voice_state_update(member, before, after),
+                    timeout=1,
+                )
+
+                self.assertIs(state.empty_channel_task, timer)
+                self.assertFalse(timer.done())
+                self.assertFalse(timer.cancelled())
+                self.assertIs(bot.music_states[guild_id], state)
+                self.assertIs(state.voice, voice)
+                self.assertIs(voice.channel, old_channel)
+                self.assertEqual(state.playback_generation, initial_generation)
+            finally:
+                release_timer.set()
+                bot.cancel_empty_channel_disconnect(state)
+                if not timer.done():
+                    timer.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(timer, return_exceptions=True),
+                    timeout=1,
+                )
+                bot.music_states.pop(guild_id, None)
+
     async def test_cross_channel_move_resets_committed_request_and_updates_panel_in_background(
         self,
     ) -> None:

@@ -5172,11 +5172,24 @@ async def on_voice_state_update(
     before: discord.VoiceState,
     after: discord.VoiceState,
 ) -> None:
-    if member.bot:
+    state = music_states.get(member.guild.id)
+    if state is None:
         return
 
-    state = music_states.get(member.guild.id)
-    if state is None or state.voice is None or not state.voice.is_connected():
+    if member.bot:
+        bot_user = bot.user
+        if (
+            bot_user is not None
+            and member.id == bot_user.id
+            and before.channel is not None
+            and after.channel is not None
+            and before.channel != after.channel
+        ):
+            cancel_empty_channel_disconnect(state)
+            update_empty_channel_disconnect(state, member.guild.id)
+        return
+
+    if state.voice is None or not state.voice.is_connected():
         return
 
     bot_channel = state.voice.channel
