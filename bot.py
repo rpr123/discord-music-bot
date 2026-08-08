@@ -4470,20 +4470,33 @@ async def disconnect_from_empty_channel(guild_id: int, channel_id: int) -> None:
     current_task = asyncio.current_task()
     try:
         await asyncio.sleep(EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS)
-        voice = state.voice
-        if (
-            voice is None
-            or not voice.is_connected()
-            or voice.channel.id != channel_id
-            or channel_has_human_listener(voice.channel)
-        ):
-            return
+        async with state.voice_connect_lock:
+            voice = state.voice
+            if (
+                voice is None
+                or not voice.is_connected()
+                or voice.channel.id != channel_id
+                or channel_has_human_listener(voice.channel)
+            ):
+                return
 
-        stop_playback(state, guild_id)
+            stop_playback(state, guild_id)
+
         await show_idle_panel(guild_id, state)
-        await voice.disconnect()
-        if state.voice is voice:
-            state.voice = None
+
+        async with state.voice_connect_lock:
+            if (
+                state.voice is not voice
+                or not voice.is_connected()
+                or voice.channel.id != channel_id
+                or channel_has_human_listener(voice.channel)
+            ):
+                return
+
+            await voice.disconnect()
+            if state.voice is voice:
+                state.voice = None
+
         logger.info(
             "Left empty voice channel %s in guild %s",
             channel_id,

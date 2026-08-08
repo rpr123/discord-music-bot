@@ -5873,6 +5873,112 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel.connect_calls, 1)
         self.assertIs(state.voice, voice)
 
+    async def test_empty_channel_timer_does_not_disconnect_voice_moved_during_panel_update(
+        self,
+    ) -> None:
+        guild_id = 815
+        panel_started = asyncio.Event()
+        release_panel = asyncio.Event()
+
+        class Member:
+            def __init__(self, *, bot_member: bool) -> None:
+                self.bot = bot_member
+
+        class Channel:
+            def __init__(
+                self,
+                channel_id: int,
+                members: list[Member],
+            ) -> None:
+                self.id = channel_id
+                self.members = members
+                self.mention = f"<#{channel_id}>"
+
+        old_channel = Channel(1001, [Member(bot_member=True)])
+        new_channel = Channel(1002, [Member(bot_member=False)])
+
+        class Voice:
+            def __init__(self) -> None:
+                self.channel = old_channel
+                self.connected = True
+                self.move_to = AsyncMock(side_effect=self._move_to)
+                self.disconnect = AsyncMock(side_effect=self._disconnect)
+
+            def is_connected(self) -> bool:
+                return self.connected
+
+            def is_playing(self) -> bool:
+                return False
+
+            def is_paused(self) -> bool:
+                return False
+
+            async def _move_to(self, channel: Channel) -> None:
+                self.channel = channel
+
+            async def _disconnect(self) -> None:
+                self.connected = False
+
+        voice = Voice()
+
+        class Guild:
+            id = guild_id
+            voice_client = voice
+
+        guild = Guild()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+
+        async def block_idle_panel(
+            requested_guild_id: int,
+            requested_state: bot.GuildMusicState,
+        ) -> None:
+            self.assertEqual(requested_guild_id, guild_id)
+            self.assertIs(requested_state, state)
+            panel_started.set()
+            await release_panel.wait()
+
+        timer = None
+        with (
+            patch.object(bot, "EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS", 0),
+            patch.object(
+                bot,
+                "show_idle_panel",
+                new=AsyncMock(side_effect=block_idle_panel),
+            ) as show_idle_panel,
+        ):
+            try:
+                bot.update_empty_channel_disconnect(state, guild_id)
+                timer = state.empty_channel_task
+                self.assertIsNotNone(timer)
+                await asyncio.wait_for(panel_started.wait(), timeout=1)
+
+                result = await asyncio.wait_for(
+                    bot.ensure_voice_channel(guild, new_channel, state),
+                    timeout=1,
+                )
+
+                self.assertEqual(result, (True, None))
+                voice.move_to.assert_awaited_once_with(new_channel)
+                voice.disconnect.assert_not_awaited()
+                self.assertIs(voice.channel, new_channel)
+
+                release_panel.set()
+                await asyncio.wait_for(timer, timeout=1)
+            finally:
+                release_panel.set()
+                bot.cancel_empty_channel_disconnect(state)
+                if timer is not None:
+                    await asyncio.gather(timer, return_exceptions=True)
+                bot.music_states.pop(guild_id, None)
+
+        show_idle_panel.assert_awaited_once_with(guild_id, state)
+        voice.disconnect.assert_not_awaited()
+        self.assertTrue(voice.is_connected())
+        self.assertIs(state.voice, voice)
+        self.assertIs(voice.channel, new_channel)
+        self.assertIsNone(state.empty_channel_task)
+
     async def test_stale_registered_voice_is_cleaned_before_reconnecting(self) -> None:
         class Guild:
             id = 812
