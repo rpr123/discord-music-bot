@@ -31,6 +31,12 @@ import discord
 import requests
 from discord import app_commands
 from discord.ext import commands
+from music_autoplay_policy import (
+    AUTOPLAY_RETRY_DELAYS_SECONDS,
+    autoplay_can_refill,
+    get_autoplay_retry_delay,
+    get_autoplay_seed,
+)
 from music_lyrics_display import (
     LYRICS_INLINE_LIMIT,
     make_lyrics_embed,
@@ -378,7 +384,6 @@ AUTOPLAY_START_DELAY_SECONDS = parse_nonnegative_float_env(
 LYRICS_START_DELAY_SECONDS = parse_nonnegative_float_env(
     "LYRICS_START_DELAY_SECONDS", 3.0
 )
-AUTOPLAY_RETRY_DELAYS_SECONDS = (60, 120, 300, 900, 1800)
 AUTOPLAY_BUTTON_CUSTOM_ID = "music:autoplay"
 CONTROL_PANEL_HISTORY_LIMIT = 100
 YTDL_BASE_OPTIONS = {
@@ -4991,33 +4996,11 @@ async def extract_auto_tracks(
     )
 
 
-def get_autoplay_seed(state: GuildMusicState) -> Track | None:
-    if state.queue:
-        return state.queue[-1]
-    return state.current
-
-
 def cancel_autoplay_refill(state: GuildMusicState) -> None:
     task = state.autoplay_task
     if task and not task.done():
         task.cancel()
     state.autoplay_task = None
-
-
-def autoplay_can_refill(state: GuildMusicState, generation: int) -> bool:
-    voice = state.voice
-    return (
-        state.autoplay_enabled
-        and generation == state.playback_generation
-        and voice is not None
-        and voice.is_connected()
-        and len(state.queue) <= 1
-    )
-
-
-def get_autoplay_retry_delay(failure_count: int) -> int:
-    index = min(max(0, failure_count), len(AUTOPLAY_RETRY_DELAYS_SECONDS) - 1)
-    return AUTOPLAY_RETRY_DELAYS_SECONDS[index]
 
 
 def schedule_autoplay_refill(
