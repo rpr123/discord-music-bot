@@ -5345,8 +5345,10 @@ async def stop(interaction: discord.Interaction) -> None:
         return
     stop_playback(state, interaction.guild_id)
 
-    await show_idle_panel(interaction.guild_id, state)
-    await interaction.response.send_message("재생을 멈추고 대기열을 비웠어요.")
+    try:
+        await interaction.response.send_message("재생을 멈추고 대기열을 비웠어요.")
+    finally:
+        await show_idle_panel(interaction.guild_id, state)
 
 
 @bot.tree.command(name="queue", description="Show the current music queue.")

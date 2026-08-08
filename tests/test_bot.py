@@ -7100,6 +7100,139 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(voice.channel, new_channel)
         self.assertIsNone(state.empty_channel_task)
 
+    async def test_stop_attempts_response_before_blocked_panel_and_converges_after_response_failure(
+        self,
+    ) -> None:
+        guild_id = 821
+        response_attempted = asyncio.Event()
+
+        class Channel:
+            id = 1102
+
+            def __init__(self) -> None:
+                self.send = AsyncMock()
+
+        channel = Channel()
+
+        class Message:
+            id = 1202
+
+            def __init__(self) -> None:
+                self.channel = channel
+                self.edit = AsyncMock()
+
+        message = Message()
+
+        class Voice:
+            def __init__(self) -> None:
+                self.channel = channel
+                self.playing = True
+                self.stop_calls = 0
+
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+                self.playing = False
+
+        voice = Voice()
+
+        class User:
+            voice = type("MemberVoice", (), {"channel": channel})()
+
+        response = MagicMock(status=500, reason="Internal Server Error")
+        response_error = bot.discord.DiscordServerError(
+            response,
+            "<html>temporary failure</html>",
+        )
+
+        async def fail_response(*_args: object, **_kwargs: object) -> None:
+            response_attempted.set()
+            raise response_error
+
+        interaction = MagicMock()
+        interaction.guild_id = guild_id
+        interaction.user = User()
+        interaction.response.send_message = AsyncMock(side_effect=fail_response)
+        interaction.response.is_done.return_value = False
+
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        state.current = make_track("current")
+        state.queue.append(make_track("queued"))
+        state.control_message = message
+        state.announcement_channel = channel
+        original_generation = state.playback_generation
+        stop_task = None
+        test_holds_lock = False
+
+        with patch.object(bot, "get_music_channel_id", return_value=None):
+            try:
+                await asyncio.wait_for(state.control_panel_lock.acquire(), timeout=1)
+                test_holds_lock = True
+                stop_task = asyncio.create_task(bot.stop.callback(interaction))
+                await asyncio.wait_for(response_attempted.wait(), timeout=1)
+
+                interaction.response.send_message.assert_awaited_once_with(
+                    "재생을 멈추고 대기열을 비웠어요."
+                )
+                self.assertFalse(stop_task.done())
+                message.edit.assert_not_awaited()
+                self.assertIsNone(state.current)
+                self.assertFalse(state.queue)
+                self.assertEqual(
+                    state.playback_generation,
+                    original_generation + 1,
+                )
+                self.assertEqual(voice.stop_calls, 1)
+                self.assertFalse(voice.is_playing())
+
+                state.control_panel_lock.release()
+                test_holds_lock = False
+                with self.assertRaises(bot.discord.DiscordServerError) as raised:
+                    await asyncio.wait_for(stop_task, timeout=1)
+                self.assertIs(raised.exception, response_error)
+            finally:
+                if test_holds_lock:
+                    state.control_panel_lock.release()
+                if stop_task is not None and not stop_task.done():
+                    stop_task.cancel()
+                if stop_task is not None:
+                    await asyncio.wait_for(
+                        asyncio.gather(stop_task, return_exceptions=True),
+                        timeout=1,
+                    )
+                empty_timer = state.empty_channel_task
+                bot.cancel_empty_channel_disconnect(state)
+                if empty_timer is not None:
+                    await asyncio.wait_for(
+                        asyncio.gather(empty_timer, return_exceptions=True),
+                        timeout=1,
+                    )
+                bot.music_states.pop(guild_id, None)
+
+        message.edit.assert_awaited_once()
+        edit_kwargs = message.edit.await_args.kwargs
+        self.assertIsNone(edit_kwargs["content"])
+        self.assertEqual(edit_kwargs["embed"].title, bot.IDLE_PANEL_TITLE)
+        idle_view = edit_kwargs["view"]
+        self.assertIsInstance(idle_view, bot.MusicControlView)
+        self.assertTrue(
+            all(
+                item.disabled
+                for item in idle_view.children
+                if item.custom_id != bot.AUTOPLAY_BUTTON_CUSTOM_ID
+            )
+        )
+        channel.send.assert_not_awaited()
+
     async def test_leave_disconnects_before_accepting_request_during_panel_update(
         self,
     ) -> None:
