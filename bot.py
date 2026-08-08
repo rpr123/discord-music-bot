@@ -2141,17 +2141,15 @@ class MusicControlView(discord.ui.View):
 
     async def edit_panel(self, interaction: discord.Interaction) -> None:
         state = self.get_state()
-        if state.current is None:
-            await interaction.response.edit_message(
-                embed=make_idle_player_embed(),
-                view=MusicControlView(self.guild_id, disabled=True),
-            )
-            return
-
-        await interaction.response.edit_message(
-            embed=make_player_embed(state.current, state),
-            view=MusicControlView(self.guild_id),
-        )
+        await interaction.response.defer()
+        async with state.control_panel_lock:
+            if state.current is None:
+                embed = make_idle_player_embed()
+                view = MusicControlView(self.guild_id, disabled=True)
+            else:
+                embed = make_player_embed(state.current, state)
+                view = MusicControlView(self.guild_id)
+            await interaction.edit_original_response(embed=embed, view=view)
 
     @discord.ui.button(label="재생/일시정지", emoji="⏯️", style=discord.ButtonStyle.secondary, row=0)
     async def pause_resume(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:

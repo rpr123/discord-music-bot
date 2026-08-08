@@ -3409,6 +3409,226 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             bot.cancel_autoplay_refill(state)
         bot.music_states.clear()
 
+    async def test_component_edit_cannot_overwrite_newer_idle_panel(self) -> None:
+        guild_id = 320
+        playing_edit_started = asyncio.Event()
+        release_playing_edit = asyncio.Event()
+        remote_titles: list[str | None] = []
+        remote_views: list[bot.discord.ui.View] = []
+        playing_edit_sources: list[str] = []
+        playing_edit_lock_states: list[bool] = []
+        defer_lock_states: list[bool] = []
+
+        class Guild:
+            id = guild_id
+
+        class Channel:
+            id = 653
+            guild = Guild()
+
+            def __init__(self) -> None:
+                self.send = AsyncMock()
+
+        channel = Channel()
+        state = bot.get_state(guild_id)
+
+        async def record_remote_edit(
+            source: str,
+            *,
+            embed: bot.discord.Embed,
+            view: bot.discord.ui.View,
+            **_kwargs: object,
+        ) -> None:
+            if (
+                embed.title == bot.PLAYING_PANEL_TITLE
+                and not playing_edit_started.is_set()
+            ):
+                playing_edit_sources.append(source)
+                playing_edit_lock_states.append(state.control_panel_lock.locked())
+                playing_edit_started.set()
+                await release_playing_edit.wait()
+            remote_titles.append(embed.title)
+            remote_views.append(view)
+
+        class Message:
+            id = 986
+
+            def __init__(self) -> None:
+                self.channel = channel
+                self.edit = AsyncMock(side_effect=self._edit)
+
+            async def _edit(self, **kwargs: object) -> None:
+                await record_remote_edit("control_message", **kwargs)
+
+        message = Message()
+        state.current = make_track("playing")
+        state.control_message = message
+        state.announcement_channel = channel
+        view = bot.MusicControlView(guild_id)
+        interaction = MagicMock()
+        interaction.message = message
+
+        async def defer_response() -> None:
+            defer_lock_states.append(state.control_panel_lock.locked())
+
+        async def edit_interaction_response(**kwargs: object) -> None:
+            await record_remote_edit("interaction_response", **kwargs)
+
+        interaction.response.defer = AsyncMock(side_effect=defer_response)
+        interaction.response.edit_message = AsyncMock()
+        interaction.edit_original_response = AsyncMock(
+            side_effect=edit_interaction_response
+        )
+        component_task = None
+        idle_task = None
+        idle_pending_before_release = False
+
+        with patch.object(bot, "get_music_channel_id", return_value=None):
+            try:
+                component_task = asyncio.create_task(view.edit_panel(interaction))
+                await asyncio.wait_for(playing_edit_started.wait(), timeout=1)
+                interaction.response.defer.assert_awaited_once_with()
+                self.assertEqual(defer_lock_states, [False])
+
+                state.current = None
+                idle_task = asyncio.create_task(
+                    bot.show_idle_panel(guild_id, state)
+                )
+                await asyncio.sleep(0)
+                idle_pending_before_release = not idle_task.done()
+
+                release_playing_edit.set()
+                await asyncio.wait_for(
+                    asyncio.gather(component_task, idle_task),
+                    timeout=1,
+                )
+            finally:
+                release_playing_edit.set()
+                tasks = [
+                    task
+                    for task in (component_task, idle_task)
+                    if task is not None
+                ]
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                if tasks:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=1,
+                    )
+                bot.music_states.pop(guild_id, None)
+
+        interaction.response.edit_message.assert_not_awaited()
+        interaction.edit_original_response.assert_awaited_once()
+        self.assertEqual(playing_edit_sources, ["interaction_response"])
+        self.assertEqual(playing_edit_lock_states, [True])
+        self.assertTrue(idle_pending_before_release)
+        self.assertEqual(
+            remote_titles,
+            [bot.PLAYING_PANEL_TITLE, bot.IDLE_PANEL_TITLE],
+        )
+        self.assertEqual(message.edit.await_count, 1)
+        channel.send.assert_not_awaited()
+        final_view = remote_views[-1]
+        self.assertTrue(
+            all(
+                item.disabled
+                for item in final_view.children
+                if item.custom_id != bot.AUTOPLAY_BUTTON_CUSTOM_ID
+            )
+        )
+
+    async def test_noncanonical_component_edit_updates_only_clicked_message(
+        self,
+    ) -> None:
+        guild_id = 323
+
+        class Guild:
+            id = guild_id
+
+        class Channel:
+            id = 656
+            guild = Guild()
+
+            def __init__(self) -> None:
+                self.send = AsyncMock()
+
+        class Message:
+            def __init__(self, message_id: int, channel: Channel) -> None:
+                self.id = message_id
+                self.channel = channel
+                self.edit = AsyncMock()
+
+        channel = Channel()
+        canonical_message = Message(989, channel)
+        clicked_message = Message(990, channel)
+        state = bot.get_state(guild_id)
+        initial_track = make_track("initial")
+        replacement_track = make_track("replacement")
+        state.current = initial_track
+        state.control_message = canonical_message
+        state.announcement_channel = channel
+        view = bot.MusicControlView(guild_id)
+        defer_seen = asyncio.Event()
+        edit_lock_states: list[bool] = []
+
+        async def defer_response() -> None:
+            defer_seen.set()
+
+        async def edit_clicked_message(**_kwargs: object) -> None:
+            edit_lock_states.append(state.control_panel_lock.locked())
+
+        interaction = MagicMock()
+        interaction.message = clicked_message
+        interaction.response.defer = AsyncMock(side_effect=defer_response)
+        interaction.response.edit_message = AsyncMock()
+        interaction.edit_original_response = AsyncMock(
+            side_effect=edit_clicked_message
+        )
+        edit_task = None
+        test_holds_lock = False
+
+        try:
+            await asyncio.wait_for(state.control_panel_lock.acquire(), timeout=1)
+            test_holds_lock = True
+            edit_task = asyncio.create_task(view.edit_panel(interaction))
+            await asyncio.wait_for(defer_seen.wait(), timeout=1)
+
+            interaction.response.defer.assert_awaited_once_with()
+            self.assertFalse(edit_task.done())
+            interaction.edit_original_response.assert_not_awaited()
+
+            state.current = replacement_track
+            state.control_panel_lock.release()
+            test_holds_lock = False
+            await asyncio.wait_for(edit_task, timeout=1)
+        finally:
+            if test_holds_lock:
+                state.control_panel_lock.release()
+            if edit_task is not None and not edit_task.done():
+                edit_task.cancel()
+            if edit_task is not None:
+                await asyncio.wait_for(
+                    asyncio.gather(edit_task, return_exceptions=True),
+                    timeout=1,
+                )
+            bot.music_states.pop(guild_id, None)
+
+        canonical_message.edit.assert_not_awaited()
+        channel.send.assert_not_awaited()
+        interaction.response.edit_message.assert_not_awaited()
+        interaction.edit_original_response.assert_awaited_once()
+        self.assertEqual(edit_lock_states, [True])
+        edit_kwargs = interaction.edit_original_response.await_args.kwargs
+        self.assertEqual(
+            edit_kwargs["embed"].to_dict(),
+            bot.make_player_embed(replacement_track, state).to_dict(),
+        )
+        edited_view = edit_kwargs["view"]
+        self.assertIsInstance(edited_view, bot.MusicControlView)
+        self.assertTrue(all(not item.disabled for item in edited_view.children))
+
     async def test_idle_panel_becomes_playing_without_creating_another_message(self) -> None:
         class Guild:
             id = 321
