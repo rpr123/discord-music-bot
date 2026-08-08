@@ -1,9 +1,7 @@
-import ast
 import unittest
-from pathlib import Path
 
 import bot
-import music_namuwiki_interleaved
+import music_namuwiki_parsing as music_namuwiki_interleaved
 
 
 MOVED_NAMES = (
@@ -21,34 +19,6 @@ class MusicNamuWikiInterleavedTests(unittest.TestCase):
                     getattr(bot, name),
                     getattr(music_namuwiki_interleaved, name),
                 )
-
-    def test_module_has_only_the_expected_import_dependencies(self) -> None:
-        source = Path(music_namuwiki_interleaved.__file__).read_text(
-            encoding="utf-8"
-        )
-        tree = ast.parse(source)
-        imported_modules = {
-            node.module
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module
-        }
-        imported_modules.update(
-            alias.name
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Import)
-            for alias in node.names
-        )
-
-        self.assertEqual(
-            imported_modules,
-            {
-                "__future__",
-                "html",
-                "music_namuwiki_validation",
-                "music_script_detection",
-                "re",
-            },
-        )
 
     def test_table_text_normalization_preserves_single_blank_separators(self) -> None:
         value = " A&nbsp; B\r\n\r\n\u200b\r\n C\tD \n\n"

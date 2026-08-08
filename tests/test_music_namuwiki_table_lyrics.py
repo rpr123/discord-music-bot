@@ -1,9 +1,7 @@
-import ast
 import unittest
-from pathlib import Path
 
 import bot
-import music_namuwiki_table_lyrics
+import music_namuwiki_parsing as music_namuwiki_table_lyrics
 
 
 class MusicNamuWikiTableLyricsTests(unittest.TestCase):
@@ -11,28 +9,6 @@ class MusicNamuWikiTableLyricsTests(unittest.TestCase):
         self.assertIs(
             bot.extract_namuwiki_lyrics_from_tables,
             music_namuwiki_table_lyrics.extract_namuwiki_lyrics_from_tables,
-        )
-
-    def test_module_has_only_the_expected_import_dependencies(self) -> None:
-        source = Path(music_namuwiki_table_lyrics.__file__).read_text(
-            encoding="utf-8"
-        )
-        tree = ast.parse(source)
-        imported_modules = {
-            node.module
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module
-        }
-
-        self.assertEqual(
-            imported_modules,
-            {
-                "__future__",
-                "music_namuwiki_headers",
-                "music_namuwiki_interleaved",
-                "music_namuwiki_validation",
-                "music_script_detection",
-            },
         )
 
     def test_header_table_preserves_source_reading_and_translation(self) -> None:

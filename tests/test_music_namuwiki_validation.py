@@ -1,9 +1,7 @@
-import ast
 import unittest
-from pathlib import Path
 
 import bot
-import music_namuwiki_validation
+import music_namuwiki_parsing as music_namuwiki_validation
 
 
 MOVED_NAMES = (
@@ -20,28 +18,6 @@ class MusicNamuWikiValidationTests(unittest.TestCase):
                     getattr(bot, name),
                     getattr(music_namuwiki_validation, name),
                 )
-
-    def test_module_has_only_the_expected_import_dependencies(self) -> None:
-        source = Path(music_namuwiki_validation.__file__).read_text(
-            encoding="utf-8"
-        )
-        tree = ast.parse(source)
-        imported_modules = {
-            node.module
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module
-        }
-        imported_modules.update(
-            alias.name
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Import)
-            for alias in node.names
-        )
-
-        self.assertEqual(
-            imported_modules,
-            {"__future__", "music_script_detection", "re"},
-        )
 
     def test_korean_translation_thresholds_are_preserved(self) -> None:
         self.assertTrue(

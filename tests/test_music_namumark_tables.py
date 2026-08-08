@@ -1,9 +1,7 @@
-import ast
 import unittest
-from pathlib import Path
 
 import bot
-import music_namumark_tables
+import music_namuwiki_parsing as music_namumark_tables
 
 
 MOVED_NAMES = (
@@ -24,28 +22,6 @@ class MusicNamuMarkTablesTests(unittest.TestCase):
                     getattr(bot, name),
                     getattr(music_namumark_tables, name),
                 )
-
-    def test_module_has_only_the_expected_import_dependencies(self) -> None:
-        source = Path(music_namumark_tables.__file__).read_text(
-            encoding="utf-8"
-        )
-        tree = ast.parse(source)
-        imported_modules = {
-            node.module
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module
-        }
-        imported_modules.update(
-            alias.name
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Import)
-            for alias in node.names
-        )
-
-        self.assertEqual(
-            imported_modules,
-            {"__future__", "music_namuwiki_interleaved", "re"},
-        )
 
     def test_clean_cell_preserves_existing_markup_removal(self) -> None:
         value = (

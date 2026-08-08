@@ -1,9 +1,7 @@
-import ast
 import unittest
-from pathlib import Path
 
 import bot
-import music_namuwiki_artists
+import music_namuwiki_matching as music_namuwiki_artists
 from music_models import Track
 
 
@@ -31,35 +29,6 @@ class MusicNamuWikiArtistsTests(unittest.TestCase):
                     getattr(bot, name),
                     getattr(music_namuwiki_artists, name),
                 )
-
-    def test_module_has_only_the_expected_import_dependencies(self) -> None:
-        source = Path(music_namuwiki_artists.__file__).read_text(
-            encoding="utf-8"
-        )
-        tree = ast.parse(source)
-        imported_modules = {
-            node.module
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module
-        }
-        imported_modules.update(
-            alias.name
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Import)
-            for alias in node.names
-        )
-
-        self.assertEqual(
-            imported_modules,
-            {
-                "__future__",
-                "music_lyrics_matching",
-                "music_models",
-                "music_search_scoring",
-                "re",
-                "unicodedata",
-            },
-        )
 
     def test_primary_artist_uses_first_value_after_a_known_label(self) -> None:
         tables = [[["발매일", "2026"], ["ＡＲＴＩＳＴ", "", "SUPER BEAVER\n공식"]]]

@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import bot
-import music_namuwiki_candidates
+import music_namuwiki_matching as music_namuwiki_candidates
 from music_models import Track
 
 
@@ -42,11 +42,11 @@ class MusicNamuWikiCandidatesTests(unittest.TestCase):
                 "collections.abc",
                 "music_lyrics_matching",
                 "music_models",
-                "music_namuwiki_artists",
                 "music_namuwiki_parsing",
                 "music_search_scoring",
                 "music_track_identity",
                 "re",
+                "unicodedata",
                 "urllib.parse",
             },
         )

@@ -99,63 +99,55 @@ from music_lyrics_matching import (
     normalize_lyrics_match_text,
     select_lyrics_record,
 )
-from music_namumark_tables import (
-    NAMUMARK_FOOTNOTE_RE,
-    NAMUMARK_LINK_RE,
-    NAMUMARK_RUBY_RE,
-    NAMUMARK_STYLE_PREFIX_RE,
-    clean_namumark_cell,
-    parse_namumark_tables,
-)
-from music_namuwiki_artists import (
+from music_namuwiki_matching import (
+    build_namuwiki_document_candidates,
     extract_namuwiki_primary_artist_from_tables,
+    find_namuwiki_override,
     get_namuwiki_track_artists,
     namuwiki_artist_matches_track,
-)
-from music_namuwiki_candidates import (
-    build_namuwiki_document_candidates,
-    find_namuwiki_override,
     parse_namuwiki_candidate,
-)
-from music_namuwiki_html_tables import (
-    NAMUWIKI_IGNORED_HTML_TAGS,
-    NAMUWIKI_VOID_HTML_TAGS,
-    NamuWikiHTMLTableParser,
-    _NamuWikiHTMLTableContext,
 )
 from music_queue import (
     remove_queued_track,
     remove_queued_track_by_id,
     remove_queued_track_range_by_ids,
 )
-from music_namuwiki_headers import (
+from music_namuwiki_parsing import (
+    NAMUMARK_FOOTNOTE_RE,
+    NAMUMARK_LINK_RE,
+    NAMUMARK_RUBY_RE,
+    NAMUMARK_STYLE_PREFIX_RE,
+    NAMUWIKI_IGNORED_HTML_TAGS,
+    NAMUWIKI_VOID_HTML_TAGS,
+    NamuWikiLyricsError,
+    NamuWikiHTMLTableParser,
+    NamuWikiPageBlockedError,
+    _NamuWikiHTMLTableContext,
     best_namuwiki_header_column,
+    clean_namumark_cell,
+    extract_interleaved_namuwiki_groups,
+    extract_interleaved_namuwiki_lyrics,
+    extract_namuwiki_annotated_reading,
+    extract_namuwiki_lyrics_from_html,
+    extract_namuwiki_lyrics_from_namumark,
+    extract_namuwiki_original_lyrics,
+    extract_namuwiki_lyrics_from_tables,
+    get_hiragana_reading_source_lyrics,
+    is_usable_namuwiki_lyrics,
+    is_valid_korean_translation,
     namuwiki_reading_header_score,
     namuwiki_source_header_score,
     namuwiki_translation_header_score,
-)
-from music_namuwiki_interleaved import (
-    extract_interleaved_namuwiki_groups,
-    extract_interleaved_namuwiki_lyrics,
     normalize_namuwiki_table_text,
-)
-from music_namuwiki_parsing import (
-    NamuWikiLyricsError,
-    NamuWikiPageBlockedError,
-    extract_namuwiki_lyrics_from_html,
-    extract_namuwiki_lyrics_from_namumark,
+    parse_namumark_tables,
     parse_namuwiki_html_tables,
-)
-from music_namuwiki_readings import (
-    extract_namuwiki_annotated_reading,
-    extract_namuwiki_original_lyrics,
-    get_hiragana_reading_source_lyrics,
     split_namuwiki_lyrics_groups,
 )
-from music_namuwiki_table_lyrics import extract_namuwiki_lyrics_from_tables
-from music_namuwiki_validation import (
-    is_usable_namuwiki_lyrics,
-    is_valid_korean_translation,
+from music_namuwiki_transport import (
+    NAMUWIKI_BLOCKED_MARKERS,
+    read_limited_http_response as read_namuwiki_http_response,
+    request_namuwiki_api_source as fetch_namuwiki_api_source,
+    request_namuwiki_html_once as fetch_namuwiki_html_once,
 )
 from music_request_parsing import (
     YOUTUBE_HOSTS,
@@ -2638,16 +2630,6 @@ NAMUWIKI_BROWSER_USER_AGENT = (
     "Chrome/124.0 Safari/537.36"
 )
 NAMUWIKI_PREVIEW_USER_AGENT = "Discordbot/2.0"
-NAMUWIKI_BLOCKED_MARKERS = (
-    "captcha 인증이 필요",
-    "로봇이 아닙니다",
-    "idc 대역 ip",
-    "ip 우회 수단",
-    "rate limit",
-    "too many requests",
-    "비정상적인 접근",
-    "차단되었습니다",
-)
 
 
 def get_namuwiki_override(track: Track) -> str | None:
@@ -2677,99 +2659,37 @@ def wait_for_namuwiki_interval() -> None:
 
 
 def read_limited_http_response(response) -> bytes:
-    payload = response.read(NAMUWIKI_MAX_RESPONSE_BYTES + 1)
-    if len(payload) > NAMUWIKI_MAX_RESPONSE_BYTES:
-        raise NamuWikiLyricsError("NamuWiki response was too large.")
-    return payload
+    return read_namuwiki_http_response(
+        response,
+        NAMUWIKI_MAX_RESPONSE_BYTES,
+    )
 
 
 def request_namuwiki_api_source(document: str) -> str | None:
-    if not NAMUWIKI_API_TOKEN:
-        return None
-
-    url = (
-        f"{NAMUWIKI_API_BASE_URL}/edit/"
-        f"{urllib.parse.quote(document, safe='')}"
+    return fetch_namuwiki_api_source(
+        document,
+        api_token=NAMUWIKI_API_TOKEN,
+        api_base_url=NAMUWIKI_API_BASE_URL,
+        timeout_seconds=NAMUWIKI_REQUEST_TIMEOUT_SECONDS,
+        wait_for_interval=wait_for_namuwiki_interval,
+        read_response=read_limited_http_response,
+        urlopen=urllib.request.urlopen,
     )
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {NAMUWIKI_API_TOKEN}",
-            "User-Agent": (
-                "discord-music-bot/1.0 "
-                "(https://github.com/rpr123/discord-music-bot)"
-            ),
-        },
-    )
-    wait_for_namuwiki_interval()
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=NAMUWIKI_REQUEST_TIMEOUT_SECONDS,
-        ) as response:
-            payload = json.loads(
-                read_limited_http_response(response).decode("utf-8")
-            )
-    except urllib.error.HTTPError as error:
-        if error.code in {404, 410}:
-            return None
-        raise NamuWikiLyricsError(f"NamuWiki API returned HTTP {error.code}.") from error
-    except (
-        urllib.error.URLError,
-        TimeoutError,
-        OSError,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-    ) as error:
-        raise NamuWikiLyricsError(str(error)) from error
-
-    if not isinstance(payload, dict) or payload.get("exists") is False:
-        return None
-    source = payload.get("text")
-    return source if isinstance(source, str) and source.strip() else None
 
 
 def request_namuwiki_html_once(
     page_url: str,
     user_agent: str,
 ) -> tuple[str, str] | None:
-    request = urllib.request.Request(
+    return fetch_namuwiki_html_once(
         page_url,
-        headers={
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "ko-KR,ko;q=0.9",
-            "User-Agent": user_agent,
-        },
+        user_agent,
+        timeout_seconds=NAMUWIKI_REQUEST_TIMEOUT_SECONDS,
+        wait_for_interval=wait_for_namuwiki_interval,
+        read_response=read_limited_http_response,
+        urlopen=urllib.request.urlopen,
+        blocked_markers=NAMUWIKI_BLOCKED_MARKERS,
     )
-    wait_for_namuwiki_interval()
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=NAMUWIKI_REQUEST_TIMEOUT_SECONDS,
-        ) as response:
-            payload = read_limited_http_response(response)
-            final_url = response.geturl()
-    except urllib.error.HTTPError as error:
-        if error.code in {404, 410}:
-            return None
-        if error.code == 403:
-            raise NamuWikiPageBlockedError(
-                "NamuWiki page returned HTTP 403."
-            ) from error
-        raise NamuWikiLyricsError(
-            f"NamuWiki page returned HTTP {error.code}."
-        ) from error
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        raise NamuWikiLyricsError(str(error)) from error
-
-    source = payload.decode("utf-8", errors="replace")
-    lowered_source = source.casefold()
-    if any(marker in lowered_source for marker in NAMUWIKI_BLOCKED_MARKERS):
-        raise NamuWikiPageBlockedError(
-            "NamuWiki blocked or challenged the request."
-        )
-    return source, final_url
 
 
 def request_namuwiki_html(page_url: str) -> tuple[str, str] | None:

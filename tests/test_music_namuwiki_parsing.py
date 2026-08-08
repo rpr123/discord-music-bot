@@ -35,14 +35,25 @@ class MusicNamuWikiParsingTests(unittest.TestCase):
             for node in ast.walk(tree)
             if isinstance(node, ast.ImportFrom) and node.module
         }
+        imported_modules.update(
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        )
 
         self.assertEqual(
             imported_modules,
             {
                 "__future__",
-                "music_namumark_tables",
-                "music_namuwiki_html_tables",
-                "music_namuwiki_table_lyrics",
+                "dataclasses",
+                "html",
+                "html.parser",
+                "music_japanese_reading",
+                "music_models",
+                "music_script_detection",
+                "re",
+                "typing",
             },
         )
 
