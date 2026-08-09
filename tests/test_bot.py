@@ -3408,6 +3408,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         for state in bot.music_states.values():
             bot.cancel_autoplay_refill(state)
+            if state.control_view is not None:
+                bot.discord.ui.View.stop(state.control_view)
         bot.music_states.clear()
 
     async def test_music_control_views_have_stable_persistent_custom_ids(
@@ -3476,6 +3478,764 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             for view in reversed(registered_views):
                 bot.discord.ui.View.stop(view)
             bot.music_states.pop(guild_id, None)
+
+    async def test_canonical_control_view_keeps_one_live_dispatch_owner(self) -> None:
+        guild_id = 322
+        message_id = 9300
+        channel = MagicMock(id=9299)
+        message = MagicMock(id=message_id, channel=channel)
+        state = bot.get_state(guild_id)
+        state.current = make_track("canonical-owner")
+        state.control_message = message
+        previous_view = bot.MusicControlView(guild_id)
+        state.control_view = previous_view
+        view_store = ViewStore(bot.bot._connection)
+        registered_views = [previous_view]
+        view_store.add_view(previous_view, message_id)
+
+        def store_view(view: object, *, message_id: int) -> None:
+            view_store.add_view(view, message_id)
+
+        async def edit_message(**kwargs: object) -> None:
+            view = kwargs["view"]
+            registered_views.append(view)
+            view_store.remove_message_tracking(message_id)
+            view_store.add_view(view, message_id)
+
+        message.edit = AsyncMock(side_effect=edit_message)
+        interaction = MagicMock(message=message)
+        interaction.response.is_done.return_value = True
+        interaction.response.defer = AsyncMock()
+        interaction.edit_original_response = AsyncMock(side_effect=edit_message)
+
+        try:
+            with patch.object(bot.bot, "add_view", side_effect=store_view) as add_view:
+                await bot.update_control_panel(guild_id, state, channel=channel)
+
+                first_owner = state.control_view
+                self.assertIsNot(first_owner, previous_view)
+                self.assertTrue(previous_view.is_finished())
+                self.assertEqual(len(view_store._views[message_id]), 8)
+                self.assertIs(view_store._synced_message_views[message_id], first_owner)
+                self.assertTrue(
+                    all(
+                        item.view is first_owner
+                        for item in view_store._views[message_id].values()
+                    )
+                )
+
+                self.assertTrue(await first_owner.edit_panel(interaction))
+
+                second_owner = state.control_view
+                self.assertIsNot(second_owner, first_owner)
+                self.assertTrue(first_owner.is_finished())
+                self.assertEqual(len(view_store._views[message_id]), 8)
+                self.assertIs(view_store._synced_message_views[message_id], second_owner)
+                self.assertTrue(
+                    all(
+                        item.view is second_owner
+                        for item in view_store._views[message_id].values()
+                    )
+                )
+                self.assertEqual(add_view.call_count, 2)
+                add_view.assert_any_call(first_owner, message_id=message_id)
+                add_view.assert_any_call(second_owner, message_id=message_id)
+                message.edit.assert_awaited_once()
+                interaction.edit_original_response.assert_awaited_once()
+                interaction.response.defer.assert_not_awaited()
+        finally:
+            for view in reversed(registered_views):
+                bot.discord.ui.View.stop(view)
+            bot.music_states.pop(guild_id, None)
+
+    async def test_stopped_dispatched_owner_converges_after_canonical_replacement(
+        self,
+    ) -> None:
+        guild_id = 323
+        message_id = 9350
+        state = bot.get_state(guild_id)
+        state.current = make_track("owner-race")
+        state.queue.append(make_track("queued"))
+        generation = state.playback_generation
+        playing = {"value": True}
+        voice = MagicMock()
+        voice.is_playing.side_effect = lambda: playing["value"]
+        voice.is_paused.return_value = False
+        voice.stop.side_effect = lambda: playing.__setitem__("value", False)
+        state.voice = voice
+
+        channel = MagicMock(id=9349)
+        channel.send = AsyncMock()
+        message = MagicMock(id=message_id, channel=channel)
+        message.id = message_id
+        message.channel = channel
+        state.control_message = message
+        state.announcement_channel = channel
+        dispatched_owner = bot.MusicControlView(guild_id)
+        state.control_view = dispatched_owner
+        view_store = ViewStore(bot.bot._connection)
+        registered_views = [dispatched_owner]
+        view_store.add_view(dispatched_owner, message_id)
+
+        update_started = asyncio.Event()
+        release_update = asyncio.Event()
+        defer_seen = asyncio.Event()
+        remote_edits: list[dict[str, object]] = []
+        order: list[str] = []
+
+        def store_view(view: object, *, message_id: int) -> None:
+            view_store.add_view(view, message_id)
+
+        async def edit_canonical(**kwargs: object) -> None:
+            if not remote_edits:
+                order.append("update-start")
+                update_started.set()
+                await release_update.wait()
+            else:
+                order.append("idle")
+            view = kwargs["view"]
+            registered_views.append(view)
+            view_store.remove_message_tracking(message_id)
+            view_store.add_view(view, message_id)
+            remote_edits.append(kwargs)
+
+        message.edit = AsyncMock(side_effect=edit_canonical)
+        interaction = MagicMock(message=message)
+        interaction.response.is_done.return_value = False
+
+        async def defer_response() -> None:
+            order.append("defer")
+            defer_seen.set()
+
+        interaction.response.defer = AsyncMock(side_effect=defer_response)
+        interaction.edit_original_response = AsyncMock()
+        stop_button = next(
+            item
+            for item in dispatched_owner.children
+            if isinstance(item, bot.discord.ui.Button)
+            and item.style == bot.discord.ButtonStyle.danger
+        )
+        tasks: list[asyncio.Task] = []
+
+        try:
+            with patch.object(bot.bot, "add_view", side_effect=store_view):
+                update_task = asyncio.create_task(
+                    bot.update_control_panel(guild_id, state, channel=channel)
+                )
+                tasks.append(update_task)
+                await asyncio.wait_for(update_started.wait(), timeout=1)
+
+                stop_task = asyncio.create_task(stop_button.callback(interaction))
+                tasks.append(stop_task)
+                await asyncio.wait_for(defer_seen.wait(), timeout=1)
+                self.assertTrue(state.control_panel_lock.locked())
+                self.assertFalse(stop_task.done())
+                self.assertIsNone(state.current)
+                self.assertFalse(state.queue)
+                self.assertEqual(state.playback_generation, generation + 1)
+                voice.stop.assert_called_once_with()
+                interaction.edit_original_response.assert_not_awaited()
+
+                release_update.set()
+                await asyncio.wait_for(
+                    asyncio.gather(update_task, stop_task),
+                    timeout=1,
+                )
+
+            self.assertEqual(order, ["update-start", "defer", "idle"])
+            self.assertEqual(len(remote_edits), 2)
+            self.assertNotEqual(remote_edits[0]["embed"].title, bot.IDLE_PANEL_TITLE)
+            self.assertEqual(remote_edits[1]["embed"].title, bot.IDLE_PANEL_TITLE)
+            final_view = remote_edits[1]["view"]
+            self.assertIs(state.control_view, final_view)
+            self.assertTrue(dispatched_owner.is_finished())
+            self.assertTrue(remote_edits[0]["view"].is_finished())
+            self.assertTrue(
+                all(
+                    child.disabled
+                    for child in final_view.children
+                    if child.custom_id != bot.AUTOPLAY_BUTTON_CUSTOM_ID
+                )
+            )
+            self.assertEqual(len(view_store._views[message_id]), 8)
+            self.assertTrue(
+                all(
+                    item.view is final_view
+                    for item in view_store._views[message_id].values()
+                )
+            )
+            interaction.response.defer.assert_awaited_once_with()
+            interaction.edit_original_response.assert_not_awaited()
+            self.assertEqual(message.edit.await_count, 2)
+            channel.send.assert_not_awaited()
+        finally:
+            release_update.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            for view in reversed(registered_views):
+                bot.discord.ui.View.stop(view)
+            bot.cancel_autoplay_refill(state)
+            bot.cancel_empty_channel_disconnect(state)
+            bot.music_states.pop(guild_id, None)
+
+    async def test_control_view_recovery_cleans_only_abandoned_dispatch_owners(
+        self,
+    ) -> None:
+        view_store = ViewStore(bot.bot._connection)
+        registered_views: list[bot.MusicControlView] = []
+        response_404 = MagicMock(status=404, reason="Not Found")
+        response_500 = MagicMock(status=500, reason="Internal Server Error")
+
+        def make_message(message_id: int, channel: object) -> MagicMock:
+            message = MagicMock(id=message_id, channel=channel)
+            message.id = message_id
+            message.channel = channel
+            return message
+
+        def own_view(
+            state: bot.GuildMusicState,
+            message_id: int,
+        ) -> bot.MusicControlView:
+            view = bot.MusicControlView(message_id)
+            registered_views.append(view)
+            state.control_view = view
+            view_store.add_view(view, message_id)
+            return view
+
+        def make_send(channel: object, message_id: int):
+            message = make_message(message_id, channel)
+
+            async def send(**kwargs: object) -> object:
+                view = kwargs["view"]
+                registered_views.append(view)
+                view_store.add_view(view, message_id)
+                return message
+
+            channel.send = AsyncMock(side_effect=send)
+            return message
+
+        channel_a = MagicMock(id=9400)
+        channel_b = MagicMock(id=9500)
+        mismatch_state = bot.GuildMusicState()
+        mismatch_old = make_message(9401, channel_a)
+        mismatch_state.control_message = mismatch_old
+        mismatch_owner = own_view(mismatch_state, mismatch_old.id)
+        mismatch_new = make_send(channel_b, 9501)
+
+        channel_c = MagicMock(id=9600)
+        missing_state = bot.GuildMusicState()
+        missing_old = make_message(9601, channel_c)
+        missing_state.control_message = missing_old
+        missing_owner = own_view(missing_state, missing_old.id)
+
+        async def raise_not_found(**_kwargs: object) -> None:
+            view_store.remove_message_tracking(missing_old.id)
+            raise bot.discord.NotFound(response_404, "missing panel")
+
+        missing_old.edit = AsyncMock(side_effect=raise_not_found)
+        missing_new = make_send(channel_c, 9602)
+
+        channel_d = MagicMock(id=9700)
+        failure_state = bot.GuildMusicState()
+        failure_old = make_message(9701, channel_d)
+        failure_state.control_message = failure_old
+        own_view(failure_state, failure_old.id)
+        prior_failure_owner = failure_state.control_view
+
+        async def raise_http_error(**_kwargs: object) -> None:
+            view_store.remove_message_tracking(failure_old.id)
+            raise bot.discord.DiscordServerError(response_500, "edit failed")
+
+        failure_old.edit = AsyncMock(side_effect=raise_http_error)
+        channel_d.send = AsyncMock()
+
+        channel_e = MagicMock(id=9750)
+        cancelled_state = bot.GuildMusicState()
+        cancelled_old = make_message(9751, channel_e)
+        cancelled_state.control_message = cancelled_old
+        cancelled_owner = own_view(cancelled_state, cancelled_old.id)
+        cancelled_error = asyncio.CancelledError("panel edit cancelled")
+
+        async def raise_cancelled(**_kwargs: object) -> None:
+            view_store.remove_message_tracking(cancelled_old.id)
+            raise cancelled_error
+
+        cancelled_old.edit = AsyncMock(side_effect=raise_cancelled)
+        channel_e.send = AsyncMock()
+
+        try:
+            with (
+                patch.object(bot, "get_control_message_id", return_value=None),
+                patch.object(bot, "set_control_message_id"),
+                patch.object(bot, "clear_control_message_id"),
+                patch.object(
+                    bot,
+                    "reconcile_control_panel_messages",
+                    new=AsyncMock(return_value=None),
+                ),
+                patch.object(bot, "is_silent_music_channel", return_value=False),
+                patch.object(bot.logger, "exception"),
+            ):
+                mismatch_result = await bot.update_control_panel(
+                    9401,
+                    mismatch_state,
+                    channel=channel_b,
+                )
+                missing_result = await bot.update_control_panel(
+                    9601,
+                    missing_state,
+                    channel=channel_c,
+                )
+                failure_result = await bot.update_control_panel(
+                    9701,
+                    failure_state,
+                    channel=channel_d,
+                )
+                with self.assertRaises(asyncio.CancelledError) as raised:
+                    await bot.update_control_panel(
+                        9751,
+                        cancelled_state,
+                        channel=channel_e,
+                    )
+                self.assertIs(raised.exception, cancelled_error)
+
+            self.assertIs(mismatch_result, mismatch_new)
+            self.assertTrue(mismatch_owner.is_finished())
+            self.assertNotIn(mismatch_old.id, view_store._views)
+            self.assertIs(mismatch_state.control_message, mismatch_new)
+            self.assertEqual(len(view_store._views[mismatch_new.id]), 8)
+            self.assertTrue(
+                all(
+                    item.view is mismatch_state.control_view
+                    for item in view_store._views[mismatch_new.id].values()
+                )
+            )
+
+            self.assertIs(missing_result, missing_new)
+            self.assertTrue(missing_owner.is_finished())
+            self.assertNotIn(missing_old.id, view_store._views)
+            self.assertIs(missing_state.control_message, missing_new)
+            self.assertEqual(len(view_store._views[missing_new.id]), 8)
+            self.assertTrue(
+                all(
+                    item.view is missing_state.control_view
+                    for item in view_store._views[missing_new.id].values()
+                )
+            )
+
+            self.assertIsNone(failure_result)
+            self.assertIs(failure_state.control_message, failure_old)
+            self.assertIs(failure_state.control_view, prior_failure_owner)
+            self.assertFalse(prior_failure_owner.is_finished())
+            channel_d.send.assert_not_awaited()
+            self.assertEqual(len(view_store._views[failure_old.id]), 8)
+            self.assertTrue(
+                all(
+                    item.view is prior_failure_owner
+                    for item in view_store._views[failure_old.id].values()
+                )
+            )
+
+            self.assertIs(cancelled_state.control_message, cancelled_old)
+            self.assertIs(cancelled_state.control_view, cancelled_owner)
+            self.assertFalse(cancelled_owner.is_finished())
+            self.assertFalse(cancelled_state.control_panel_lock.locked())
+            channel_e.send.assert_not_awaited()
+            self.assertEqual(len(view_store._views[cancelled_old.id]), 8)
+            self.assertTrue(
+                all(
+                    item.view is cancelled_owner
+                    for item in view_store._views[cancelled_old.id].values()
+                )
+            )
+        finally:
+            for view in reversed(registered_views):
+                bot.discord.ui.View.stop(view)
+
+    async def test_raw_panel_deletion_releases_only_the_live_dispatch_owner(
+        self,
+    ) -> None:
+        for offset, bulk in enumerate((False, True)):
+            with self.subTest(matching="bulk" if bulk else "single"):
+                guild_id = 9760 + offset
+                message_id = 9860 + offset
+                state = bot.get_state(guild_id)
+                message = MagicMock(id=message_id)
+                message.id = message_id
+                owner = bot.MusicControlView(guild_id)
+                state.control_message = message
+                state.control_view = owner
+                view_store = ViewStore(bot.bot._connection)
+                view_store.add_view(owner, message_id)
+                payload = SimpleNamespace(guild_id=guild_id)
+                if bulk:
+                    payload.message_ids = {message_id, message_id + 100}
+                    handler = bot.on_raw_bulk_message_delete
+                else:
+                    payload.message_id = message_id
+                    handler = bot.on_raw_message_delete
+
+                try:
+                    with patch.object(
+                        bot,
+                        "clear_control_message_id",
+                    ) as clear_id:
+                        await handler(payload)
+
+                    clear_id.assert_called_once_with(guild_id)
+                    self.assertIsNone(state.control_message)
+                    self.assertIsNone(state.control_view)
+                    self.assertTrue(owner.is_finished())
+                    self.assertFalse(state.control_panel_lock.locked())
+                    self.assertNotIn(message_id, view_store._views)
+                    self.assertNotIn(
+                        message_id,
+                        view_store._synced_message_views,
+                    )
+                finally:
+                    bot.discord.ui.View.stop(owner)
+                    bot.music_states.pop(guild_id, None)
+
+        guild_id = 9780
+        message_id = 9880
+        state = bot.get_state(guild_id)
+        message = MagicMock(id=message_id)
+        message.id = message_id
+        owner = bot.MusicControlView(guild_id)
+        state.control_message = message
+        state.control_view = owner
+        view_store = ViewStore(bot.bot._connection)
+        view_store.add_view(owner, message_id)
+        try:
+            with patch.object(bot, "clear_control_message_id") as clear_id:
+                await bot.on_raw_message_delete(
+                    SimpleNamespace(
+                        guild_id=guild_id,
+                        message_id=message_id + 1,
+                    )
+                )
+                await bot.on_raw_bulk_message_delete(
+                    SimpleNamespace(
+                        guild_id=guild_id,
+                        message_ids={message_id + 2, message_id + 3},
+                    )
+                )
+
+            clear_id.assert_not_called()
+            self.assertIs(state.control_message, message)
+            self.assertIs(state.control_view, owner)
+            self.assertFalse(owner.is_finished())
+            self.assertEqual(len(view_store._views[message_id]), 8)
+        finally:
+            bot.discord.ui.View.stop(owner)
+            bot.music_states.pop(guild_id, None)
+
+        guild_id = 9790
+        old_message_id = 9890
+        new_message_id = 9891
+        state = bot.get_state(guild_id)
+        old_message = MagicMock(id=old_message_id)
+        old_message.id = old_message_id
+        old_owner = bot.MusicControlView(guild_id)
+        state.control_message = old_message
+        state.control_view = old_owner
+        view_store = ViewStore(bot.bot._connection)
+        view_store.add_view(old_owner, old_message_id)
+        handler_task = None
+        test_holds_lock = False
+
+        def store_view(view: object, *, message_id: int) -> None:
+            view_store.add_view(view, message_id)
+
+        try:
+            await state.control_panel_lock.acquire()
+            test_holds_lock = True
+            with (
+                patch.object(bot, "clear_control_message_id") as clear_id,
+                patch.object(bot.bot, "add_view", side_effect=store_view),
+            ):
+                handler_task = asyncio.create_task(
+                    bot.on_raw_message_delete(
+                        SimpleNamespace(
+                            guild_id=guild_id,
+                            message_id=old_message_id,
+                        )
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(handler_task.done())
+
+                new_message = MagicMock(id=new_message_id)
+                new_message.id = new_message_id
+                new_owner = bot.MusicControlView(guild_id)
+                view_store.add_view(new_owner, new_message_id)
+                state.control_message = new_message
+                bot.replace_control_panel_view(
+                    state,
+                    new_owner,
+                    message_id=new_message_id,
+                )
+
+                state.control_panel_lock.release()
+                test_holds_lock = False
+                await asyncio.wait_for(handler_task, timeout=1)
+
+            clear_id.assert_not_called()
+            self.assertIs(state.control_message, new_message)
+            self.assertIs(state.control_view, new_owner)
+            self.assertFalse(new_owner.is_finished())
+            self.assertTrue(old_owner.is_finished())
+            self.assertNotIn(old_message_id, view_store._views)
+            self.assertEqual(len(view_store._views[new_message_id]), 8)
+            self.assertTrue(
+                all(
+                    item.view is new_owner
+                    for item in view_store._views[new_message_id].values()
+                )
+            )
+        finally:
+            if test_holds_lock:
+                state.control_panel_lock.release()
+            if handler_task is not None and not handler_task.done():
+                handler_task.cancel()
+                await asyncio.gather(handler_task, return_exceptions=True)
+            bot.discord.ui.View.stop(old_owner)
+            if "new_owner" in locals():
+                bot.discord.ui.View.stop(new_owner)
+            bot.music_states.pop(guild_id, None)
+
+    async def test_deleted_persistent_callbacks_cannot_recreate_the_panel(
+        self,
+    ) -> None:
+        for offset, action in enumerate(("repeat", "stop")):
+            with self.subTest(action=action):
+                guild_id = 9795 + offset
+                message_id = 9895 + offset
+                state = bot.get_state(guild_id)
+                state.current = make_track(f"deleted-{action}")
+                state.queue.append(make_track("queued"))
+                voice = MagicMock()
+                voice.is_playing.return_value = True
+                voice.is_paused.return_value = False
+                state.voice = voice
+                channel = MagicMock(id=10_100 + offset)
+                channel.send = AsyncMock()
+                message = MagicMock(id=message_id, channel=channel)
+                message.id = message_id
+                message.channel = channel
+                message.edit = AsyncMock()
+                state.control_message = message
+                state.announcement_channel = channel
+                owner = bot.MusicControlView(guild_id)
+                state.control_view = owner
+                view_store = ViewStore(bot.bot._connection)
+                view_store.add_view(owner, message_id)
+
+                clicked_started = asyncio.Event()
+                release_clicked = asyncio.Event()
+                response = MagicMock(status=500, reason="Internal Server Error")
+                clicked_error = bot.discord.DiscordServerError(
+                    response,
+                    f"{action} clicked edit failed",
+                )
+
+                async def fail_clicked_edit(**_kwargs: object) -> None:
+                    clicked_started.set()
+                    await release_clicked.wait()
+                    raise clicked_error
+
+                interaction = MagicMock(message=message)
+                acknowledged = False
+
+                async def defer_response() -> None:
+                    nonlocal acknowledged
+                    acknowledged = True
+
+                interaction.response.defer = AsyncMock(side_effect=defer_response)
+                interaction.response.is_done.side_effect = lambda: acknowledged
+                interaction.edit_original_response = AsyncMock(
+                    side_effect=fail_clicked_edit,
+                )
+                callback_task = None
+                raw_task = None
+                try:
+                    with (
+                        patch.object(bot, "get_music_channel_id", return_value=None),
+                        patch.object(bot, "get_control_message_id", return_value=None),
+                        patch.object(bot, "set_control_message_id") as set_id,
+                        patch.object(bot, "clear_control_message_id") as clear_id,
+                        patch.object(
+                            bot,
+                            "reconcile_control_panel_messages",
+                            new=AsyncMock(return_value=None),
+                        ),
+                    ):
+                        callback_task = asyncio.create_task(
+                            getattr(owner, action).callback(interaction)
+                        )
+                        await asyncio.wait_for(clicked_started.wait(), timeout=1)
+                        self.assertTrue(state.control_panel_lock.locked())
+
+                        raw_task = asyncio.create_task(
+                            bot.on_raw_message_delete(
+                                SimpleNamespace(
+                                    guild_id=guild_id,
+                                    message_id=message_id,
+                                )
+                            )
+                        )
+                        await asyncio.sleep(0)
+                        self.assertFalse(raw_task.done())
+                        release_clicked.set()
+
+                        with self.assertRaises(
+                            bot.discord.DiscordServerError
+                        ) as raised:
+                            await asyncio.wait_for(callback_task, timeout=1)
+                        self.assertIs(raised.exception, clicked_error)
+                        await asyncio.wait_for(raw_task, timeout=1)
+
+                    clear_id.assert_called_once_with(guild_id)
+                    set_id.assert_not_called()
+                    self.assertIsNone(state.control_message)
+                    self.assertIsNone(state.control_view)
+                    self.assertTrue(owner.is_finished())
+                    self.assertNotIn(message_id, view_store._views)
+                    interaction.response.defer.assert_awaited_once_with()
+                    interaction.edit_original_response.assert_awaited_once()
+                    message.edit.assert_not_awaited()
+                    channel.send.assert_not_awaited()
+                finally:
+                    release_clicked.set()
+                    for task in (callback_task, raw_task):
+                        if task is not None and not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        *(
+                            task
+                            for task in (callback_task, raw_task)
+                            if task is not None
+                        ),
+                        return_exceptions=True,
+                    )
+                    bot.discord.ui.View.stop(owner)
+                    bot.cancel_autoplay_refill(state)
+                    bot.cancel_empty_channel_disconnect(state)
+                    bot.music_states.pop(guild_id, None)
+
+    async def test_delete_control_panel_cleans_terminal_results_and_retries_cancel(
+        self,
+    ) -> None:
+        cases = (
+            ("success", None),
+            (
+                "not-found",
+                bot.discord.NotFound(
+                    MagicMock(status=404, reason="Not Found"),
+                    "missing panel",
+                ),
+            ),
+            (
+                "http-error",
+                bot.discord.DiscordServerError(
+                    MagicMock(status=500, reason="Internal Server Error"),
+                    "delete failed",
+                ),
+            ),
+        )
+
+        for offset, (label, error) in enumerate(cases):
+            with self.subTest(label=label):
+                guild_id = 9800 + offset
+                message_id = 9900 + offset
+                channel = MagicMock(id=10_000 + offset)
+                message = MagicMock(id=message_id, channel=channel)
+                message.id = message_id
+                message.channel = channel
+                message.delete = AsyncMock(side_effect=error)
+                state = bot.GuildMusicState(control_message=message)
+                view = bot.MusicControlView(guild_id)
+                state.control_view = view
+                view_store = ViewStore(bot.bot._connection)
+                view_store.add_view(view, message_id)
+
+                try:
+                    with (
+                        patch.object(bot, "clear_control_message_id") as clear_id,
+                        patch.object(bot.logger, "exception"),
+                    ):
+                        await bot.delete_control_panel(
+                            guild_id,
+                            state,
+                            channel=channel,
+                        )
+
+                    message.delete.assert_awaited_once_with()
+                    clear_id.assert_called_once_with(guild_id)
+                    self.assertIsNone(state.control_message)
+                    self.assertIsNone(state.control_view)
+                    self.assertTrue(view.is_finished())
+                    self.assertFalse(state.control_panel_lock.locked())
+                    self.assertNotIn(message_id, view_store._views)
+                    self.assertNotIn(message_id, view_store._synced_message_views)
+                finally:
+                    bot.discord.ui.View.stop(view)
+
+        guild_id = 9803
+        message_id = 9903
+        channel = MagicMock(id=10_003)
+        message = MagicMock(id=message_id, channel=channel)
+        message.id = message_id
+        message.channel = channel
+        cancelled_error = asyncio.CancelledError("delete cancelled")
+        message.delete = AsyncMock(side_effect=(cancelled_error, None))
+        state = bot.GuildMusicState(control_message=message)
+        view = bot.MusicControlView(guild_id)
+        state.control_view = view
+        view_store = ViewStore(bot.bot._connection)
+        view_store.add_view(view, message_id)
+
+        try:
+            with patch.object(bot, "clear_control_message_id") as clear_id:
+                with self.assertRaises(asyncio.CancelledError) as raised:
+                    await bot.delete_control_panel(
+                        guild_id,
+                        state,
+                        channel=channel,
+                    )
+                self.assertIs(raised.exception, cancelled_error)
+                self.assertIs(state.control_message, message)
+                self.assertIs(state.control_view, view)
+                self.assertFalse(view.is_finished())
+                self.assertFalse(state.control_panel_lock.locked())
+                clear_id.assert_not_called()
+                self.assertEqual(len(view_store._views[message_id]), 8)
+                self.assertTrue(
+                    all(
+                        item.view is view
+                        for item in view_store._views[message_id].values()
+                    )
+                )
+
+                await bot.delete_control_panel(
+                    guild_id,
+                    state,
+                    channel=channel,
+                )
+
+                self.assertEqual(message.delete.await_count, 2)
+                clear_id.assert_called_once_with(guild_id)
+                self.assertIsNone(state.control_message)
+                self.assertIsNone(state.control_view)
+                self.assertTrue(view.is_finished())
+                self.assertFalse(state.control_panel_lock.locked())
+                self.assertNotIn(message_id, view_store._views)
+                self.assertNotIn(message_id, view_store._synced_message_views)
+        finally:
+            bot.discord.ui.View.stop(view)
 
     async def test_nowplaying_views_are_finite_bound_and_expire_from_view_store(
         self,
@@ -4584,7 +5344,6 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                         asyncio.gather(*tasks, return_exceptions=True),
                         timeout=1,
                     )
-                bot.music_states.pop(guild_id, None)
 
         interaction.response.edit_message.assert_not_awaited()
         interaction.edit_original_response.assert_awaited_once()
@@ -4797,7 +5556,13 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             interaction.response.is_done.return_value = False
             interaction.response.defer = AsyncMock()
             interaction.edit_original_response = AsyncMock()
-            return state, channel, canonical, interaction, bot.MusicControlView(guild_id)
+            view = bot.MusicControlView(
+                guild_id,
+                timeout=None if same_id else 180,
+            )
+            if same_id:
+                state.control_view = view
+            return state, channel, canonical, interaction, view
 
         async def run_failure_case(guild_id: int, *, cancel: bool) -> None:
             state, channel, canonical, interaction, view = make_case(
@@ -4873,6 +5638,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 if task is not None:
                     await asyncio.gather(task, return_exceptions=True)
                 bot.cancel_empty_channel_disconnect(state)
+                if state.control_view is not None:
+                    bot.discord.ui.View.stop(state.control_view)
                 bot.music_states.pop(guild_id, None)
 
         state, channel, canonical, interaction, view = make_case(
@@ -4910,6 +5677,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             if edit_task is not None:
                 await asyncio.gather(edit_task, return_exceptions=True)
             bot.cancel_empty_channel_disconnect(state)
+            if state.control_view is not None:
+                bot.discord.ui.View.stop(state.control_view)
             bot.music_states.pop(339, None)
 
         state, channel, canonical, interaction, view = make_case(
@@ -4924,6 +5693,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             channel.send.assert_not_awaited()
         finally:
             bot.cancel_empty_channel_disconnect(state)
+            if state.control_view is not None:
+                bot.discord.ui.View.stop(state.control_view)
             bot.music_states.pop(340, None)
 
         await run_failure_case(341, cancel=False)
@@ -4998,7 +5769,12 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                             "clicked"
                         )
                     )
-                    view = bot.MusicControlView(guild_id)
+                    view = bot.MusicControlView(
+                        guild_id,
+                        timeout=None if clicked_is_canonical else 180,
+                    )
+                    if clicked_is_canonical:
+                        state.control_view = view
                     button = next(
                         item
                         for item in view.children
@@ -5047,6 +5823,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                     continue
                 bot.cancel_autoplay_refill(state)
                 bot.cancel_empty_channel_disconnect(state)
+                if state.control_view is not None:
+                    bot.discord.ui.View.stop(state.control_view)
                 bot.music_states.pop(guild_id, None)
 
     async def test_stop_button_converges_canonical_panel_when_ack_fails(
@@ -5125,6 +5903,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
 
             interaction.response.defer = AsyncMock(side_effect=defer_response)
             view = bot.MusicControlView(guild_id)
+            state.control_view = view
             button = next(
                 item
                 for item in view.children
@@ -5192,6 +5971,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                     )
                 bot.cancel_autoplay_refill(state)
                 bot.cancel_empty_channel_disconnect(state)
+                if state.control_view is not None:
+                    bot.discord.ui.View.stop(state.control_view)
                 bot.music_states.pop(guild_id, None)
 
         await run_case(327, cancel=False)
@@ -5768,6 +6549,9 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(bot.is_music_control_panel_message(panel, 77))
         self.assertFalse(bot.is_music_control_panel_message(panel, 88))
+        panel.interaction_metadata = Value()
+        self.assertFalse(bot.is_music_control_panel_message(panel, 77))
+        panel.interaction_metadata = None
         panel.embeds[0].title = "Added to queue"
         self.assertFalse(bot.is_music_control_panel_message(panel, 77))
 

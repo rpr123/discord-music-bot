@@ -165,6 +165,7 @@ class MusicModelTests(unittest.TestCase):
                 "voice",
                 "announcement_channel",
                 "control_message",
+                "control_view",
                 "repeat_one",
                 "autoplay_enabled",
                 "recent_track_keys",

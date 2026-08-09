@@ -2241,7 +2241,7 @@ class MusicControlView(discord.ui.View):
         interaction: discord.Interaction,
         *,
         refresh_canonical: bool = False,
-    ) -> None:
+    ) -> bool:
         state = self.get_state()
         clicked_message_id = getattr(interaction.message, "id", None)
         clicked_panel_updated = False
@@ -2249,8 +2249,8 @@ class MusicControlView(discord.ui.View):
             if not interaction.response.is_done():
                 await interaction.response.defer()
             async with state.control_panel_lock:
-                if self.timeout is not None and self.is_finished():
-                    return
+                if self.is_finished():
+                    return False
                 if state.current is None:
                     embed = make_idle_player_embed()
                     if self.timeout is None:
@@ -2266,6 +2266,17 @@ class MusicControlView(discord.ui.View):
                         self._sync_buttons(state, disabled=False)
                         view = self
                 await interaction.edit_original_response(embed=embed, view=view)
+                control_message_id = getattr(state.control_message, "id", None)
+                clicked_is_current = (
+                    clicked_message_id is not None
+                    and clicked_message_id == control_message_id
+                )
+                if self.timeout is None and clicked_is_current:
+                    replace_control_panel_view(
+                        state,
+                        view,
+                        message_id=clicked_message_id,
+                    )
             clicked_panel_updated = True
         finally:
             if refresh_canonical:
@@ -2275,7 +2286,12 @@ class MusicControlView(discord.ui.View):
                     and clicked_message_id == control_message_id
                 )
                 if not clicked_panel_updated or not clicked_is_current:
-                    await update_control_panel(self.guild_id, state)
+                    await update_control_panel(
+                        self.guild_id,
+                        state,
+                        require_control_view=self.timeout is None,
+                    )
+        return clicked_panel_updated
 
     async def on_timeout(self) -> None:
         if bot_shutdown_started:
@@ -2403,8 +2419,7 @@ class MusicControlView(discord.ui.View):
         clicked_message_id = getattr(interaction.message, "id", None)
         clicked_panel_updated = False
         try:
-            await self.edit_panel(interaction)
-            clicked_panel_updated = True
+            clicked_panel_updated = await self.edit_panel(interaction)
         finally:
             control_message_id = getattr(state.control_message, "id", None)
             clicked_is_current = (
@@ -2412,7 +2427,11 @@ class MusicControlView(discord.ui.View):
                 and clicked_message_id == control_message_id
             )
             if not clicked_panel_updated or not clicked_is_current:
-                await show_idle_panel(self.guild_id, state)
+                await show_idle_panel(
+                    self.guild_id,
+                    state,
+                    require_control_view=self.timeout is None,
+                )
 
     @discord.ui.button(
         label="반복",
@@ -4868,6 +4887,9 @@ def is_music_control_panel_message(
     message: discord.Message,
     bot_user_id: int | None = None,
 ) -> bool:
+    if getattr(message, "interaction_metadata", None) is not None:
+        return False
+
     if bot_user_id is None:
         bot_user_id = getattr(bot.user, "id", None)
     if bot_user_id is None or getattr(message.author, "id", None) != bot_user_id:
@@ -4962,13 +4984,62 @@ async def delete_music_channel_message(
     return False
 
 
+def replace_control_panel_view(
+    state: GuildMusicState,
+    view: discord.ui.View | None,
+    *,
+    message_id: int | None = None,
+) -> None:
+    previous_view = state.control_view
+    state.control_view = view
+    if previous_view is None or previous_view is view:
+        return
+
+    # MusicControlView.stop is the stop button callback, not View.stop.
+    discord.ui.View.stop(previous_view)
+    if view is not None and message_id is not None:
+        # Discord stores the new items before this helper runs. Stopping the
+        # previous same-ID view removes those keys, so restore the new owner.
+        bot.add_view(view, message_id=message_id)
+
+
+async def release_deleted_control_panel(
+    guild_id: int | None,
+    message_ids: set[int],
+) -> None:
+    if guild_id is None:
+        return
+
+    state = music_states.get(guild_id)
+    if state is None:
+        if get_control_message_id(guild_id) in message_ids:
+            clear_control_message_id(guild_id)
+        return
+
+    async with state.control_panel_lock:
+        control_message_id = getattr(state.control_message, "id", None)
+        if control_message_id is None:
+            control_message_id = get_control_message_id(guild_id)
+        if control_message_id not in message_ids:
+            return
+
+        replace_control_panel_view(state, None)
+        state.control_message = None
+        clear_control_message_id(guild_id)
+
+
 async def update_control_panel(
     guild_id: int,
     state: GuildMusicState,
     *,
     channel: discord.abc.Messageable | None = None,
+    require_control_view: bool = False,
 ) -> discord.Message | None:
     async with state.control_panel_lock:
+        if require_control_view:
+            control_view = state.control_view
+            if control_view is None or control_view.is_finished():
+                return None
         return await _update_control_panel(
             guild_id,
             state,
@@ -4982,6 +5053,9 @@ async def _update_control_panel(
     *,
     channel: discord.abc.Messageable | None = None,
 ) -> discord.Message | None:
+    if state.control_message is None:
+        replace_control_panel_view(state, None)
+
     control_channel = channel or resolve_control_panel_channel(guild_id, state)
     if control_channel is None:
         return None
@@ -4999,6 +5073,7 @@ async def _update_control_panel(
             and message_channel_id is not None
             and message_channel_id != control_channel_id
         ):
+            replace_control_panel_view(state, None)
             state.control_message = None
 
     recovering_panel = state.control_message is None
@@ -5040,12 +5115,19 @@ async def _update_control_panel(
         view = MusicControlView(guild_id)
 
     if state.control_message is not None:
+        control_message = state.control_message
         try:
-            await state.control_message.edit(content=None, embed=embed, view=view)
-            if searched_history and saved_message_id != state.control_message.id:
-                set_control_message_id(guild_id, state.control_message.id)
-            return state.control_message
+            await control_message.edit(content=None, embed=embed, view=view)
+            replace_control_panel_view(
+                state,
+                view,
+                message_id=control_message.id,
+            )
+            if searched_history and saved_message_id != control_message.id:
+                set_control_message_id(guild_id, control_message.id)
+            return control_message
         except discord.NotFound:
+            replace_control_panel_view(state, None)
             state.control_message = None
             clear_control_message_id(guild_id)
         except discord.Forbidden:
@@ -5059,7 +5141,7 @@ async def _update_control_panel(
             return None
 
     try:
-        state.control_message = await control_channel.send(
+        control_message = await control_channel.send(
             embed=embed,
             view=view,
             silent=is_silent_music_channel(control_channel),
@@ -5071,12 +5153,27 @@ async def _update_control_panel(
         logger.exception("Failed to send music control panel in guild %s", guild_id)
         return None
 
-    set_control_message_id(guild_id, state.control_message.id)
-    return state.control_message
+    state.control_message = control_message
+    replace_control_panel_view(
+        state,
+        view,
+        message_id=control_message.id,
+    )
+    set_control_message_id(guild_id, control_message.id)
+    return control_message
 
 
-async def show_idle_panel(guild_id: int, state: GuildMusicState) -> None:
-    await update_control_panel(guild_id, state)
+async def show_idle_panel(
+    guild_id: int,
+    state: GuildMusicState,
+    *,
+    require_control_view: bool = False,
+) -> None:
+    await update_control_panel(
+        guild_id,
+        state,
+        require_control_view=require_control_view,
+    )
 
 
 async def delete_control_panel(
@@ -5112,8 +5209,12 @@ async def _delete_control_panel(
         except discord.NotFound:
             pass
         except discord.HTTPException:
-            logger.exception("Failed to delete music control panel in guild %s", guild_id)
+            logger.exception(
+                "Failed to delete music control panel in guild %s",
+                guild_id,
+            )
 
+    replace_control_panel_view(state, None)
     state.control_message = None
     clear_control_message_id(guild_id)
 
@@ -5334,6 +5435,24 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
 
 def guild_only_error() -> str:
     return "이 명령어는 디스코드 서버 안에서만 사용할 수 있어요."
+
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
+    await release_deleted_control_panel(
+        payload.guild_id,
+        {payload.message_id},
+    )
+
+
+@bot.event
+async def on_raw_bulk_message_delete(
+    payload: discord.RawBulkMessageDeleteEvent,
+) -> None:
+    await release_deleted_control_panel(
+        payload.guild_id,
+        payload.message_ids,
+    )
 
 
 @bot.event

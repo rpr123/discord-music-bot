@@ -62,6 +62,7 @@ class GuildMusicState:
     voice: discord.VoiceClient | None = None
     announcement_channel: discord.abc.Messageable | None = None
     control_message: discord.Message | None = None
+    control_view: discord.ui.View | None = None
     repeat_one: bool = False
     autoplay_enabled: bool = False
     recent_track_keys: Deque[str] = field(
