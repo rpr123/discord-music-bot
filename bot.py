@@ -1900,8 +1900,14 @@ def make_bulk_embed(tracks: list[Track], title: str) -> discord.Embed:
 
 
 class QueueRemoveSelect(discord.ui.Select):
-    def __init__(self, guild_id: int):
+    def __init__(
+        self,
+        guild_id: int,
+        *,
+        interaction_lock: asyncio.Lock | None = None,
+    ):
         self.guild_id = guild_id
+        self.interaction_lock = interaction_lock or asyncio.Lock()
         state = get_state(guild_id)
         options = [
             discord.SelectOption(
@@ -1922,49 +1928,77 @@ class QueueRemoveSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        selected_track_id = self.values[0]
+        await interaction.response.defer()
         state = get_state(self.guild_id)
-        removed = remove_queued_track_by_id(state, self.values[0])
-        if removed is None:
-            replacement_view = (
-                QueueManageView(self.guild_id) if state.queue else None
-            )
-            await interaction.response.edit_message(
-                content="이미 삭제되었거나 찾을 수 없는 곡이에요.",
-                embed=make_queue_embed(state),
-                view=replacement_view,
-            )
-            if replacement_view is not None:
+        refresh_panel = False
+        try:
+            async with self.interaction_lock:
+                removed = remove_queued_track_by_id(state, selected_track_id)
+                if removed is None:
+                    replacement_view = (
+                        QueueManageView(
+                            self.guild_id,
+                            interaction_lock=self.interaction_lock,
+                        )
+                        if state.queue
+                        else None
+                    )
+                    await interaction.edit_original_response(
+                        content="이미 삭제되었거나 찾을 수 없는 곡이에요.",
+                        embed=make_queue_embed(state),
+                        view=replacement_view,
+                    )
+                    if replacement_view is not None:
+                        schedule_queue_message_cleanup(
+                            state,
+                            interaction.message,
+                            EPHEMERAL_RESPONSE_DELETE_SECONDS,
+                        )
+                    return
+
+                schedule_autoplay_refill(self.guild_id)
+                refresh_panel = state.current is not None
+                replacement_view = (
+                    QueueManageView(
+                        self.guild_id,
+                        interaction_lock=self.interaction_lock,
+                    )
+                    if state.queue
+                    else None
+                )
+                await interaction.edit_original_response(
+                    content=f"대기열에서 `{removed.title}`을 삭제했어요.",
+                    embed=make_queue_embed(state),
+                    view=replacement_view,
+                )
                 schedule_queue_message_cleanup(
                     state,
                     interaction.message,
-                    EPHEMERAL_RESPONSE_DELETE_SECONDS,
+                    QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
                 )
-            return
-
-        schedule_autoplay_refill(self.guild_id)
-        refresh_panel = state.current is not None
-        try:
-            await interaction.response.edit_message(
-                content=f"대기열에서 `{removed.title}`을 삭제했어요.",
-                embed=make_queue_embed(state),
-                view=QueueManageView(self.guild_id) if state.queue else None,
-            )
-            schedule_queue_message_cleanup(
-                state,
-                interaction.message,
-                QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
-            )
         finally:
             if refresh_panel:
                 await update_control_panel(self.guild_id, state)
 
 
 class QueueManageView(discord.ui.View):
-    def __init__(self, guild_id: int):
+    def __init__(
+        self,
+        guild_id: int,
+        *,
+        interaction_lock: asyncio.Lock | None = None,
+    ):
         super().__init__(timeout=180)
         self.guild_id = guild_id
+        self.interaction_lock = interaction_lock or asyncio.Lock()
         if get_state(guild_id).queue:
-            self.add_item(QueueRemoveSelect(guild_id))
+            self.add_item(
+                QueueRemoveSelect(
+                    guild_id,
+                    interaction_lock=self.interaction_lock,
+                )
+            )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await ensure_same_voice_channel(interaction, get_state(self.guild_id))

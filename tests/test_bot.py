@@ -7690,7 +7690,8 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         select = bot.QueueRemoveSelect(guild_id)
         select._values = [first.track_id]
         interaction = MagicMock()
-        interaction.response.edit_message = AsyncMock()
+        interaction.response.defer = AsyncMock()
+        interaction.edit_original_response = AsyncMock()
         interaction.message = MagicMock(id=991)
 
         with (
@@ -7703,7 +7704,8 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             await select.callback(interaction)
 
         self.assertEqual(list(state.queue), [second])
-        interaction.response.edit_message.assert_awaited_once()
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.edit_original_response.assert_awaited_once()
         schedule_cleanup.assert_called_once_with(
             state,
             interaction.message,
@@ -7725,8 +7727,11 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         )
         success_interaction = MagicMock(message=MagicMock(id=992))
         operation_order: list[str] = []
-        success_interaction.response.edit_message = AsyncMock(
-            side_effect=lambda **_kwargs: operation_order.append("response")
+        success_interaction.response.defer = AsyncMock(
+            side_effect=lambda: operation_order.append("defer")
+        )
+        success_interaction.edit_original_response = AsyncMock(
+            side_effect=lambda **_kwargs: operation_order.append("edit")
         )
         with patch.object(
             bot,
@@ -7735,9 +7740,10 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         ) as schedule_cleanup:
             await success_select.callback(success_interaction)
 
-        self.assertEqual(operation_order, ["response", "cleanup"])
+        self.assertEqual(operation_order, ["defer", "edit", "cleanup"])
         self.assertEqual(list(success_state.queue), [latest])
-        response_kwargs = success_interaction.response.edit_message.await_args.kwargs
+        success_interaction.response.defer.assert_awaited_once_with()
+        response_kwargs = success_interaction.edit_original_response.await_args.kwargs
         self.assertEqual(
             response_kwargs["content"],
             "이미 삭제되었거나 찾을 수 없는 곡이에요.",
@@ -7756,6 +7762,10 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [option.value for option in replacement_select.options],
             [latest.track_id],
+        )
+        self.assertIs(
+            replacement_select.interaction_lock,
+            success_select.interaction_lock,
         )
         schedule_cleanup.assert_called_once_with(
             success_state,
@@ -7778,7 +7788,8 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             response,
             "<html>temporary failure</html>",
         )
-        failure_interaction.response.edit_message = AsyncMock(
+        failure_interaction.response.defer = AsyncMock()
+        failure_interaction.edit_original_response = AsyncMock(
             side_effect=response_error
         )
         with patch.object(
@@ -7790,7 +7801,8 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(raised.exception, response_error)
         self.assertEqual(list(failure_state.queue), [latest])
-        failure_interaction.response.edit_message.assert_awaited_once()
+        failure_interaction.response.defer.assert_awaited_once_with()
+        failure_interaction.edit_original_response.assert_awaited_once()
         schedule_cleanup.assert_not_called()
 
         empty_state = bot.get_state(995)
@@ -7799,7 +7811,8 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         empty_select._values = [stale.track_id]
         empty_state.queue.clear()
         empty_interaction = MagicMock(message=MagicMock(id=996))
-        empty_interaction.response.edit_message = AsyncMock()
+        empty_interaction.response.defer = AsyncMock()
+        empty_interaction.edit_original_response = AsyncMock()
         with patch.object(
             bot,
             "schedule_queue_message_cleanup",
@@ -7807,7 +7820,8 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             await empty_select.callback(empty_interaction)
 
         self.assertEqual(list(empty_state.queue), [])
-        empty_kwargs = empty_interaction.response.edit_message.await_args.kwargs
+        empty_interaction.response.defer.assert_awaited_once_with()
+        empty_kwargs = empty_interaction.edit_original_response.await_args.kwargs
         self.assertEqual(
             empty_kwargs["content"],
             "이미 삭제되었거나 찾을 수 없는 곡이에요.",
@@ -7829,11 +7843,14 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         state.queue.extend([third, first, second])
         select = bot.QueueRemoveSelect(guild_id)
         select._values = [second.track_id]
+        operation_order: list[str] = []
         interaction = MagicMock()
-        interaction.response.edit_message = AsyncMock()
+        interaction.response.defer = AsyncMock(
+            side_effect=lambda: operation_order.append("defer")
+        )
+        interaction.edit_original_response = AsyncMock()
         interaction.message = MagicMock()
         interaction.message.id = 991
-        operation_order: list[str] = []
         response = MagicMock(status=500, reason="Internal Server Error")
         response_error = bot.discord.DiscordServerError(
             response,
@@ -7844,7 +7861,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             operation_order.append("response")
             raise response_error
 
-        interaction.response.edit_message.side_effect = edit_response
+        interaction.edit_original_response.side_effect = edit_response
 
         with (
             patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
@@ -7864,11 +7881,12 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
                 await select.callback(interaction)
 
         self.assertIs(raised.exception, response_error)
-        self.assertEqual(operation_order, ["response", "panel"])
+        self.assertEqual(operation_order, ["defer", "response", "panel"])
         self.assertEqual(list(state.queue), [third, first])
         schedule_refill.assert_called_once_with(guild_id)
-        interaction.response.edit_message.assert_awaited_once()
-        response_kwargs = interaction.response.edit_message.await_args.kwargs
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.edit_original_response.assert_awaited_once()
+        response_kwargs = interaction.edit_original_response.await_args.kwargs
         self.assertIn(second.title, response_kwargs["content"])
         self.assertEqual(
             response_kwargs["embed"].to_dict(),
@@ -7877,6 +7895,207 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(response_kwargs["view"], bot.QueueManageView)
         schedule_cleanup.assert_not_called()
         update_control_panel.assert_awaited_once_with(guild_id, state)
+
+    async def test_single_delete_defer_failure_keeps_queue_unchanged(self) -> None:
+        guild_id = 997
+        tracks = [make_track("first"), make_track("second")]
+        state = bot.get_state(guild_id)
+        state.current = make_track("current")
+        state.queue.extend(tracks)
+        original_queue = state.queue
+        select = bot.QueueRemoveSelect(guild_id)
+        select._values = [tracks[0].track_id]
+        interaction = MagicMock(message=MagicMock(id=998))
+        response = MagicMock(status=500, reason="Internal Server Error")
+        response_error = bot.discord.DiscordServerError(
+            response,
+            "<html>defer failure</html>",
+        )
+        interaction.response.defer = AsyncMock(side_effect=response_error)
+        interaction.edit_original_response = AsyncMock()
+
+        with (
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+            patch.object(bot, "schedule_queue_message_cleanup") as schedule_cleanup,
+            patch.object(bot, "update_control_panel", new=AsyncMock()) as update_panel,
+        ):
+            with self.assertRaises(bot.discord.DiscordServerError) as raised:
+                await select.callback(interaction)
+
+        self.assertIs(raised.exception, response_error)
+        self.assertIs(state.queue, original_queue)
+        self.assertEqual(list(state.queue), tracks)
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.edit_original_response.assert_not_awaited()
+        schedule_refill.assert_not_called()
+        schedule_cleanup.assert_not_called()
+        update_panel.assert_not_awaited()
+
+    async def test_single_delete_replacement_views_share_serialization_lock(
+        self,
+    ) -> None:
+        guild_id = 999
+        tracks = [make_track(title) for title in ("A", "B", "C", "D")]
+        state = bot.get_state(guild_id)
+        state.current = make_track("current")
+        state.queue.extend(tracks)
+        old_select = bot.QueueRemoveSelect(guild_id)
+        old_select._values = [tracks[0].track_id]
+        shared_message = MagicMock(id=1000)
+        deferred = {name: asyncio.Event() for name in ("A", "B", "C")}
+        edit_started = {name: asyncio.Event() for name in ("A", "B", "C")}
+        release_edit = {name: asyncio.Event() for name in ("A", "B", "C")}
+        defer_order: list[str] = []
+        edit_order: list[str] = []
+        edit_lock_states: list[bool] = []
+        cleanup_lock_states: list[bool] = []
+        panel_lock_states: list[bool] = []
+        snapshots: dict[str, tuple[list[bot.Track], dict[str, object]]] = {}
+
+        def make_interaction(name: str) -> MagicMock:
+            interaction = MagicMock(message=shared_message)
+
+            async def defer_response() -> None:
+                defer_order.append(name)
+                deferred[name].set()
+                if name == "B":
+                    old_select._values = [tracks[3].track_id]
+
+            async def edit_response(**kwargs: object) -> None:
+                edit_order.append(name)
+                edit_lock_states.append(old_select.interaction_lock.locked())
+                response_view = kwargs["view"]
+                self.assertIsInstance(response_view, bot.QueueManageView)
+                response_select = next(
+                    item
+                    for item in response_view.children
+                    if isinstance(item, bot.QueueRemoveSelect)
+                )
+                self.assertEqual(
+                    [option.value for option in response_select.options],
+                    [track.track_id for track in state.queue],
+                )
+                self.assertEqual(
+                    kwargs["embed"].to_dict(),
+                    bot.make_queue_embed(state).to_dict(),
+                )
+                self.assertIn(f"`{name}`", kwargs["content"])
+                snapshots[name] = (list(state.queue), kwargs)
+                edit_started[name].set()
+                await release_edit[name].wait()
+
+            interaction.response.defer = AsyncMock(side_effect=defer_response)
+            interaction.edit_original_response = AsyncMock(side_effect=edit_response)
+            return interaction
+
+        async def record_panel(*_args: object, **_kwargs: object) -> None:
+            panel_lock_states.append(old_select.interaction_lock.locked())
+
+        def record_cleanup(*_args: object) -> None:
+            cleanup_lock_states.append(old_select.interaction_lock.locked())
+
+        interactions = {name: make_interaction(name) for name in ("A", "B", "C")}
+        tasks: list[asyncio.Task[None]] = []
+        with (
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+            patch.object(
+                bot,
+                "schedule_queue_message_cleanup",
+                side_effect=record_cleanup,
+            ) as schedule_cleanup,
+            patch.object(
+                bot,
+                "update_control_panel",
+                new=AsyncMock(side_effect=record_panel),
+            ) as update_panel,
+        ):
+            try:
+                task_a = asyncio.create_task(old_select.callback(interactions["A"]))
+                tasks.append(task_a)
+                await asyncio.wait_for(edit_started["A"].wait(), timeout=1)
+
+                old_select._values = [tracks[1].track_id]
+                task_b = asyncio.create_task(old_select.callback(interactions["B"]))
+                tasks.append(task_b)
+                await asyncio.wait_for(deferred["B"].wait(), timeout=1)
+                await asyncio.sleep(0)
+                self.assertFalse(edit_started["B"].is_set())
+                self.assertFalse(task_b.done())
+
+                release_edit["A"].set()
+                await asyncio.wait_for(edit_started["B"].wait(), timeout=1)
+                replacement_view = snapshots["A"][1]["view"]
+                self.assertIsInstance(replacement_view, bot.QueueManageView)
+                replacement_select = next(
+                    item
+                    for item in replacement_view.children
+                    if isinstance(item, bot.QueueRemoveSelect)
+                )
+                self.assertIs(
+                    replacement_select.interaction_lock,
+                    old_select.interaction_lock,
+                )
+
+                replacement_select._values = [tracks[2].track_id]
+                task_c = asyncio.create_task(
+                    replacement_select.callback(interactions["C"])
+                )
+                tasks.append(task_c)
+                await asyncio.wait_for(deferred["C"].wait(), timeout=1)
+                await asyncio.sleep(0)
+                self.assertFalse(edit_started["C"].is_set())
+                self.assertFalse(task_c.done())
+
+                release_edit["B"].set()
+                await asyncio.wait_for(edit_started["C"].wait(), timeout=1)
+                release_edit["C"].set()
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+            finally:
+                for release in release_edit.values():
+                    release.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                if tasks:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=1,
+                    )
+
+        self.assertEqual(defer_order, ["A", "B", "C"])
+        self.assertEqual(edit_order, ["A", "B", "C"])
+        self.assertEqual(edit_lock_states, [True, True, True])
+        self.assertEqual(cleanup_lock_states, [True, True, True])
+        self.assertEqual(panel_lock_states, [False, False, False])
+        self.assertEqual(
+            [snapshot for snapshot, _kwargs in snapshots.values()],
+            [tracks[1:], tracks[2:], tracks[3:]],
+        )
+        self.assertEqual(list(state.queue), tracks[3:])
+        final_view = snapshots["C"][1]["view"]
+        self.assertIsInstance(final_view, bot.QueueManageView)
+        final_select = next(
+            item
+            for item in final_view.children
+            if isinstance(item, bot.QueueRemoveSelect)
+        )
+        self.assertEqual(
+            [option.value for option in final_select.options],
+            [tracks[3].track_id],
+        )
+        for interaction in interactions.values():
+            interaction.response.defer.assert_awaited_once_with()
+            interaction.edit_original_response.assert_awaited_once()
+        self.assertEqual(schedule_refill.call_count, 3)
+        self.assertEqual(schedule_cleanup.call_count, 3)
+        for cleanup_call in schedule_cleanup.call_args_list:
+            self.assertEqual(
+                cleanup_call.args,
+                (state, shared_message, bot.QUEUE_DELETE_RESPONSE_DELETE_SECONDS),
+            )
+        self.assertEqual(update_panel.await_count, 3)
+        for panel_call in update_panel.await_args_list:
+            self.assertEqual(panel_call.args, (guild_id, state))
 
 
 class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
