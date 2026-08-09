@@ -4,16 +4,12 @@ import asyncio
 import concurrent.futures
 import copy
 import functools
-import json
 import random
 import re
 import shutil
 import threading
 import time
 import unicodedata
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Callable, Coroutine, TypeVar
@@ -95,6 +91,7 @@ from music_lyrics_sources import (
     QUOTED_TRACK_TITLE_RE,
     VTT_TAG_RE,
     VTT_TIMESTAMP_LINE_RE,
+    LyricsLookupError,
     YouTubeSubtitleError,
     extract_json3_lyrics,
     extract_original_lyrics,
@@ -105,8 +102,11 @@ from music_lyrics_sources import (
     get_subtitle_candidates,
     lyrics_native_script_ratio,
     lyrics_record_score,
+    lookup_track_lyrics,
     normalize_lyrics_match_text,
     normalize_subtitle_text,
+    request_lyrics_records,
+    request_youtube_subtitle,
     select_korean_manual_subtitle,
     select_lyrics_record,
     select_manual_subtitle,
@@ -2088,10 +2088,6 @@ async def extract_first_info(
     raise ValueError(f"No playable search results were found for '{query}'.")
 
 
-class LyricsLookupError(RuntimeError):
-    pass
-
-
 class KoreanLyricsError(RuntimeError):
     pass
 
@@ -2102,82 +2098,6 @@ class LyricsReadingError(RuntimeError):
 
 SUDACHI_TOKENIZER = None
 SUDACHI_TOKENIZER_LOCK = threading.Lock()
-def request_lyrics_records(track_name: str, artist_name: str | None) -> list[dict]:
-    params = {"track_name": track_name}
-    if artist_name:
-        params["artist_name"] = artist_name
-    separator = "&" if "?" in LYRICS_API_URL else "?"
-    url = f"{LYRICS_API_URL}{separator}{urllib.parse.urlencode(params)}"
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": (
-                "discord-music-bot/1.0 "
-                "(https://github.com/rpr123/discord-music-bot)"
-            ),
-        },
-    )
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=LYRICS_REQUEST_TIMEOUT_SECONDS,
-        ) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
-        raise LyricsLookupError(str(error)) from error
-
-    if not isinstance(payload, list):
-        raise LyricsLookupError("Lyrics API returned an invalid response.")
-    return [record for record in payload if isinstance(record, dict)]
-
-
-def lookup_track_lyrics(track: Track) -> str | None:
-    track_name, artist_name = get_lyrics_search_terms(track)
-    if not track_name:
-        return None
-    records = request_lyrics_records(track_name, artist_name)
-    record = select_lyrics_record(
-        records,
-        track_name,
-        artist_name,
-        track.duration,
-    )
-    if record is None and artist_name:
-        records = request_lyrics_records(track_name, None)
-        record = select_lyrics_record(
-            records,
-            track_name,
-            artist_name,
-            track.duration,
-        )
-        if record is not None:
-            logger.info(
-                "LRCLIB title-only retry matched lyrics for %s",
-                track.title,
-            )
-    return extract_original_lyrics(record) if record else None
-
-
-def request_youtube_subtitle(url: str, extension: str) -> str | None:
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 discord-music-bot/1.0"},
-    )
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=LYRICS_REQUEST_TIMEOUT_SECONDS,
-        ) as response:
-            payload = response.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        raise YouTubeSubtitleError(str(error)) from error
-
-    if extension == "json3":
-        return extract_json3_lyrics(payload)
-    if extension == "vtt":
-        return extract_vtt_lyrics(payload)
-    return None
 
 
 async def run_lyrics_job(function: Callable[..., T], *args: object) -> T:

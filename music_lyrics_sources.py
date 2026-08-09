@@ -4,7 +4,15 @@ import html
 import json
 import re
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 
+from music_config import (
+    LYRICS_API_URL,
+    LYRICS_REQUEST_TIMEOUT_SECONDS,
+    logger,
+)
 from music_models import Track
 from music_search_scoring import (
     clean_track_title,
@@ -26,6 +34,10 @@ LRC_METADATA_RE = re.compile(
 QUOTED_TRACK_TITLE_RE = re.compile(
     r"^\s*(?P<artist>.+?)\s*[「『](?P<title>[^」』]+)[」』]"
 )
+
+
+class LyricsLookupError(RuntimeError):
+    pass
 
 
 def get_lyrics_search_terms(track: Track) -> tuple[str, str | None]:
@@ -209,6 +221,63 @@ def select_lyrics_record(
     return max(scored_records, key=lambda candidate: candidate[1])[0]
 
 
+def request_lyrics_records(track_name: str, artist_name: str | None) -> list[dict]:
+    params = {"track_name": track_name}
+    if artist_name:
+        params["artist_name"] = artist_name
+    separator = "&" if "?" in LYRICS_API_URL else "?"
+    url = f"{LYRICS_API_URL}{separator}{urllib.parse.urlencode(params)}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": (
+                "discord-music-bot/1.0 "
+                "(https://github.com/rpr123/discord-music-bot)"
+            ),
+        },
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=LYRICS_REQUEST_TIMEOUT_SECONDS,
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+        raise LyricsLookupError(str(error)) from error
+
+    if not isinstance(payload, list):
+        raise LyricsLookupError("Lyrics API returned an invalid response.")
+    return [record for record in payload if isinstance(record, dict)]
+
+
+def lookup_track_lyrics(track: Track) -> str | None:
+    track_name, artist_name = get_lyrics_search_terms(track)
+    if not track_name:
+        return None
+    records = request_lyrics_records(track_name, artist_name)
+    record = select_lyrics_record(
+        records,
+        track_name,
+        artist_name,
+        track.duration,
+    )
+    if record is None and artist_name:
+        records = request_lyrics_records(track_name, None)
+        record = select_lyrics_record(
+            records,
+            track_name,
+            artist_name,
+            track.duration,
+        )
+        if record is not None:
+            logger.info(
+                "LRCLIB title-only retry matched lyrics for %s",
+                track.title,
+            )
+    return extract_original_lyrics(record) if record else None
+
+
 class YouTubeSubtitleError(RuntimeError):
     pass
 
@@ -269,6 +338,27 @@ def extract_vtt_lyrics(payload: str) -> str | None:
             lines.append(line)
     lyrics = "\n".join(lines).strip()
     return lyrics or None
+
+
+def request_youtube_subtitle(url: str, extension: str) -> str | None:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 discord-music-bot/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=LYRICS_REQUEST_TIMEOUT_SECONDS,
+        ) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise YouTubeSubtitleError(str(error)) from error
+
+    if extension == "json3":
+        return extract_json3_lyrics(payload)
+    if extension == "vtt":
+        return extract_vtt_lyrics(payload)
+    return None
 
 
 def get_subtitle_candidates(
