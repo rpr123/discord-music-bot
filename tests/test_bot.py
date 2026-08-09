@@ -1115,90 +1115,12 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
-    class FakeToken:
-        def __init__(self, surface: str, reading: str | None = None):
-            self._surface = surface
-            self._reading = reading if reading is not None else surface
-
-        def surface(self) -> str:
-            return self._surface
-
-        def reading_form(self) -> str:
-            return self._reading
-
-    class FakeTokenizer:
-        def tokenize(self, text: str):
-            return [LyricsVariantTests.FakeToken(text)] if text else []
-
     async def asyncTearDown(self) -> None:
         for state in bot.music_states.values():
             bot.schedule_private_lyrics_cleanup(state)
             bot.cancel_queue_message_cleanups(state)
         await asyncio.sleep(0)
         bot.music_states.clear()
-
-    def test_japanese_and_korean_lyrics_are_detected_locally(self) -> None:
-        track = make_track("Japanese song")
-
-        self.assertTrue(bot.lyrics_are_japanese(track, "君の声が聞こえる"))
-        self.assertFalse(bot.lyrics_are_japanese(track, "I can hear your voice"))
-        self.assertTrue(bot.lyrics_are_primarily_korean("너의 목소리가 들려"))
-        self.assertFalse(bot.lyrics_are_primarily_korean("君の声が聞こえる"))
-
-    def test_explicit_readings_accept_common_bracket_styles(self) -> None:
-        tokenizer = self.FakeTokenizer()
-        examples = {
-            "運命(さだめ)": "運命(さだめ)",
-            "運命（さだめ）": "運命(さだめ)",
-            "運命[さだめ]": "運命(さだめ)",
-            "運命【さだめ】": "運命(さだめ)",
-            "運命《サダメ》": "運命(さだめ)",
-            "｜超電磁砲《レールガン》": "超電磁砲(れーるがん)",
-        }
-
-        for source, expected in examples.items():
-            with self.subTest(source=source):
-                self.assertEqual(
-                    bot.replace_explicit_readings(source, tokenizer),
-                    expected,
-                )
-
-    def test_non_kana_parentheses_are_not_treated_as_a_reading(self) -> None:
-        source = "運命(Oh yeah)"
-
-        self.assertEqual(
-            bot.replace_explicit_readings(source, self.FakeTokenizer()),
-            source,
-        )
-        self.assertEqual(
-            bot.replace_explicit_readings("愛してる(ああ)", self.FakeTokenizer()),
-            "愛してる(ああ)",
-        )
-        self.assertEqual(bot.annotate_token_reading("(", "キゴウ"), "(")
-        self.assertEqual(bot.annotate_token_reading("Oh", "オー"), "Oh")
-
-    def test_dictionary_readings_are_added_after_kanji(self) -> None:
-        examples = {
-            ("運命", "ウンメイ"): "運命(うんめい)",
-            ("礼を持って", "レイヲモッテ"): "礼(れい)を持(も)って",
-            ("取り戻す", "トリモドス"): "取(と)り戻(もど)す",
-            ("かなだけ", "カナダケ"): "かなだけ",
-        }
-
-        for (surface, reading), expected in examples.items():
-            with self.subTest(surface=surface):
-                self.assertEqual(
-                    bot.annotate_token_reading(surface, reading),
-                    expected,
-                )
-
-    def test_explicit_reading_overrides_dictionary_reading(self) -> None:
-        tokenizer = self.FakeTokenizer()
-
-        with patch.object(bot, "get_sudachi_tokenizer", return_value=tokenizer):
-            reading = bot.generate_hiragana_lyrics("未来(あした)")
-
-        self.assertEqual(reading, "未来(あした)")
 
     def test_variant_view_only_shows_modes_available_for_the_track(self) -> None:
         japanese_track = make_track("Japanese")

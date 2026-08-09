@@ -35,10 +35,16 @@ from music_japanese_reading import (
     JAPANESE_HAN_RE,
     JAPANESE_KANA_RE,
     JAPANESE_READING_RE,
+    SUDACHI_TOKENIZER,
+    SUDACHI_TOKENIZER_LOCK,
+    LyricsReadingError,
     annotate_japanese_reading,
+    annotate_token_reading,
     find_explicit_reading_base_start,
     find_explicit_reading_replacements,
+    generate_hiragana_lyrics,
     get_reading_surface_segment_kind,
+    get_sudachi_tokenizer,
     katakana_to_hiragana,
     lyrics_are_japanese,
     lyrics_are_primarily_korean,
@@ -46,6 +52,7 @@ from music_japanese_reading import (
     protect_explicit_readings,
     replace_explicit_readings,
     split_reading_surface,
+    sudachi_dictionary,
 )
 from music_models import (
     AUTOPLAY_HISTORY_SIZE,
@@ -224,12 +231,6 @@ from music_track_metadata import (
 )
 from ytmusicapi import YTMusic
 from ytmusicapi.auth.oauth import OAuthCredentials
-
-try:
-    from sudachipy import dictionary as sudachi_dictionary
-except ImportError:
-    sudachi_dictionary = None
-
 
 from music_config import (
     AUTOPLAY_BUTTON_CUSTOM_ID,
@@ -2092,14 +2093,6 @@ class KoreanLyricsError(RuntimeError):
     pass
 
 
-class LyricsReadingError(RuntimeError):
-    pass
-
-
-SUDACHI_TOKENIZER = None
-SUDACHI_TOKENIZER_LOCK = threading.Lock()
-
-
 async def run_lyrics_job(function: Callable[..., T], *args: object) -> T:
     if lyrics_executor_closing:
         raise asyncio.CancelledError
@@ -2296,53 +2289,6 @@ def can_generate_lyrics_reading(track: Track, lyrics: str) -> bool:
         sudachi_dictionary is not None
         and get_hiragana_reading_source_lyrics(track, lyrics)
     )
-
-
-def get_sudachi_tokenizer():
-    global SUDACHI_TOKENIZER
-    if sudachi_dictionary is None:
-        raise LyricsReadingError(
-            "SudachiPy and SudachiDict-core are not installed."
-        )
-    if SUDACHI_TOKENIZER is None:
-        SUDACHI_TOKENIZER = sudachi_dictionary.Dictionary().create()
-    return SUDACHI_TOKENIZER
-
-
-def annotate_token_reading(surface: str, reading: str) -> str:
-    if (
-        not reading
-        or re.search(r"[A-Za-z]", surface)
-        or not JAPANESE_HAN_RE.search(surface)
-        or surface.isspace()
-        or all(
-            unicodedata.category(character).startswith(("P", "S"))
-            for character in surface
-        )
-    ):
-        return surface
-    return annotate_japanese_reading(surface, reading)
-
-
-def generate_hiragana_lyrics(lyrics: str) -> str:
-    with SUDACHI_TOKENIZER_LOCK:
-        tokenizer = get_sudachi_tokenizer()
-        converted_lines: list[str] = []
-        for line in lyrics.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-            line, protected_readings = protect_explicit_readings(line, tokenizer)
-            converted_tokens: list[str] = []
-            for token in tokenizer.tokenize(line):
-                surface = token.surface()
-                reading = token.reading_form()
-                converted_tokens.append(annotate_token_reading(surface, reading))
-            converted_line = "".join(converted_tokens)
-            for placeholder, replacement in protected_readings.items():
-                converted_line = converted_line.replace(placeholder, replacement)
-            converted_lines.append(converted_line)
-    reading_text = "\n".join(converted_lines).strip()
-    if not reading_text:
-        raise LyricsReadingError("Sudachi returned empty reading text.")
-    return reading_text
 
 
 async def get_track_namuwiki_lyrics(track: Track) -> str | None:

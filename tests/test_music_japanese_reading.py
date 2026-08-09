@@ -30,11 +30,21 @@ EXPLICIT_READING_MOVED_NAMES = (
     "protect_explicit_readings",
     "replace_explicit_readings",
 )
+SUDACHI_READING_MOVED_NAMES = (
+    "LyricsReadingError",
+    "SUDACHI_TOKENIZER_LOCK",
+    "annotate_token_reading",
+    "generate_hiragana_lyrics",
+    "get_sudachi_tokenizer",
+    "sudachi_dictionary",
+)
 EXPECTED_IMPORTS = {
     "__future__",
     "functools",
     "music_models",
     "re",
+    "sudachipy",
+    "threading",
     "unicodedata",
 }
 
@@ -108,7 +118,7 @@ class MusicScriptDetectionTests(unittest.TestCase):
 
 class MusicJapaneseReadingTests(unittest.TestCase):
     def test_bot_reexports_moved_japanese_reading_names(self) -> None:
-        for name in JAPANESE_READING_MOVED_NAMES:
+        for name in JAPANESE_READING_MOVED_NAMES + SUDACHI_READING_MOVED_NAMES:
             with self.subTest(name=name):
                 self.assertIs(
                     getattr(bot, name),
@@ -158,14 +168,15 @@ class MusicJapaneseReadingTests(unittest.TestCase):
 
 
 class FakeToken:
-    def __init__(self, surface: str) -> None:
+    def __init__(self, surface: str, reading: str | None = None) -> None:
         self._surface = surface
+        self._reading = reading if reading is not None else surface
 
     def surface(self) -> str:
         return self._surface
 
     def reading_form(self) -> str:
-        return ""
+        return self._reading
 
 
 class FakeTokenizer:
@@ -179,14 +190,21 @@ class MusicJapaneseReadingBotCompatibilityTests(unittest.TestCase):
     ) -> None:
         tokenizer = FakeTokenizer()
         with (
-            patch.object(bot, "get_sudachi_tokenizer", return_value=tokenizer),
             patch.object(
-                bot,
+                music_japanese_reading,
+                "get_sudachi_tokenizer",
+                return_value=tokenizer,
+            ),
+            patch.object(
+                music_japanese_reading,
                 "protect_explicit_readings",
                 return_value=("protected", {}),
             ) as protect,
         ):
-            self.assertEqual(bot.generate_hiragana_lyrics("source"), "protected")
+            self.assertEqual(
+                music_japanese_reading.generate_hiragana_lyrics("source"),
+                "protected",
+            )
 
         protect.assert_called_once_with("source", tokenizer)
 
@@ -194,13 +212,118 @@ class MusicJapaneseReadingBotCompatibilityTests(unittest.TestCase):
         self,
     ) -> None:
         with patch.object(
-            bot,
+            music_japanese_reading,
             "annotate_japanese_reading",
             return_value="patched",
         ) as annotate:
-            self.assertEqual(bot.annotate_token_reading("漢", "カン"), "patched")
+            self.assertEqual(
+                music_japanese_reading.annotate_token_reading("漢", "カン"),
+                "patched",
+            )
 
         annotate.assert_called_once_with("漢", "カン")
+
+
+class MusicJapaneseReadingGenerationTests(unittest.TestCase):
+    def test_japanese_and_korean_lyrics_are_detected_locally(self) -> None:
+        track = make_track("Japanese song")
+
+        self.assertTrue(
+            music_japanese_reading.lyrics_are_japanese(track, "君の声が聞こえる")
+        )
+        self.assertFalse(
+            music_japanese_reading.lyrics_are_japanese(
+                track,
+                "I can hear your voice",
+            )
+        )
+        self.assertTrue(
+            music_japanese_reading.lyrics_are_primarily_korean(
+                "너의 목소리가 들려"
+            )
+        )
+        self.assertFalse(
+            music_japanese_reading.lyrics_are_primarily_korean("君の声が聞こえる")
+        )
+
+    def test_explicit_readings_accept_common_bracket_styles(self) -> None:
+        tokenizer = FakeTokenizer()
+        examples = {
+            "運命(さだめ)": "運命(さだめ)",
+            "運命（さだめ）": "運命(さだめ)",
+            "運命[さだめ]": "運命(さだめ)",
+            "運命【さだめ】": "運命(さだめ)",
+            "運命《サダメ》": "運命(さだめ)",
+            "｜超電磁砲《レールガン》": "超電磁砲(れーるがん)",
+        }
+
+        for source, expected in examples.items():
+            with self.subTest(source=source):
+                self.assertEqual(
+                    music_japanese_reading.replace_explicit_readings(
+                        source,
+                        tokenizer,
+                    ),
+                    expected,
+                )
+
+    def test_non_kana_parentheses_are_not_treated_as_a_reading(self) -> None:
+        source = "運命(Oh yeah)"
+
+        self.assertEqual(
+            music_japanese_reading.replace_explicit_readings(
+                source,
+                FakeTokenizer(),
+            ),
+            source,
+        )
+        self.assertEqual(
+            music_japanese_reading.replace_explicit_readings(
+                "愛してる(ああ)",
+                FakeTokenizer(),
+            ),
+            "愛してる(ああ)",
+        )
+        self.assertEqual(
+            music_japanese_reading.annotate_token_reading("(", "キゴウ"),
+            "(",
+        )
+        self.assertEqual(
+            music_japanese_reading.annotate_token_reading("Oh", "オー"),
+            "Oh",
+        )
+
+    def test_dictionary_readings_are_added_after_kanji(self) -> None:
+        examples = {
+            ("運命", "ウンメイ"): "運命(うんめい)",
+            ("礼を持って", "レイヲモッテ"): "礼(れい)を持(も)って",
+            ("取り戻す", "トリモドス"): "取(と)り戻(もど)す",
+            ("かなだけ", "カナダケ"): "かなだけ",
+        }
+
+        for (surface, reading), expected in examples.items():
+            with self.subTest(surface=surface):
+                self.assertEqual(
+                    music_japanese_reading.annotate_token_reading(
+                        surface,
+                        reading,
+                    ),
+                    expected,
+                )
+
+    def test_explicit_reading_overrides_dictionary_reading(self) -> None:
+        tokenizer = FakeTokenizer()
+
+        with patch.object(
+            music_japanese_reading,
+            "get_sudachi_tokenizer",
+            return_value=tokenizer,
+        ):
+            reading = music_japanese_reading.generate_hiragana_lyrics(
+                "未来(あした)"
+            )
+
+        self.assertEqual(reading, "未来(あした)")
 
 
 class MusicExplicitReadingsTests(unittest.TestCase):

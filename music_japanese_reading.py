@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import functools
 import re
+import threading
 import unicodedata
 
 from music_models import Track
+
+try:
+    from sudachipy import dictionary as sudachi_dictionary
+except ImportError:
+    sudachi_dictionary = None
 
 
 JAPANESE_KANA_RE = re.compile(r"[\u3041-\u309f\u30a0-\u30ff]")
@@ -27,6 +33,14 @@ EXPLICIT_READING_BRACKETS = (
     ("【", "】"),
     ("〔", "〕"),
 )
+
+
+class LyricsReadingError(RuntimeError):
+    pass
+
+
+SUDACHI_TOKENIZER = None
+SUDACHI_TOKENIZER_LOCK = threading.Lock()
 
 
 def lyrics_are_japanese(track: Track, lyrics: str) -> bool:
@@ -270,3 +284,50 @@ def protect_explicit_readings(
         cursor = end
     output.append(line[cursor:])
     return "".join(output), protected
+
+
+def get_sudachi_tokenizer():
+    global SUDACHI_TOKENIZER
+    if sudachi_dictionary is None:
+        raise LyricsReadingError(
+            "SudachiPy and SudachiDict-core are not installed."
+        )
+    if SUDACHI_TOKENIZER is None:
+        SUDACHI_TOKENIZER = sudachi_dictionary.Dictionary().create()
+    return SUDACHI_TOKENIZER
+
+
+def annotate_token_reading(surface: str, reading: str) -> str:
+    if (
+        not reading
+        or re.search(r"[A-Za-z]", surface)
+        or not JAPANESE_HAN_RE.search(surface)
+        or surface.isspace()
+        or all(
+            unicodedata.category(character).startswith(("P", "S"))
+            for character in surface
+        )
+    ):
+        return surface
+    return annotate_japanese_reading(surface, reading)
+
+
+def generate_hiragana_lyrics(lyrics: str) -> str:
+    with SUDACHI_TOKENIZER_LOCK:
+        tokenizer = get_sudachi_tokenizer()
+        converted_lines: list[str] = []
+        for line in lyrics.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line, protected_readings = protect_explicit_readings(line, tokenizer)
+            converted_tokens: list[str] = []
+            for token in tokenizer.tokenize(line):
+                surface = token.surface()
+                reading = token.reading_form()
+                converted_tokens.append(annotate_token_reading(surface, reading))
+            converted_line = "".join(converted_tokens)
+            for placeholder, replacement in protected_readings.items():
+                converted_line = converted_line.replace(placeholder, replacement)
+            converted_lines.append(converted_line)
+    reading_text = "\n".join(converted_lines).strip()
+    if not reading_text:
+        raise LyricsReadingError("Sudachi returned empty reading text.")
+    return reading_text
