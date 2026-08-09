@@ -190,6 +190,7 @@ from music_search_scoring import (
     TRAILING_BRACKETED_TITLE_PART_RE,
     VERSION_MARKER_RE,
     YOUTUBE_SEARCH_NOISE_TOKENS,
+    build_youtube_search_query,
     clean_track_title,
     clean_track_title_preserving_case,
     get_search_result_duration,
@@ -200,7 +201,10 @@ from music_search_scoring import (
     is_likely_official_youtube_upload,
     normalize_artist_name,
     normalize_identity_component,
+    resolve_query,
     score_youtube_search_result,
+    select_youtube_music_song_result,
+    select_youtube_search_result,
     should_use_youtube_music_search,
     strip_edge_title_tags,
     youtube_music_entries_are_ambiguous,
@@ -1989,102 +1993,6 @@ class MusicControlView(discord.ui.View):
         else:
             cancel_autoplay_refill(state)
         await self.edit_panel(interaction, refresh_canonical=True)
-
-
-def select_youtube_music_song_result(query: str, results: list[dict]) -> dict | None:
-    entries = [
-        entry
-        for result in results
-        if (entry := youtube_music_result_to_entry(result)) is not None
-    ]
-    if not entries:
-        return None
-    if youtube_music_entries_are_ambiguous(query, entries):
-        logger.info(
-            "YouTube Music returned multiple artists for title-only query %s; "
-            "using YouTube ranking instead",
-            query,
-        )
-        return None
-
-    selected = select_youtube_search_result(query, entries)
-    logger.info(
-        "YouTube Music selected catalog song for %s: %s (%s)",
-        query,
-        selected.get("title"),
-        selected.get("id"),
-    )
-    return selected
-
-
-def build_youtube_search_query(
-    query: str,
-    artist_hint: str | None = None,
-) -> str:
-    search_text = query
-    if artist_hint:
-        search_text = f"{query} {artist_hint}"
-    return f"ytsearch{YOUTUBE_SEARCH_CANDIDATES}:{search_text}"
-
-
-def select_youtube_search_result(
-    query: str,
-    entries: list[dict],
-    preferred_artist: str | None = None,
-    preferred_title: str | None = None,
-) -> dict:
-    candidates = [
-        entry
-        for entry in entries
-        if isinstance(entry, dict) and (entry.get("id") or entry.get("url"))
-    ]
-    if not candidates:
-        raise ValueError(f"No playable search results were found for '{query}'.")
-
-    ranked = [
-        (
-            score_youtube_search_result(
-                entry,
-                query,
-                index,
-                preferred_artist,
-                preferred_title,
-            ),
-            -index,
-            entry,
-        )
-        for index, entry in enumerate(candidates)
-    ]
-    score, negative_index, selected = max(
-        ranked,
-        key=lambda candidate: candidate[:2],
-    )
-    logger.info(
-        "YouTube search selected result %s/%s for %s: %s (%s, score %s)",
-        -negative_index + 1,
-        len(candidates),
-        query,
-        selected.get("title") or "Untitled track",
-        format_duration(selected.get("duration")),
-        score,
-    )
-    return selected
-
-
-def resolve_query(query: str, search_kind: str | None = None) -> str:
-    query = query.strip()
-    parsed = urllib.parse.urlparse(query)
-
-    if parsed.scheme in {"http", "https"}:
-        host = parsed.netloc.lower().removeprefix("www.")
-        if host not in YOUTUBE_HOSTS:
-            raise ValueError("YouTube 링크나 검색어만 사용할 수 있어요.")
-        return query
-
-    if search_kind in {"album", "playlist"}:
-        return build_youtube_playlist_search_url(query, search_kind)
-
-    return build_youtube_search_query(query)
 
 
 async def extract_first_info(
