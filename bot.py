@@ -5182,15 +5182,33 @@ async def on_voice_state_update(
 
     if member.bot:
         bot_user = bot.user
-        if (
-            bot_user is not None
-            and member.id == bot_user.id
-            and before.channel is not None
-            and after.channel is not None
-            and before.channel != after.channel
-        ):
-            cancel_empty_channel_disconnect(state)
-            update_empty_channel_disconnect(state, member.guild.id)
+        if bot_user is None or member.id != bot_user.id:
+            return
+
+        if before.channel is not None and after.channel is not None:
+            if before.channel != after.channel:
+                cancel_empty_channel_disconnect(state)
+                update_empty_channel_disconnect(state, member.guild.id)
+            return
+
+        if before.channel is not None and after.channel is None:
+            event_voice = state.voice
+            if event_voice is None:
+                return
+
+            should_refresh_panel = False
+            async with state.voice_connect_lock:
+                if (
+                    not bot_shutdown_started
+                    and state.voice is event_voice
+                    and getattr(getattr(member, "voice", None), "channel", None)
+                    is None
+                ):
+                    stop_playback(state, member.guild.id)
+                    should_refresh_panel = True
+
+            if should_refresh_panel:
+                await show_idle_panel(member.guild.id, state)
         return
 
     if state.voice is None or not state.voice.is_connected():
