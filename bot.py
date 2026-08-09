@@ -2010,6 +2010,11 @@ class QueueRangeBoundarySelect(discord.ui.Select):
             embed=make_queue_embed(state),
             view=self.range_view,
         )
+        schedule_queue_message_cleanup(
+            state,
+            interaction.message,
+            EPHEMERAL_RESPONSE_DELETE_SECONDS,
+        )
 
 
 class QueueRangeDeleteButton(discord.ui.Button):

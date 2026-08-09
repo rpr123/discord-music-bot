@@ -6431,6 +6431,73 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("끝", selects[1].placeholder)
         self.assertTrue(view.confirm_button.disabled)
 
+    async def test_boundary_selection_resets_expiry_only_after_response(self) -> None:
+        guild_id = 996
+        tracks = [make_track("first"), make_track("second"), make_track("third")]
+        state = bot.get_state(guild_id)
+        state.queue.extend(tracks)
+        view = bot.QueueRangeDeleteView(guild_id)
+        start = next(
+            item
+            for item in view.children
+            if isinstance(item, bot.QueueRangeBoundarySelect)
+            and item.boundary == "start"
+        )
+        interaction = MagicMock(message=MagicMock(id=997))
+        interaction.response.edit_message = AsyncMock()
+        operation_order: list[str] = []
+        interaction.response.edit_message.side_effect = (
+            lambda **_kwargs: operation_order.append("response")
+        )
+
+        with patch.object(
+            bot,
+            "schedule_queue_message_cleanup",
+            side_effect=lambda *_args: operation_order.append("cleanup"),
+        ) as schedule_cleanup:
+            start._values = [tracks[0].track_id]
+            await start.callback(interaction)
+
+            self.assertEqual(operation_order, ["response", "cleanup"])
+            expected_cleanup = (
+                state,
+                interaction.message,
+                bot.EPHEMERAL_RESPONSE_DELETE_SECONDS,
+            )
+            self.assertEqual(schedule_cleanup.call_args.args, expected_cleanup)
+
+            schedule_cleanup.reset_mock()
+            failed_view = bot.QueueRangeDeleteView(guild_id)
+            failed_start = next(
+                item
+                for item in failed_view.children
+                if getattr(item, "boundary", None) == "start"
+            )
+            failed_start._values = [tracks[1].track_id]
+            failed_interaction = MagicMock(message=MagicMock(id=998))
+            response = MagicMock(status=500, reason="Internal Server Error")
+            response_error = bot.discord.DiscordServerError(
+                response,
+                "<html>temporary failure</html>",
+            )
+            failed_interaction.response.edit_message = AsyncMock(
+                side_effect=response_error
+            )
+
+            with self.assertRaises(bot.discord.DiscordServerError) as raised:
+                await failed_start.callback(failed_interaction)
+
+        self.assertIs(raised.exception, response_error)
+        self.assertEqual(view.start_track_id, tracks[0].track_id)
+        self.assertEqual(
+            [option.value for option in start.options if option.default],
+            [tracks[0].track_id],
+        )
+        self.assertTrue(view.confirm_button.disabled)
+        interaction.response.edit_message.assert_awaited_once()
+        failed_interaction.response.edit_message.assert_awaited_once()
+        schedule_cleanup.assert_not_called()
+
     async def test_confirm_deletes_inclusive_range(self) -> None:
         guild_id = 988
         tracks = [make_track(f"track-{index}") for index in range(1, 21)]
