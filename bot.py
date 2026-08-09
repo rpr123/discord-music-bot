@@ -2247,7 +2247,13 @@ class MusicControlView(discord.ui.View):
                 if not clicked_panel_updated or not clicked_is_current:
                     await update_control_panel(self.guild_id, state)
 
-    @discord.ui.button(label="재생/일시정지", emoji="⏯️", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(
+        label="재생/일시정지",
+        emoji="⏯️",
+        style=discord.ButtonStyle.secondary,
+        custom_id="music:pause_resume",
+        row=0,
+    )
     async def pause_resume(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
         voice = state.voice
@@ -2278,7 +2284,13 @@ class MusicControlView(discord.ui.View):
 
         await self.edit_panel(interaction)
 
-    @discord.ui.button(label="스킵", emoji="⏭️", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(
+        label="스킵",
+        emoji="⏭️",
+        style=discord.ButtonStyle.primary,
+        custom_id="music:skip",
+        row=0,
+    )
     async def skip(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
         voice = state.voice
@@ -2324,7 +2336,13 @@ class MusicControlView(discord.ui.View):
         voice.stop()
         await send_ephemeral_followup(interaction, "다음 곡으로 넘어갈게요.")
 
-    @discord.ui.button(label="정지", emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
+    @discord.ui.button(
+        label="정지",
+        emoji="⏹️",
+        style=discord.ButtonStyle.danger,
+        custom_id="music:stop",
+        row=0,
+    )
     async def stop(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
         stop_playback(state, self.guild_id)
@@ -2342,14 +2360,26 @@ class MusicControlView(discord.ui.View):
             if not clicked_panel_updated or not clicked_is_current:
                 await show_idle_panel(self.guild_id, state)
 
-    @discord.ui.button(label="반복", emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(
+        label="반복",
+        emoji="🔁",
+        style=discord.ButtonStyle.secondary,
+        custom_id="music:repeat",
+        row=1,
+    )
     async def repeat(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
         await interaction.response.defer()
         state.repeat_one = not state.repeat_one
         await self.edit_panel(interaction, refresh_canonical=True)
 
-    @discord.ui.button(label="셔플", emoji="🔀", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(
+        label="셔플",
+        emoji="🔀",
+        style=discord.ButtonStyle.secondary,
+        custom_id="music:shuffle",
+        row=1,
+    )
     async def shuffle(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
         await interaction.response.defer()
@@ -2358,7 +2388,13 @@ class MusicControlView(discord.ui.View):
         state.queue = deque(tracks)
         await self.edit_panel(interaction, refresh_canonical=True)
 
-    @discord.ui.button(label="대기열 삭제", emoji="📋", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(
+        label="대기열 삭제",
+        emoji="📋",
+        style=discord.ButtonStyle.secondary,
+        custom_id="music:queue",
+        row=1,
+    )
     async def queue(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
         await send_queue_management_response(
@@ -2368,7 +2404,13 @@ class MusicControlView(discord.ui.View):
             view=QueueManageView(self.guild_id) if state.queue else None,
         )
 
-    @discord.ui.button(label="구간 삭제", emoji="✂️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(
+        label="구간 삭제",
+        emoji="✂️",
+        style=discord.ButtonStyle.secondary,
+        custom_id="music:queue_range",
+        row=1,
+    )
     async def queue_range(
         self,
         interaction: discord.Interaction,

@@ -3410,6 +3410,72 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             bot.cancel_autoplay_refill(state)
         bot.music_states.clear()
 
+    async def test_music_control_views_have_stable_persistent_custom_ids(
+        self,
+    ) -> None:
+        guild_id = 320
+        expected_custom_ids = {
+            "music:pause_resume",
+            "music:skip",
+            "music:stop",
+            "music:repeat",
+            "music:shuffle",
+            "music:queue",
+            "music:queue_range",
+            bot.AUTOPLAY_BUTTON_CUSTOM_ID,
+        }
+        views = (
+            bot.MusicControlView(guild_id),
+            bot.MusicControlView(guild_id, disabled=True),
+            bot.MusicControlView(guild_id),
+        )
+
+        try:
+            for view in views:
+                custom_ids = [item.custom_id for item in view.children]
+                self.assertEqual(len(custom_ids), 8)
+                self.assertEqual(set(custom_ids), expected_custom_ids)
+                self.assertTrue(view.is_persistent())
+        finally:
+            for view in views:
+                bot.discord.ui.View.stop(view)
+            bot.music_states.pop(guild_id, None)
+
+    async def test_music_control_view_store_replaces_stable_dispatch_entries(
+        self,
+    ) -> None:
+        guild_id = 321
+        same_message_id = 9100
+        separate_message_ids = tuple(range(9200, 9204))
+        view_store = ViewStore(bot.bot._connection)
+        registered_views: list[bot.MusicControlView] = []
+
+        try:
+            for message_ids in (
+                (same_message_id,) * 4,
+                separate_message_ids,
+            ):
+                counts: list[int] = []
+                latest_views: dict[int, bot.MusicControlView] = {}
+                for message_id in message_ids:
+                    view = bot.MusicControlView(guild_id)
+                    registered_views.append(view)
+                    latest_views[message_id] = view
+                    view_store.add_view(view, message_id)
+                    counts.append(len(view_store._views[message_id]))
+
+                self.assertEqual(counts, [8, 8, 8, 8])
+                for message_id, view in latest_views.items():
+                    dispatch_items = view_store._views[message_id]
+                    self.assertIs(view_store._synced_message_views[message_id], view)
+                    self.assertTrue(
+                        all(item.view is view for item in dispatch_items.values())
+                    )
+        finally:
+            for view in reversed(registered_views):
+                bot.discord.ui.View.stop(view)
+            bot.music_states.pop(guild_id, None)
+
     def _make_pause_case(self, guild_id: int, action: str):
         state = bot.get_state(guild_id)
         state.current = make_track(f"current-{guild_id}")
