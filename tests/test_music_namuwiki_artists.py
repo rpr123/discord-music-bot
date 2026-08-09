@@ -1,7 +1,7 @@
 import unittest
 
 import bot
-import music_namuwiki_matching as music_namuwiki_artists
+import music_namuwiki as music_namuwiki_artists
 from music_models import Track
 
 

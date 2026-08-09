@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from discord.ui.view import ViewStore
 
 import bot
+import music_namuwiki
 import music_ytdl
 from devtools.local_music_bot import LocalMusicMode
 
@@ -2505,9 +2506,13 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         response.geturl.return_value = self.PAGE_URL
 
         with (
-            patch.object(bot, "NAMUWIKI_REQUEST_INTERVAL_SECONDS", 0),
             patch.object(
-                bot.urllib.request,
+                music_namuwiki,
+                "NAMUWIKI_REQUEST_INTERVAL_SECONDS",
+                0,
+            ),
+            patch.object(
+                music_namuwiki.urllib.request,
                 "urlopen",
                 return_value=response,
             ) as urlopen,
@@ -2533,11 +2538,23 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch.object(bot, "NAMUWIKI_REQUEST_INTERVAL_SECONDS", 0),
-            patch.object(bot, "NAMUWIKI_PREVIEW_FALLBACK_ENABLED", True),
-            patch.object(bot, "namuwiki_prefer_preview_renderer", False),
             patch.object(
-                bot.urllib.request,
+                music_namuwiki,
+                "NAMUWIKI_REQUEST_INTERVAL_SECONDS",
+                0,
+            ),
+            patch.object(
+                music_namuwiki,
+                "NAMUWIKI_PREVIEW_FALLBACK_ENABLED",
+                True,
+            ),
+            patch.object(
+                music_namuwiki,
+                "namuwiki_prefer_preview_renderer",
+                False,
+            ),
+            patch.object(
+                music_namuwiki.urllib.request,
                 "urlopen",
                 side_effect=[blocked, response, response],
             ) as urlopen,
@@ -2545,7 +2562,7 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
             first_result = bot.request_namuwiki_html(self.PAGE_URL)
             second_result = bot.request_namuwiki_html(self.PAGE_URL)
 
-            self.assertTrue(bot.namuwiki_prefer_preview_renderer)
+            self.assertTrue(music_namuwiki.namuwiki_prefer_preview_renderer)
 
         self.assertEqual(first_result, (self.HTML_FIXTURE, self.PAGE_URL))
         self.assertEqual(second_result, (self.HTML_FIXTURE, self.PAGE_URL))
@@ -2556,9 +2573,9 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             user_agents,
             [
-                bot.NAMUWIKI_BROWSER_USER_AGENT,
-                bot.NAMUWIKI_PREVIEW_USER_AGENT,
-                bot.NAMUWIKI_PREVIEW_USER_AGENT,
+                music_namuwiki.NAMUWIKI_BROWSER_USER_AGENT,
+                music_namuwiki.NAMUWIKI_PREVIEW_USER_AGENT,
+                music_namuwiki.NAMUWIKI_PREVIEW_USER_AGENT,
             ],
         )
 
@@ -2571,11 +2588,23 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
             None,
         )
         with (
-            patch.object(bot, "NAMUWIKI_REQUEST_INTERVAL_SECONDS", 0),
-            patch.object(bot, "NAMUWIKI_PREVIEW_FALLBACK_ENABLED", False),
-            patch.object(bot, "namuwiki_prefer_preview_renderer", False),
             patch.object(
-                bot.urllib.request,
+                music_namuwiki,
+                "NAMUWIKI_REQUEST_INTERVAL_SECONDS",
+                0,
+            ),
+            patch.object(
+                music_namuwiki,
+                "NAMUWIKI_PREVIEW_FALLBACK_ENABLED",
+                False,
+            ),
+            patch.object(
+                music_namuwiki,
+                "namuwiki_prefer_preview_renderer",
+                False,
+            ),
+            patch.object(
+                music_namuwiki.urllib.request,
                 "urlopen",
                 side_effect=blocked,
             ) as urlopen,
@@ -2598,11 +2627,23 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         preview_response.geturl.return_value = self.PAGE_URL
 
         with (
-            patch.object(bot, "NAMUWIKI_REQUEST_INTERVAL_SECONDS", 0),
-            patch.object(bot, "NAMUWIKI_PREVIEW_FALLBACK_ENABLED", True),
-            patch.object(bot, "namuwiki_prefer_preview_renderer", False),
             patch.object(
-                bot.urllib.request,
+                music_namuwiki,
+                "NAMUWIKI_REQUEST_INTERVAL_SECONDS",
+                0,
+            ),
+            patch.object(
+                music_namuwiki,
+                "NAMUWIKI_PREVIEW_FALLBACK_ENABLED",
+                True,
+            ),
+            patch.object(
+                music_namuwiki,
+                "namuwiki_prefer_preview_renderer",
+                False,
+            ),
+            patch.object(
+                music_namuwiki.urllib.request,
                 "urlopen",
                 side_effect=[challenge_response, preview_response],
             ) as urlopen,
@@ -2620,10 +2661,14 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         ).encode("utf-8")
 
         with (
-            patch.object(bot, "NAMUWIKI_API_TOKEN", "test-token"),
-            patch.object(bot, "NAMUWIKI_REQUEST_INTERVAL_SECONDS", 0),
+            patch.object(music_namuwiki, "NAMUWIKI_API_TOKEN", "test-token"),
             patch.object(
-                bot.urllib.request,
+                music_namuwiki,
+                "NAMUWIKI_REQUEST_INTERVAL_SECONDS",
+                0,
+            ),
+            patch.object(
+                music_namuwiki.urllib.request,
                 "urlopen",
                 return_value=response,
             ) as urlopen,
@@ -2643,10 +2688,10 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         track = make_track(self.DOCUMENT)
         with (
-            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
-            patch.object(bot, "NAMUWIKI_API_TOKEN", None),
+            patch.object(music_namuwiki, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(music_namuwiki, "NAMUWIKI_API_TOKEN", None),
             patch.object(
-                bot,
+                music_namuwiki,
                 "request_namuwiki_html",
                 return_value=(self.HTML_FIXTURE, self.PAGE_URL),
             ) as html_lookup,
@@ -2689,10 +2734,10 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
             return None
 
         with (
-            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
-            patch.object(bot, "NAMUWIKI_API_TOKEN", None),
+            patch.object(music_namuwiki, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(music_namuwiki, "NAMUWIKI_API_TOKEN", None),
             patch.object(
-                bot,
+                music_namuwiki,
                 "request_namuwiki_html",
                 side_effect=request_page,
             ) as html_lookup,
@@ -2725,10 +2770,10 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         </html>
         """
         with (
-            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
-            patch.object(bot, "NAMUWIKI_API_TOKEN", None),
+            patch.object(music_namuwiki, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(music_namuwiki, "NAMUWIKI_API_TOKEN", None),
             patch.object(
-                bot,
+                music_namuwiki,
                 "request_namuwiki_html",
                 return_value=(page_without_lyrics, self.PAGE_URL),
             ) as html_lookup,
@@ -2742,15 +2787,15 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
         track = make_track(self.DOCUMENT)
 
         with (
-            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
-            patch.object(bot, "NAMUWIKI_API_TOKEN", None),
+            patch.object(music_namuwiki, "NAMUWIKI_LYRICS_ENABLED", True),
+            patch.object(music_namuwiki, "NAMUWIKI_API_TOKEN", None),
             patch.object(
-                bot,
+                music_namuwiki,
                 "get_namuwiki_document_candidates",
                 return_value=[self.DOCUMENT],
             ),
             patch.object(
-                bot,
+                music_namuwiki,
                 "request_namuwiki_html",
                 side_effect=bot.NamuWikiLyricsError("request blocked"),
             ),
@@ -2764,14 +2809,21 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
     def test_api_namumark_is_preferred_when_token_is_configured(self) -> None:
         track = make_track(self.DOCUMENT)
         with (
-            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
-            patch.object(bot, "NAMUWIKI_API_TOKEN", "test-token"),
+            patch.object(music_namuwiki, "NAMUWIKI_LYRICS_ENABLED", True),
             patch.object(
-                bot,
+                music_namuwiki,
+                "NAMUWIKI_API_TOKEN",
+                "test-token",
+            ),
+            patch.object(
+                music_namuwiki,
                 "request_namuwiki_api_source",
                 return_value=self.NAMUMARK_FIXTURE,
             ) as api_lookup,
-            patch.object(bot, "request_namuwiki_html") as html_lookup,
+            patch.object(
+                music_namuwiki,
+                "request_namuwiki_html",
+            ) as html_lookup,
         ):
             result = bot.lookup_namuwiki_lyrics(track)
 
@@ -2800,14 +2852,21 @@ class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
             return None
 
         with (
-            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
-            patch.object(bot, "NAMUWIKI_API_TOKEN", "test-token"),
+            patch.object(music_namuwiki, "NAMUWIKI_LYRICS_ENABLED", True),
             patch.object(
-                bot,
+                music_namuwiki,
+                "NAMUWIKI_API_TOKEN",
+                "test-token",
+            ),
+            patch.object(
+                music_namuwiki,
                 "request_namuwiki_api_source",
                 side_effect=request_source,
             ) as api_lookup,
-            patch.object(bot, "request_namuwiki_html") as html_lookup,
+            patch.object(
+                music_namuwiki,
+                "request_namuwiki_html",
+            ) as html_lookup,
         ):
             result = bot.lookup_namuwiki_lyrics(track)
 

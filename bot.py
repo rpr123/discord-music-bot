@@ -111,13 +111,23 @@ from music_lyrics_sources import (
     select_lyrics_record,
     select_manual_subtitle,
 )
-from music_namuwiki_matching import (
+from music_namuwiki import (
+    NAMUWIKI_MAX_DOCUMENT_CANDIDATES,
     build_namuwiki_document_candidates,
     extract_namuwiki_primary_artist_from_tables,
     find_namuwiki_override,
+    get_namuwiki_document_candidates,
+    get_namuwiki_override,
     get_namuwiki_track_artists,
+    lookup_namuwiki_lyrics,
     namuwiki_artist_matches_track,
     parse_namuwiki_candidate,
+    read_limited_http_response,
+    request_namuwiki_api_source,
+    request_namuwiki_html,
+    request_namuwiki_html_once,
+    split_namuwiki_candidate,
+    wait_for_namuwiki_interval,
 )
 from music_namuwiki_parsing import (
     NAMUMARK_FOOTNOTE_RE,
@@ -149,12 +159,6 @@ from music_namuwiki_parsing import (
     parse_namumark_tables,
     parse_namuwiki_html_tables,
     split_namuwiki_lyrics_groups,
-)
-from music_namuwiki_transport import (
-    NAMUWIKI_BLOCKED_MARKERS,
-    read_limited_http_response as read_namuwiki_http_response,
-    request_namuwiki_api_source as fetch_namuwiki_api_source,
-    request_namuwiki_html_once as fetch_namuwiki_html_once,
 )
 from music_request_parsing import (
     YOUTUBE_HOSTS,
@@ -2190,256 +2194,6 @@ class LyricsReadingError(RuntimeError):
 
 SUDACHI_TOKENIZER = None
 SUDACHI_TOKENIZER_LOCK = threading.Lock()
-NAMUWIKI_REQUEST_LOCK = threading.Lock()
-namuwiki_last_request_started_at = 0.0
-namuwiki_prefer_preview_renderer = False
-NAMUWIKI_MAX_DOCUMENT_CANDIDATES = 4
-NAMUWIKI_MAX_RESPONSE_BYTES = 3_000_000
-NAMUWIKI_BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36"
-)
-NAMUWIKI_PREVIEW_USER_AGENT = "Discordbot/2.0"
-
-
-def get_namuwiki_override(track: Track) -> str | None:
-    return find_namuwiki_override(track, NAMUWIKI_DOCUMENT_OVERRIDES)
-
-
-def get_namuwiki_document_candidates(track: Track) -> list[str]:
-    return build_namuwiki_document_candidates(
-        track,
-        get_namuwiki_override(track),
-        NAMUWIKI_MAX_DOCUMENT_CANDIDATES,
-    )
-
-
-def split_namuwiki_candidate(candidate: str) -> tuple[str, str]:
-    return parse_namuwiki_candidate(candidate, NAMUWIKI_PAGE_BASE_URL)
-
-
-def wait_for_namuwiki_interval() -> None:
-    global namuwiki_last_request_started_at
-    with NAMUWIKI_REQUEST_LOCK:
-        elapsed = time.monotonic() - namuwiki_last_request_started_at
-        delay = max(0.0, NAMUWIKI_REQUEST_INTERVAL_SECONDS - elapsed)
-        if delay:
-            time.sleep(delay)
-        namuwiki_last_request_started_at = time.monotonic()
-
-
-def read_limited_http_response(response) -> bytes:
-    return read_namuwiki_http_response(
-        response,
-        NAMUWIKI_MAX_RESPONSE_BYTES,
-    )
-
-
-def request_namuwiki_api_source(document: str) -> str | None:
-    return fetch_namuwiki_api_source(
-        document,
-        api_token=NAMUWIKI_API_TOKEN,
-        api_base_url=NAMUWIKI_API_BASE_URL,
-        timeout_seconds=NAMUWIKI_REQUEST_TIMEOUT_SECONDS,
-        wait_for_interval=wait_for_namuwiki_interval,
-        read_response=read_limited_http_response,
-        urlopen=urllib.request.urlopen,
-    )
-
-
-def request_namuwiki_html_once(
-    page_url: str,
-    user_agent: str,
-) -> tuple[str, str] | None:
-    return fetch_namuwiki_html_once(
-        page_url,
-        user_agent,
-        timeout_seconds=NAMUWIKI_REQUEST_TIMEOUT_SECONDS,
-        wait_for_interval=wait_for_namuwiki_interval,
-        read_response=read_limited_http_response,
-        urlopen=urllib.request.urlopen,
-        blocked_markers=NAMUWIKI_BLOCKED_MARKERS,
-    )
-
-
-def request_namuwiki_html(page_url: str) -> tuple[str, str] | None:
-    global namuwiki_prefer_preview_renderer
-
-    if (
-        not NAMUWIKI_PREVIEW_FALLBACK_ENABLED
-        or namuwiki_prefer_preview_renderer
-    ):
-        user_agent = (
-            NAMUWIKI_PREVIEW_USER_AGENT
-            if namuwiki_prefer_preview_renderer
-            else NAMUWIKI_BROWSER_USER_AGENT
-        )
-        return request_namuwiki_html_once(page_url, user_agent)
-
-    try:
-        return request_namuwiki_html_once(
-            page_url,
-            NAMUWIKI_BROWSER_USER_AGENT,
-        )
-    except NamuWikiPageBlockedError as browser_error:
-        logger.info(
-            "NamuWiki browser page was blocked; retrying through the "
-            "Discord link-preview renderer"
-        )
-        try:
-            result = request_namuwiki_html_once(
-                page_url,
-                NAMUWIKI_PREVIEW_USER_AGENT,
-            )
-        except NamuWikiLyricsError as preview_error:
-            raise NamuWikiLyricsError(
-                f"{browser_error} Discord preview fallback failed: "
-                f"{preview_error}"
-            ) from preview_error
-
-        namuwiki_prefer_preview_renderer = True
-        logger.info(
-            "NamuWiki Discord link-preview renderer is now preferred "
-            "for this process"
-        )
-        return result
-
-
-def lookup_namuwiki_lyrics(
-    track: Track,
-) -> tuple[str, str, str] | None:
-    if not NAMUWIKI_LYRICS_ENABLED:
-        return None
-
-    candidates = get_namuwiki_document_candidates(track)
-    override = get_namuwiki_override(track)
-    transient_failures: list[str] = []
-    for candidate in candidates:
-        try:
-            document, page_url = split_namuwiki_candidate(candidate)
-        except NamuWikiLyricsError as error:
-            logger.warning(
-                "Invalid NamuWiki document candidate for %s: %s",
-                track.title,
-                error,
-            )
-            continue
-
-        if NAMUWIKI_API_TOKEN:
-            try:
-                namumark = request_namuwiki_api_source(document)
-            except NamuWikiLyricsError as error:
-                logger.warning(
-                    "NamuWiki API lookup failed for %s (%s): %s",
-                    track.title,
-                    document,
-                    error,
-                )
-            else:
-                if namumark:
-                    try:
-                        namumark_tables = parse_namumark_tables(namumark)
-                        lyrics = extract_namuwiki_lyrics_from_tables(
-                            namumark_tables
-                        )
-                        page_artist = extract_namuwiki_primary_artist_from_tables(
-                            namumark_tables
-                        )
-                    except Exception as error:
-                        logger.warning(
-                            "NamuWiki source parsing failed for %s (%s): %s",
-                            track.title,
-                            document,
-                            error,
-                        )
-                        lyrics = None
-                    if lyrics:
-                        if (
-                            candidate != override
-                            and not namuwiki_artist_matches_track(
-                                track,
-                                page_artist,
-                            )
-                        ):
-                            logger.info(
-                                "NamuWiki artist mismatch for %s (%s): "
-                                "expected %s, page has %s",
-                                track.title,
-                                document,
-                                ", ".join(get_namuwiki_track_artists(track)),
-                                page_artist,
-                            )
-                            continue
-                        return lyrics, "나무위키 · 원문·독음·번역", page_url
-
-        try:
-            html_result = request_namuwiki_html(page_url)
-        except NamuWikiLyricsError as error:
-            logger.warning(
-                "NamuWiki page lookup failed for %s (%s): %s",
-                track.title,
-                document,
-                error,
-            )
-            transient_failures.append(f"{document}: {error}")
-            continue
-        if html_result is None:
-            continue
-
-        page_source, final_url = html_result
-        try:
-            html_tables = parse_namuwiki_html_tables(page_source)
-            lyrics = extract_namuwiki_lyrics_from_tables(html_tables)
-            page_artist = extract_namuwiki_primary_artist_from_tables(
-                html_tables
-            )
-        except NamuWikiLyricsError as error:
-            logger.warning(
-                "NamuWiki HTML parsing failed for %s (%s): %s",
-                track.title,
-                document,
-                error,
-            )
-            transient_failures.append(f"{document}: {error}")
-            continue
-        if lyrics:
-            if (
-                candidate != override
-                and not namuwiki_artist_matches_track(track, page_artist)
-            ):
-                logger.info(
-                    "NamuWiki artist mismatch for %s (%s): expected %s, "
-                    "page has %s",
-                    track.title,
-                    document,
-                    ", ".join(get_namuwiki_track_artists(track)),
-                    page_artist,
-                )
-                continue
-            logger.info(
-                "NamuWiki lyrics selected for %s (%s)",
-                track.title,
-                document,
-            )
-            return lyrics, "나무위키 · 원문·독음·번역", final_url
-
-    if transient_failures:
-        raise NamuWikiLyricsError(
-            "NamuWiki candidate pages could not be verified. "
-            "On hosted servers, configure NAMUWIKI_API_TOKEN. "
-            f"Last failure: {transient_failures[-1]}"
-        )
-
-    if candidates:
-        logger.info(
-            "No NamuWiki lyrics found for %s (candidates: %s)",
-            track.title,
-            ", ".join(candidates),
-        )
-    return None
-
-
 def request_lyrics_records(track_name: str, artist_name: str | None) -> list[dict]:
     params = {"track_name": track_name}
     if artist_name:

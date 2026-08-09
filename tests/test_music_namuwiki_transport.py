@@ -4,11 +4,11 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import bot
-import music_namuwiki_transport
+import music_namuwiki
 
 
 def make_http_error(url: str, status: int):
-    return music_namuwiki_transport.urllib.error.HTTPError(
+    return music_namuwiki.urllib.error.HTTPError(
         url,
         status,
         "error",
@@ -19,7 +19,7 @@ def make_http_error(url: str, status: int):
 
 class MusicNamuWikiTransportTests(unittest.TestCase):
     def test_module_has_only_the_expected_import_dependencies(self) -> None:
-        source = Path(music_namuwiki_transport.__file__).read_text(
+        source = Path(music_namuwiki.__file__).read_text(
             encoding="utf-8"
         )
         tree = ast.parse(source)
@@ -41,7 +41,16 @@ class MusicNamuWikiTransportTests(unittest.TestCase):
                 "__future__",
                 "collections.abc",
                 "json",
+                "music_config",
+                "music_lyrics_sources",
+                "music_models",
                 "music_namuwiki_parsing",
+                "music_search_scoring",
+                "music_track_metadata",
+                "re",
+                "threading",
+                "time",
+                "unicodedata",
                 "urllib.error",
                 "urllib.parse",
                 "urllib.request",
@@ -52,7 +61,7 @@ class MusicNamuWikiTransportTests(unittest.TestCase):
         response = MagicMock()
         response.read.return_value = b"12345"
 
-        with patch.object(bot, "NAMUWIKI_MAX_RESPONSE_BYTES", 4):
+        with patch.object(music_namuwiki, "NAMUWIKI_MAX_RESPONSE_BYTES", 4):
             with self.assertRaises(bot.NamuWikiLyricsError):
                 bot.read_limited_http_response(response)
 
@@ -63,14 +72,30 @@ class MusicNamuWikiTransportTests(unittest.TestCase):
         read_response = MagicMock()
         urlopen = MagicMock()
         with (
-            patch.object(bot, "NAMUWIKI_API_TOKEN", "token"),
-            patch.object(bot, "NAMUWIKI_API_BASE_URL", "https://api.test"),
-            patch.object(bot, "NAMUWIKI_REQUEST_TIMEOUT_SECONDS", 7),
-            patch.object(bot, "wait_for_namuwiki_interval", wait_for_interval),
-            patch.object(bot, "read_limited_http_response", read_response),
-            patch.object(bot.urllib.request, "urlopen", urlopen),
+            patch.object(music_namuwiki, "NAMUWIKI_API_TOKEN", "token"),
             patch.object(
-                bot,
+                music_namuwiki,
+                "NAMUWIKI_API_BASE_URL",
+                "https://api.test",
+            ),
+            patch.object(
+                music_namuwiki,
+                "NAMUWIKI_REQUEST_TIMEOUT_SECONDS",
+                7,
+            ),
+            patch.object(
+                music_namuwiki,
+                "wait_for_namuwiki_interval",
+                wait_for_interval,
+            ),
+            patch.object(
+                music_namuwiki,
+                "read_limited_http_response",
+                read_response,
+            ),
+            patch.object(music_namuwiki.urllib.request, "urlopen", urlopen),
+            patch.object(
+                music_namuwiki,
                 "fetch_namuwiki_api_source",
                 return_value="source",
             ) as fetch_source,
@@ -94,13 +119,29 @@ class MusicNamuWikiTransportTests(unittest.TestCase):
         urlopen = MagicMock()
         blocked_markers = ("blocked",)
         with (
-            patch.object(bot, "NAMUWIKI_REQUEST_TIMEOUT_SECONDS", 9),
-            patch.object(bot, "NAMUWIKI_BLOCKED_MARKERS", blocked_markers),
-            patch.object(bot, "wait_for_namuwiki_interval", wait_for_interval),
-            patch.object(bot, "read_limited_http_response", read_response),
-            patch.object(bot.urllib.request, "urlopen", urlopen),
             patch.object(
-                bot,
+                music_namuwiki,
+                "NAMUWIKI_REQUEST_TIMEOUT_SECONDS",
+                9,
+            ),
+            patch.object(
+                music_namuwiki,
+                "NAMUWIKI_BLOCKED_MARKERS",
+                blocked_markers,
+            ),
+            patch.object(
+                music_namuwiki,
+                "wait_for_namuwiki_interval",
+                wait_for_interval,
+            ),
+            patch.object(
+                music_namuwiki,
+                "read_limited_http_response",
+                read_response,
+            ),
+            patch.object(music_namuwiki.urllib.request, "urlopen", urlopen),
+            patch.object(
+                music_namuwiki,
                 "fetch_namuwiki_html_once",
                 return_value=("html", "https://final.test"),
             ) as fetch_html,
@@ -127,7 +168,7 @@ class MusicNamuWikiTransportTests(unittest.TestCase):
         response.geturl.return_value = "https://final.test"
 
         with self.assertRaises(bot.NamuWikiPageBlockedError):
-            music_namuwiki_transport.request_namuwiki_html_once(
+            music_namuwiki.fetch_namuwiki_html_once(
                 "https://page.test",
                 "agent",
                 timeout_seconds=3,
@@ -147,7 +188,7 @@ class MusicNamuWikiTransportTests(unittest.TestCase):
         for status in (404, 410):
             with self.subTest(status=status):
                 self.assertIsNone(
-                    music_namuwiki_transport.request_namuwiki_api_source(
+                    music_namuwiki.fetch_namuwiki_api_source(
                         "Document",
                         urlopen=MagicMock(
                             side_effect=make_http_error(
@@ -164,7 +205,7 @@ class MusicNamuWikiTransportTests(unittest.TestCase):
             bot.NamuWikiLyricsError,
             "NamuWiki API returned HTTP 500",
         ):
-            music_namuwiki_transport.request_namuwiki_api_source(
+            music_namuwiki.fetch_namuwiki_api_source(
                 "Document",
                 api_token="token",
                 api_base_url="https://api.test",
@@ -188,7 +229,7 @@ class MusicNamuWikiTransportTests(unittest.TestCase):
         for status in (404, 410):
             with self.subTest(status=status):
                 self.assertIsNone(
-                    music_namuwiki_transport.request_namuwiki_html_once(
+                    music_namuwiki.fetch_namuwiki_html_once(
                         "https://page.test",
                         "agent",
                         urlopen=MagicMock(
@@ -203,7 +244,7 @@ class MusicNamuWikiTransportTests(unittest.TestCase):
 
     def test_transport_html_403_is_blocked(self) -> None:
         with self.assertRaises(bot.NamuWikiPageBlockedError):
-            music_namuwiki_transport.request_namuwiki_html_once(
+            music_namuwiki.fetch_namuwiki_html_once(
                 "https://page.test",
                 "agent",
                 timeout_seconds=3,

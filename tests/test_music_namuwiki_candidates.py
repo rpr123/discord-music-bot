@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import bot
-import music_namuwiki_matching as music_namuwiki_candidates
+import music_namuwiki as music_namuwiki_candidates
 from music_models import Track
 
 
@@ -40,21 +40,27 @@ class MusicNamuWikiCandidatesTests(unittest.TestCase):
             {
                 "__future__",
                 "collections.abc",
+                "json",
+                "music_config",
                 "music_lyrics_sources",
                 "music_models",
                 "music_namuwiki_parsing",
                 "music_search_scoring",
                 "music_track_metadata",
                 "re",
+                "threading",
+                "time",
                 "unicodedata",
+                "urllib.error",
                 "urllib.parse",
+                "urllib.request",
             },
         )
 
     def test_bot_override_wrapper_reads_current_setting(self) -> None:
         track = make_track()
         with patch.object(
-            bot,
+            music_namuwiki_candidates,
             "NAMUWIKI_DOCUMENT_OVERRIDES",
             {"video:abcdefghijk": "Configured document"},
         ):
@@ -67,11 +73,15 @@ class MusicNamuWikiCandidatesTests(unittest.TestCase):
         track = make_track("Artist - Song (Official Video)")
         with (
             patch.object(
-                bot,
+                music_namuwiki_candidates,
                 "get_namuwiki_override",
                 return_value="Patched document",
             ),
-            patch.object(bot, "NAMUWIKI_MAX_DOCUMENT_CANDIDATES", 1),
+            patch.object(
+                music_namuwiki_candidates,
+                "NAMUWIKI_MAX_DOCUMENT_CANDIDATES",
+                1,
+            ),
         ):
             self.assertEqual(
                 bot.get_namuwiki_document_candidates(track),
@@ -80,7 +90,7 @@ class MusicNamuWikiCandidatesTests(unittest.TestCase):
 
     def test_split_wrapper_reads_current_base_url(self) -> None:
         with patch.object(
-            bot,
+            music_namuwiki_candidates,
             "NAMUWIKI_PAGE_BASE_URL",
             "https://example.test/w",
         ):
