@@ -1925,11 +1925,20 @@ class QueueRemoveSelect(discord.ui.Select):
         state = get_state(self.guild_id)
         removed = remove_queued_track_by_id(state, self.values[0])
         if removed is None:
+            replacement_view = (
+                QueueManageView(self.guild_id) if state.queue else None
+            )
             await interaction.response.edit_message(
                 content="이미 삭제되었거나 찾을 수 없는 곡이에요.",
                 embed=make_queue_embed(state),
-                view=QueueManageView(self.guild_id) if state.queue else None,
+                view=replacement_view,
             )
+            if replacement_view is not None:
+                schedule_queue_message_cleanup(
+                    state,
+                    interaction.message,
+                    EPHEMERAL_RESPONSE_DELETE_SECONDS,
+                )
             return
 
         schedule_autoplay_refill(self.guild_id)

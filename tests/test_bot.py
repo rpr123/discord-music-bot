@@ -7710,6 +7710,115 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             bot.QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
         )
 
+    async def test_stale_single_delete_refreshes_latest_queue_message(self) -> None:
+        stale = make_track("stale")
+        latest = make_track("latest")
+
+        success_state = bot.get_state(991)
+        success_state.queue.extend([stale, latest])
+        success_select = bot.QueueRemoveSelect(991)
+        success_select._values = [stale.track_id]
+        self.assertEqual(success_select.options[0].value, stale.track_id)
+        self.assertIs(
+            bot.remove_queued_track_by_id(success_state, stale.track_id),
+            stale,
+        )
+        success_interaction = MagicMock(message=MagicMock(id=992))
+        operation_order: list[str] = []
+        success_interaction.response.edit_message = AsyncMock(
+            side_effect=lambda **_kwargs: operation_order.append("response")
+        )
+        with patch.object(
+            bot,
+            "schedule_queue_message_cleanup",
+            side_effect=lambda *_args: operation_order.append("cleanup"),
+        ) as schedule_cleanup:
+            await success_select.callback(success_interaction)
+
+        self.assertEqual(operation_order, ["response", "cleanup"])
+        self.assertEqual(list(success_state.queue), [latest])
+        response_kwargs = success_interaction.response.edit_message.await_args.kwargs
+        self.assertEqual(
+            response_kwargs["content"],
+            "이미 삭제되었거나 찾을 수 없는 곡이에요.",
+        )
+        self.assertEqual(
+            response_kwargs["embed"].to_dict(),
+            bot.make_queue_embed(success_state).to_dict(),
+        )
+        replacement_view = response_kwargs["view"]
+        self.assertIsInstance(replacement_view, bot.QueueManageView)
+        replacement_select = next(
+            item
+            for item in replacement_view.children
+            if isinstance(item, bot.QueueRemoveSelect)
+        )
+        self.assertEqual(
+            [option.value for option in replacement_select.options],
+            [latest.track_id],
+        )
+        schedule_cleanup.assert_called_once_with(
+            success_state,
+            success_interaction.message,
+            bot.EPHEMERAL_RESPONSE_DELETE_SECONDS,
+        )
+
+        failure_state = bot.get_state(993)
+        failure_state.queue.extend([stale, latest])
+        failure_select = bot.QueueRemoveSelect(993)
+        failure_select._values = [stale.track_id]
+        self.assertEqual(failure_select.options[0].value, stale.track_id)
+        self.assertIs(
+            bot.remove_queued_track_by_id(failure_state, stale.track_id),
+            stale,
+        )
+        failure_interaction = MagicMock(message=MagicMock(id=994))
+        response = MagicMock(status=500, reason="Internal Server Error")
+        response_error = bot.discord.DiscordServerError(
+            response,
+            "<html>temporary failure</html>",
+        )
+        failure_interaction.response.edit_message = AsyncMock(
+            side_effect=response_error
+        )
+        with patch.object(
+            bot,
+            "schedule_queue_message_cleanup",
+        ) as schedule_cleanup:
+            with self.assertRaises(bot.discord.DiscordServerError) as raised:
+                await failure_select.callback(failure_interaction)
+
+        self.assertIs(raised.exception, response_error)
+        self.assertEqual(list(failure_state.queue), [latest])
+        failure_interaction.response.edit_message.assert_awaited_once()
+        schedule_cleanup.assert_not_called()
+
+        empty_state = bot.get_state(995)
+        empty_state.queue.append(stale)
+        empty_select = bot.QueueRemoveSelect(995)
+        empty_select._values = [stale.track_id]
+        empty_state.queue.clear()
+        empty_interaction = MagicMock(message=MagicMock(id=996))
+        empty_interaction.response.edit_message = AsyncMock()
+        with patch.object(
+            bot,
+            "schedule_queue_message_cleanup",
+        ) as schedule_cleanup:
+            await empty_select.callback(empty_interaction)
+
+        self.assertEqual(list(empty_state.queue), [])
+        empty_kwargs = empty_interaction.response.edit_message.await_args.kwargs
+        self.assertEqual(
+            empty_kwargs["content"],
+            "이미 삭제되었거나 찾을 수 없는 곡이에요.",
+        )
+        self.assertEqual(
+            empty_kwargs["embed"].to_dict(),
+            bot.make_queue_embed(empty_state).to_dict(),
+        )
+        self.assertIsNone(empty_kwargs["view"])
+        schedule_cleanup.assert_not_called()
+
     async def test_single_delete_response_failure_still_refreshes_panel(self) -> None:
         guild_id = 990
         first = make_track("first")
