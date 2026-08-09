@@ -3358,53 +3358,6 @@ class EphemeralResponseTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(message.id, state.queue_cleanup_tasks)
 
 
-class MusicChannelConfigTests(unittest.TestCase):
-    def test_legacy_channel_config_is_migrated_with_control_message_id(self) -> None:
-        original_channels = dict(bot.configured_music_channels)
-        original_messages = dict(bot.configured_control_messages)
-        original_autoplay = dict(bot.configured_autoplay_enabled)
-
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                config_path = Path(temp_dir) / "music_channels.json"
-                config_path.write_text('{"123": 456}\n', encoding="utf-8")
-
-                with (
-                    patch.object(bot, "MUSIC_CHANNELS_FILE", config_path),
-                    patch.object(bot, "MUSIC_CHANNEL_ID", None),
-                ):
-                    bot.load_music_channel_config()
-                    self.assertEqual(bot.get_music_channel_id(123), 456)
-                    self.assertIsNone(bot.get_control_message_id(123))
-                    self.assertFalse(bot.get_autoplay_enabled(123))
-
-                    bot.set_control_message_id(123, 789)
-                    saved = json.loads(config_path.read_text(encoding="utf-8"))
-                    self.assertEqual(
-                        saved["123"],
-                        {"channel_id": 456, "control_message_id": 789},
-                    )
-
-                    bot.set_autoplay_enabled(123, True)
-                    saved = json.loads(config_path.read_text(encoding="utf-8"))
-                    self.assertTrue(saved["123"]["autoplay_enabled"])
-
-                    bot.configured_music_channels.clear()
-                    bot.configured_control_messages.clear()
-                    bot.configured_autoplay_enabled.clear()
-                    bot.load_music_channel_config()
-                    self.assertEqual(bot.get_music_channel_id(123), 456)
-                    self.assertEqual(bot.get_control_message_id(123), 789)
-                    self.assertTrue(bot.get_autoplay_enabled(123))
-        finally:
-            bot.configured_music_channels.clear()
-            bot.configured_music_channels.update(original_channels)
-            bot.configured_control_messages.clear()
-            bot.configured_control_messages.update(original_messages)
-            bot.configured_autoplay_enabled.clear()
-            bot.configured_autoplay_enabled.update(original_autoplay)
-
-
 class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         for state in bot.music_states.values():

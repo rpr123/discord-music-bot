@@ -285,12 +285,24 @@ from music_config import (
     YTDL_PLAYLIST_OPTIONS,
     YTDL_SEARCH_OPTIONS,
     YTDL_WORKER_PATH,
+    clear_control_message_id,
+    configured_autoplay_enabled,
+    configured_control_messages,
+    configured_music_channels,
+    get_autoplay_enabled,
+    get_control_message_id,
+    get_music_channel_id,
     load_env_file,
+    load_music_channel_config,
     logger,
     parse_nonnegative_float_env,
     parse_positive_int_env,
     parse_string_map_env,
     resolve_project_path,
+    save_music_channel_config,
+    set_autoplay_enabled,
+    set_control_message_id,
+    set_music_channel,
 )
 from music_ytdl import (
     YouTubeCircuitOpenError,
@@ -973,9 +985,6 @@ class MusicBot(commands.Bot):
 
 bot = MusicBot(command_prefix="!", intents=intents)
 music_states: dict[int, GuildMusicState] = {}
-configured_music_channels: dict[int, int] = {}
-configured_control_messages: dict[int, int] = {}
-configured_autoplay_enabled: dict[int, bool] = {}
 startup_initialization_lock = asyncio.Lock()
 startup_initialized = False
 commands_synced = False
@@ -1154,134 +1163,6 @@ async def send_queue_management_response(
         message,
         EPHEMERAL_RESPONSE_DELETE_SECONDS,
     )
-
-
-def load_music_channel_config() -> None:
-    if not MUSIC_CHANNELS_FILE.exists():
-        configured_music_channels.clear()
-        configured_control_messages.clear()
-        configured_autoplay_enabled.clear()
-        return
-
-    try:
-        raw_config = json.loads(MUSIC_CHANNELS_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        logger.warning("Could not read %s", MUSIC_CHANNELS_FILE)
-        return
-
-    if not isinstance(raw_config, dict):
-        logger.warning("Ignoring invalid music channel config in %s", MUSIC_CHANNELS_FILE)
-        return
-
-    configured_music_channels.clear()
-    configured_control_messages.clear()
-    configured_autoplay_enabled.clear()
-    for guild_id, value in raw_config.items():
-        if isinstance(value, dict):
-            channel_id = value.get("channel_id")
-            control_message_id = value.get("control_message_id")
-            autoplay_enabled = value.get("autoplay_enabled", False)
-        else:
-            channel_id = value
-            control_message_id = None
-            autoplay_enabled = False
-
-        try:
-            parsed_guild_id = int(guild_id)
-            configured_music_channels[parsed_guild_id] = int(channel_id)
-        except (TypeError, ValueError):
-            logger.warning("Ignoring invalid music channel config for guild %s", guild_id)
-            continue
-
-        if control_message_id is not None:
-            try:
-                configured_control_messages[parsed_guild_id] = int(control_message_id)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "Ignoring invalid control message config for guild %s",
-                    guild_id,
-                )
-
-        if isinstance(autoplay_enabled, bool):
-            if autoplay_enabled:
-                configured_autoplay_enabled[parsed_guild_id] = True
-        else:
-            logger.warning(
-                "Ignoring invalid autoplay config for guild %s",
-                guild_id,
-            )
-
-
-def save_music_channel_config() -> None:
-    raw_config: dict[str, dict[str, int | bool]] = {}
-    for guild_id, channel_id in sorted(configured_music_channels.items()):
-        entry = {"channel_id": channel_id}
-        control_message_id = configured_control_messages.get(guild_id)
-        if control_message_id is not None:
-            entry["control_message_id"] = control_message_id
-        if configured_autoplay_enabled.get(guild_id, False):
-            entry["autoplay_enabled"] = True
-        raw_config[str(guild_id)] = entry
-
-    MUSIC_CHANNELS_FILE.write_text(
-        json.dumps(raw_config, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-
-
-def get_music_channel_id(guild_id: int) -> int | None:
-    if MUSIC_CHANNEL_ID:
-        try:
-            return int(MUSIC_CHANNEL_ID)
-        except ValueError:
-            logger.warning("MUSIC_CHANNEL_ID must be a numeric Discord channel ID")
-            return None
-    return configured_music_channels.get(guild_id)
-
-
-def set_music_channel(guild_id: int, channel_id: int) -> None:
-    if configured_music_channels.get(guild_id) != channel_id:
-        configured_control_messages.pop(guild_id, None)
-    configured_music_channels[guild_id] = channel_id
-    save_music_channel_config()
-
-
-def get_control_message_id(guild_id: int) -> int | None:
-    return configured_control_messages.get(guild_id)
-
-
-def set_control_message_id(guild_id: int, message_id: int) -> None:
-    channel_id = get_music_channel_id(guild_id)
-    if channel_id is None:
-        return
-
-    configured_music_channels.setdefault(guild_id, channel_id)
-    if configured_control_messages.get(guild_id) == message_id:
-        return
-
-    configured_control_messages[guild_id] = message_id
-    save_music_channel_config()
-
-
-def clear_control_message_id(guild_id: int) -> None:
-    if configured_control_messages.pop(guild_id, None) is not None:
-        save_music_channel_config()
-
-
-def get_autoplay_enabled(guild_id: int) -> bool:
-    return configured_autoplay_enabled.get(guild_id, False)
-
-
-def set_autoplay_enabled(guild_id: int, enabled: bool) -> None:
-    channel_id = get_music_channel_id(guild_id)
-    if channel_id is not None:
-        configured_music_channels.setdefault(guild_id, channel_id)
-
-    if enabled:
-        configured_autoplay_enabled[guild_id] = True
-    else:
-        configured_autoplay_enabled.pop(guild_id, None)
-    save_music_channel_config()
 
 
 def make_bulk_embed(tracks: list[Track], title: str) -> discord.Embed:

@@ -1,4 +1,5 @@
 import ast
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,12 +71,24 @@ MOVED_NAMES = (
     "YTDL_PLAYLIST_OPTIONS",
     "YTDL_SEARCH_OPTIONS",
     "YTDL_WORKER_PATH",
+    "clear_control_message_id",
+    "configured_autoplay_enabled",
+    "configured_control_messages",
+    "configured_music_channels",
+    "get_autoplay_enabled",
+    "get_control_message_id",
+    "get_music_channel_id",
     "load_env_file",
+    "load_music_channel_config",
     "logger",
     "parse_nonnegative_float_env",
     "parse_positive_int_env",
     "parse_string_map_env",
     "resolve_project_path",
+    "save_music_channel_config",
+    "set_autoplay_enabled",
+    "set_control_message_id",
+    "set_music_channel",
 )
 
 
@@ -273,3 +286,50 @@ class MusicConfigTests(unittest.TestCase):
                 "options": "-vn",
             },
         )
+
+
+class MusicChannelConfigTests(unittest.TestCase):
+    def test_legacy_channel_config_is_migrated_with_control_message_id(self) -> None:
+        original_channels = dict(music_config.configured_music_channels)
+        original_messages = dict(music_config.configured_control_messages)
+        original_autoplay = dict(music_config.configured_autoplay_enabled)
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "music_channels.json"
+                config_path.write_text('{"123": 456}\n', encoding="utf-8")
+
+                with (
+                    patch.object(music_config, "MUSIC_CHANNELS_FILE", config_path),
+                    patch.object(music_config, "MUSIC_CHANNEL_ID", None),
+                ):
+                    music_config.load_music_channel_config()
+                    self.assertEqual(music_config.get_music_channel_id(123), 456)
+                    self.assertIsNone(music_config.get_control_message_id(123))
+                    self.assertFalse(music_config.get_autoplay_enabled(123))
+
+                    music_config.set_control_message_id(123, 789)
+                    saved = json.loads(config_path.read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        saved["123"],
+                        {"channel_id": 456, "control_message_id": 789},
+                    )
+
+                    music_config.set_autoplay_enabled(123, True)
+                    saved = json.loads(config_path.read_text(encoding="utf-8"))
+                    self.assertTrue(saved["123"]["autoplay_enabled"])
+
+                    music_config.configured_music_channels.clear()
+                    music_config.configured_control_messages.clear()
+                    music_config.configured_autoplay_enabled.clear()
+                    music_config.load_music_channel_config()
+                    self.assertEqual(music_config.get_music_channel_id(123), 456)
+                    self.assertEqual(music_config.get_control_message_id(123), 789)
+                    self.assertTrue(music_config.get_autoplay_enabled(123))
+        finally:
+            music_config.configured_music_channels.clear()
+            music_config.configured_music_channels.update(original_channels)
+            music_config.configured_control_messages.clear()
+            music_config.configured_control_messages.update(original_messages)
+            music_config.configured_autoplay_enabled.clear()
+            music_config.configured_autoplay_enabled.update(original_autoplay)
