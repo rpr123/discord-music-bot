@@ -9198,6 +9198,21 @@ class QueueTests(unittest.TestCase):
 
 
 class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
+    def set_same_voice(
+        self,
+        state: bot.GuildMusicState,
+        *interactions: MagicMock,
+    ) -> MagicMock:
+        channel = MagicMock()
+        voice = MagicMock(channel=channel)
+        voice.is_connected.return_value = True
+        state.voice = voice
+        member = MagicMock()
+        member.voice = MagicMock(channel=channel)
+        for interaction in interactions:
+            interaction.user = member
+        return voice
+
     async def asyncTearDown(self) -> None:
         for state in bot.music_states.values():
             bot.cancel_queue_message_cleanups(state)
@@ -9557,6 +9572,310 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_single_delete_rechecks_voice_after_waiting_for_interaction_lock(
+        self,
+    ) -> None:
+        messages = {
+            "member": "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
+            "disconnect": "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
+            "voice": "재생 상태가 변경되어 조작이 취소됐어요. 다시 시도해 주세요.",
+            "defer-voice": "재생 상태가 변경되어 조작이 취소됐어요. 다시 시도해 주세요.",
+        }
+        for offset, outcome in enumerate(
+            ("member", "disconnect", "voice", "defer-voice")
+        ):
+            with self.subTest(outcome=outcome):
+                guild_id = 1200 + offset
+                state = bot.get_state(guild_id)
+                current = make_track(f"current-{outcome}")
+                tracks = [
+                    make_track(f"first-{outcome}"),
+                    make_track(f"second-{outcome}"),
+                ]
+                state.current = current
+                state.queue.extend(tracks)
+                original_queue = state.queue
+                generation = state.playback_generation
+                channel = MagicMock(id=1300 + offset)
+                voice = MagicMock(channel=channel)
+                voice.is_connected.return_value = True
+                state.voice = voice
+                member_voice = MagicMock(channel=channel)
+                member = MagicMock(voice=member_voice)
+                view = bot.QueueManageView(guild_id)
+                select = next(
+                    item
+                    for item in view.children
+                    if isinstance(item, bot.QueueRemoveSelect)
+                )
+                select._values = [tracks[0].track_id]
+                interaction = MagicMock(
+                    message=MagicMock(id=1400 + offset),
+                    user=member,
+                )
+                deferred = asyncio.Event()
+                replacement_voice = None
+
+                async def defer_response() -> None:
+                    nonlocal replacement_voice
+                    self.assertIs(state.voice, voice)
+                    self.assertEqual(list(state.queue), tracks)
+                    if outcome == "defer-voice":
+                        replacement_channel = MagicMock(id=1500 + offset)
+                        replacement_voice = MagicMock(
+                            channel=replacement_channel
+                        )
+                        replacement_voice.is_connected.return_value = True
+                        voice.is_connected.return_value = False
+                        state.voice = replacement_voice
+                        member_voice.channel = replacement_channel
+                    deferred.set()
+
+                async def send_followup(
+                    _content: str,
+                    **_kwargs: object,
+                ) -> None:
+                    self.assertFalse(select.interaction_lock.locked())
+                    self.assertFalse(state.lock.locked())
+                    return None
+
+                interaction.response.is_done.return_value = False
+                interaction.response.send_message = AsyncMock()
+                interaction.response.defer = AsyncMock(side_effect=defer_response)
+                interaction.edit_original_response = AsyncMock()
+                interaction.followup.send = AsyncMock(side_effect=send_followup)
+                callback_task = None
+                test_holds_lock = False
+                with (
+                    patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+                    patch.object(
+                        bot,
+                        "schedule_queue_message_cleanup",
+                    ) as schedule_cleanup,
+                    patch.object(
+                        bot,
+                        "update_control_panel",
+                        new=AsyncMock(),
+                    ) as update_panel,
+                ):
+                    try:
+                        self.assertTrue(await view.interaction_check(interaction))
+                        interaction.response.send_message.assert_not_awaited()
+                        await asyncio.wait_for(
+                            select.interaction_lock.acquire(),
+                            timeout=1,
+                        )
+                        test_holds_lock = True
+                        callback_task = asyncio.create_task(
+                            select.callback(interaction)
+                        )
+                        await asyncio.wait_for(deferred.wait(), timeout=1)
+                        await asyncio.sleep(0)
+                        self.assertFalse(callback_task.done())
+                        if outcome == "member":
+                            member_voice.channel = None
+                        elif outcome == "disconnect":
+                            voice.is_connected.return_value = False
+                        elif outcome == "voice":
+                            replacement_channel = MagicMock(id=1500 + offset)
+                            replacement_voice = MagicMock(
+                                channel=replacement_channel
+                            )
+                            replacement_voice.is_connected.return_value = True
+                            voice.is_connected.return_value = False
+                            state.voice = replacement_voice
+                            member_voice.channel = replacement_channel
+
+                        select.interaction_lock.release()
+                        test_holds_lock = False
+                        await asyncio.wait_for(callback_task, timeout=1)
+
+                        self.assertIs(state.queue, original_queue)
+                        self.assertEqual(list(state.queue), tracks)
+                        self.assertIs(state.current, current)
+                        self.assertEqual(state.playback_generation, generation)
+                        self.assertFalse(state.stop_requested)
+                        self.assertFalse(view.is_finished())
+                        voice.stop.assert_not_called()
+                        if replacement_voice is not None:
+                            replacement_voice.stop.assert_not_called()
+                        interaction.response.defer.assert_awaited_once_with()
+                        interaction.edit_original_response.assert_not_awaited()
+                        interaction.followup.send.assert_awaited_once_with(
+                            messages[outcome],
+                            ephemeral=True,
+                            wait=True,
+                        )
+                        schedule_refill.assert_not_called()
+                        schedule_cleanup.assert_not_called()
+                        update_panel.assert_not_awaited()
+                    finally:
+                        if test_holds_lock:
+                            select.interaction_lock.release()
+                        if callback_task is not None and not callback_task.done():
+                            callback_task.cancel()
+                        if callback_task is not None:
+                            await asyncio.wait_for(
+                                asyncio.gather(
+                                    callback_task,
+                                    return_exceptions=True,
+                                ),
+                                timeout=1,
+                            )
+                        bot.discord.ui.View.stop(view)
+                        bot.music_states.pop(guild_id, None)
+
+    async def test_range_delete_rechecks_voice_after_waiting_for_state_lock(
+        self,
+    ) -> None:
+        messages = {
+            "member": "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
+            "disconnect": "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
+            "voice": "재생 상태가 변경되어 조작이 취소됐어요. 다시 시도해 주세요.",
+            "defer-voice": "재생 상태가 변경되어 조작이 취소됐어요. 다시 시도해 주세요.",
+        }
+        for offset, outcome in enumerate(
+            ("member", "disconnect", "voice", "defer-voice")
+        ):
+            with self.subTest(outcome=outcome):
+                guild_id = 1210 + offset
+                state = bot.get_state(guild_id)
+                current = make_track(f"range-current-{outcome}")
+                tracks = [
+                    make_track(f"range-{outcome}-{index}")
+                    for index in range(4)
+                ]
+                state.current = current
+                state.queue.extend(tracks)
+                original_queue = state.queue
+                generation = state.playback_generation
+                channel = MagicMock(id=1310 + offset)
+                voice = MagicMock(channel=channel)
+                voice.is_connected.return_value = True
+                state.voice = voice
+                member_voice = MagicMock(channel=channel)
+                member = MagicMock(voice=member_voice)
+                view = bot.QueueRangeDeleteView(guild_id)
+                view.start_track_id = tracks[0].track_id
+                view.end_track_id = tracks[2].track_id
+                view.confirm_button.disabled = False
+                interaction = MagicMock(
+                    message=MagicMock(id=1410 + offset),
+                    user=member,
+                )
+                deferred = asyncio.Event()
+                replacement_voice = None
+
+                async def defer_response() -> None:
+                    nonlocal replacement_voice
+                    self.assertIs(state.voice, voice)
+                    self.assertEqual(list(state.queue), tracks)
+                    if outcome == "defer-voice":
+                        replacement_channel = MagicMock(id=1510 + offset)
+                        replacement_voice = MagicMock(
+                            channel=replacement_channel
+                        )
+                        replacement_voice.is_connected.return_value = True
+                        voice.is_connected.return_value = False
+                        state.voice = replacement_voice
+                        member_voice.channel = replacement_channel
+                    deferred.set()
+
+                async def send_followup(
+                    _content: str,
+                    **_kwargs: object,
+                ) -> None:
+                    self.assertFalse(view.interaction_lock.locked())
+                    self.assertFalse(state.lock.locked())
+                    return None
+
+                interaction.response.is_done.return_value = False
+                interaction.response.send_message = AsyncMock()
+                interaction.response.defer = AsyncMock(side_effect=defer_response)
+                interaction.edit_original_response = AsyncMock()
+                interaction.followup.send = AsyncMock(side_effect=send_followup)
+                callback_task = None
+                test_holds_state_lock = False
+                with (
+                    patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+                    patch.object(
+                        bot,
+                        "schedule_queue_message_cleanup",
+                    ) as schedule_cleanup,
+                    patch.object(
+                        bot,
+                        "update_control_panel",
+                        new=AsyncMock(),
+                    ) as update_panel,
+                ):
+                    try:
+                        self.assertTrue(await view.interaction_check(interaction))
+                        interaction.response.send_message.assert_not_awaited()
+                        await asyncio.wait_for(state.lock.acquire(), timeout=1)
+                        test_holds_state_lock = True
+                        callback_task = asyncio.create_task(
+                            view.confirm_button.callback(interaction)
+                        )
+                        await asyncio.wait_for(deferred.wait(), timeout=1)
+                        for _ in range(10):
+                            if view.interaction_lock.locked():
+                                break
+                            await asyncio.sleep(0)
+                        self.assertTrue(view.interaction_lock.locked())
+                        self.assertFalse(callback_task.done())
+                        if outcome == "member":
+                            member_voice.channel = None
+                        elif outcome == "disconnect":
+                            voice.is_connected.return_value = False
+                        elif outcome == "voice":
+                            replacement_channel = MagicMock(id=1510 + offset)
+                            replacement_voice = MagicMock(
+                                channel=replacement_channel
+                            )
+                            replacement_voice.is_connected.return_value = True
+                            voice.is_connected.return_value = False
+                            state.voice = replacement_voice
+                            member_voice.channel = replacement_channel
+
+                        state.lock.release()
+                        test_holds_state_lock = False
+                        await asyncio.wait_for(callback_task, timeout=1)
+
+                        self.assertIs(state.queue, original_queue)
+                        self.assertEqual(list(state.queue), tracks)
+                        self.assertIs(state.current, current)
+                        self.assertEqual(state.playback_generation, generation)
+                        self.assertFalse(state.stop_requested)
+                        self.assertFalse(view.is_finished())
+                        voice.stop.assert_not_called()
+                        if replacement_voice is not None:
+                            replacement_voice.stop.assert_not_called()
+                        interaction.response.defer.assert_awaited_once_with()
+                        interaction.edit_original_response.assert_not_awaited()
+                        interaction.followup.send.assert_awaited_once_with(
+                            messages[outcome],
+                            ephemeral=True,
+                            wait=True,
+                        )
+                        schedule_refill.assert_not_called()
+                        schedule_cleanup.assert_not_called()
+                        update_panel.assert_not_awaited()
+                    finally:
+                        if test_holds_state_lock:
+                            state.lock.release()
+                        if callback_task is not None and not callback_task.done():
+                            callback_task.cancel()
+                        if callback_task is not None:
+                            await asyncio.wait_for(
+                                asyncio.gather(
+                                    callback_task,
+                                    return_exceptions=True,
+                                ),
+                                timeout=1,
+                            )
+                        bot.discord.ui.View.stop(view)
+                        bot.music_states.pop(guild_id, None)
+
     async def test_range_confirm_cannot_be_revived_by_waiting_boundary(
         self,
     ) -> None:
@@ -9593,6 +9912,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         confirm_interaction.edit_original_response = AsyncMock()
         boundary_interaction.response.defer = AsyncMock(side_effect=defer_boundary)
         boundary_interaction.edit_original_response = AsyncMock()
+        self.set_same_voice(state, confirm_interaction, boundary_interaction)
 
         def record_panel(*_args: object, **_kwargs: object) -> None:
             panel_lock_states.append(view.interaction_lock.locked())
@@ -9688,6 +10008,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         interaction.edit_original_response = AsyncMock()
         interaction.message = MagicMock()
         interaction.message.id = 989
+        self.set_same_voice(state, interaction)
         operation_order: list[str] = []
         cleanup_error = RuntimeError("queue cleanup scheduling failed")
 
@@ -9756,6 +10077,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         interaction = MagicMock()
         interaction.response.defer = AsyncMock()
         interaction.edit_original_response = AsyncMock()
+        self.set_same_voice(state, interaction)
         operation_order: list[str] = []
         response = MagicMock(status=500, reason="Internal Server Error")
         response_error = bot.discord.DiscordServerError(
@@ -9816,6 +10138,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         interaction = MagicMock(message=MagicMock(id=994))
         interaction.response.defer = AsyncMock(side_effect=response_error)
         interaction.edit_original_response = AsyncMock()
+        self.set_same_voice(state, interaction)
 
         with (
             patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
@@ -9861,6 +10184,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         interaction.edit_original_response = AsyncMock(
             side_effect=edit_replacement
         )
+        self.set_same_voice(state, interaction)
 
         with (
             patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
@@ -9906,6 +10230,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         empty_interaction = MagicMock(message=MagicMock(id=996))
         empty_interaction.response.defer = AsyncMock()
         empty_interaction.edit_original_response = AsyncMock()
+        self.set_same_voice(empty_state, empty_interaction)
         with patch.object(
             bot,
             "schedule_queue_message_cleanup",
@@ -9941,6 +10266,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         interaction.edit_original_response = AsyncMock(
             side_effect=response_error
         )
+        self.set_same_voice(state, interaction)
 
         with (
             patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
@@ -9975,6 +10301,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         interaction.response.defer = AsyncMock()
         interaction.edit_original_response = AsyncMock()
         interaction.message = MagicMock(id=991)
+        self.set_same_voice(state, interaction)
 
         with (
             patch.object(bot, "schedule_autoplay_refill"),
@@ -10015,6 +10342,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         success_interaction.edit_original_response = AsyncMock(
             side_effect=lambda **_kwargs: operation_order.append("edit")
         )
+        self.set_same_voice(success_state, success_interaction)
         with patch.object(
             bot,
             "schedule_queue_message_cleanup",
@@ -10074,6 +10402,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         failure_interaction.edit_original_response = AsyncMock(
             side_effect=response_error
         )
+        self.set_same_voice(failure_state, failure_interaction)
         with patch.object(
             bot,
             "schedule_queue_message_cleanup",
@@ -10095,6 +10424,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         empty_interaction = MagicMock(message=MagicMock(id=996))
         empty_interaction.response.defer = AsyncMock()
         empty_interaction.edit_original_response = AsyncMock()
+        self.set_same_voice(empty_state, empty_interaction)
         with patch.object(
             bot,
             "schedule_queue_message_cleanup",
@@ -10144,6 +10474,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             raise response_error
 
         interaction.edit_original_response.side_effect = edit_response
+        self.set_same_voice(state, interaction)
 
         with (
             patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
@@ -10195,6 +10526,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         )
         interaction.response.defer = AsyncMock(side_effect=response_error)
         interaction.edit_original_response = AsyncMock()
+        self.set_same_voice(state, interaction)
 
         with (
             patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
@@ -10277,6 +10609,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             cleanup_lock_states.append(old_select.interaction_lock.locked())
 
         interactions = {name: make_interaction(name) for name in ("A", "B", "C")}
+        self.set_same_voice(state, *interactions.values())
         tasks: list[asyncio.Task[None]] = []
         with (
             patch.object(bot, "schedule_autoplay_refill") as schedule_refill,

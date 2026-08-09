@@ -1928,14 +1928,39 @@ class QueueRemoveSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        state = get_state(self.guild_id)
+        accepted_voice = state.voice
         selected_track_id = self.values[0]
         await interaction.response.defer()
-        state = get_state(self.guild_id)
         refresh_panel = False
+        authorization_error: str | None = None
         try:
             async with self.interaction_lock:
-                removed = remove_queued_track_by_id(state, selected_track_id)
-                if removed is None:
+                if state.voice is not accepted_voice:
+                    authorization_error = (
+                        "재생 상태가 변경되어 조작이 취소됐어요. 다시 시도해 주세요."
+                    )
+                else:
+                    member_channel = getattr(
+                        getattr(interaction.user, "voice", None),
+                        "channel",
+                        None,
+                    )
+                    if (
+                        accepted_voice is None
+                        or not accepted_voice.is_connected()
+                        or member_channel != accepted_voice.channel
+                    ):
+                        authorization_error = (
+                            "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
+                        )
+
+                if authorization_error is None:
+                    removed = remove_queued_track_by_id(state, selected_track_id)
+                else:
+                    removed = None
+
+                if authorization_error is None and removed is None:
                     replacement_view = (
                         QueueManageView(
                             self.guild_id,
@@ -1957,29 +1982,33 @@ class QueueRemoveSelect(discord.ui.Select):
                         )
                     return
 
-                schedule_autoplay_refill(self.guild_id)
-                refresh_panel = state.current is not None
-                replacement_view = (
-                    QueueManageView(
-                        self.guild_id,
-                        interaction_lock=self.interaction_lock,
+                if removed is not None:
+                    schedule_autoplay_refill(self.guild_id)
+                    refresh_panel = state.current is not None
+                    replacement_view = (
+                        QueueManageView(
+                            self.guild_id,
+                            interaction_lock=self.interaction_lock,
+                        )
+                        if state.queue
+                        else None
                     )
-                    if state.queue
-                    else None
-                )
-                await interaction.edit_original_response(
-                    content=f"대기열에서 `{removed.title}`을 삭제했어요.",
-                    embed=make_queue_embed(state),
-                    view=replacement_view,
-                )
-                schedule_queue_message_cleanup(
-                    state,
-                    interaction.message,
-                    QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
-                )
+                    await interaction.edit_original_response(
+                        content=f"대기열에서 `{removed.title}`을 삭제했어요.",
+                        embed=make_queue_embed(state),
+                        view=replacement_view,
+                    )
+                    schedule_queue_message_cleanup(
+                        state,
+                        interaction.message,
+                        QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
+                    )
         finally:
             if refresh_panel:
                 await update_control_panel(self.guild_id, state)
+
+        if authorization_error is not None:
+            await send_ephemeral_followup(interaction, authorization_error)
 
 
 class QueueManageView(discord.ui.View):
@@ -2103,11 +2132,13 @@ class QueueRangeDeleteView(discord.ui.View):
         return await ensure_same_voice_channel(interaction, get_state(self.guild_id))
 
     async def delete_selected_range(self, interaction: discord.Interaction) -> None:
+        state = get_state(self.guild_id)
+        accepted_voice = state.voice
         start_track_id = self.start_track_id
         end_track_id = self.end_track_id
         await interaction.response.defer()
-        state = get_state(self.guild_id)
         refresh_panel = False
+        authorization_error: str | None = None
         try:
             async with self.interaction_lock:
                 if self.is_finished():
@@ -2121,13 +2152,35 @@ class QueueRangeDeleteView(discord.ui.View):
                     return
 
                 async with state.lock:
-                    result = remove_queued_track_range_by_ids(
-                        state,
-                        start_track_id,
-                        end_track_id,
-                    )
+                    if state.voice is not accepted_voice:
+                        authorization_error = (
+                            "재생 상태가 변경되어 조작이 취소됐어요. 다시 시도해 주세요."
+                        )
+                    else:
+                        member_channel = getattr(
+                            getattr(interaction.user, "voice", None),
+                            "channel",
+                            None,
+                        )
+                        if (
+                            accepted_voice is None
+                            or not accepted_voice.is_connected()
+                            or member_channel != accepted_voice.channel
+                        ):
+                            authorization_error = (
+                                "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
+                            )
 
-                if result is None:
+                    if authorization_error is None:
+                        result = remove_queued_track_range_by_ids(
+                            state,
+                            start_track_id,
+                            end_track_id,
+                        )
+                    else:
+                        result = None
+
+                if authorization_error is None and result is None:
                     replacement_view = (
                         QueueRangeDeleteView(self.guild_id)
                         if state.queue
@@ -2150,26 +2203,30 @@ class QueueRangeDeleteView(discord.ui.View):
                         )
                     return
 
-                removed, start_index, end_index = result
-                schedule_autoplay_refill(self.guild_id)
-                refresh_panel = state.current is not None
-                await interaction.edit_original_response(
-                    content=(
-                        f"대기열 {start_index + 1}~{end_index + 1}번, "
-                        f"{len(removed)}곡을 삭제했어요."
-                    ),
-                    embed=make_queue_embed(state),
-                    view=None,
-                )
-                self.stop()
-                schedule_queue_message_cleanup(
-                    state,
-                    interaction.message,
-                    QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
-                )
+                if result is not None:
+                    removed, start_index, end_index = result
+                    schedule_autoplay_refill(self.guild_id)
+                    refresh_panel = state.current is not None
+                    await interaction.edit_original_response(
+                        content=(
+                            f"대기열 {start_index + 1}~{end_index + 1}번, "
+                            f"{len(removed)}곡을 삭제했어요."
+                        ),
+                        embed=make_queue_embed(state),
+                        view=None,
+                    )
+                    self.stop()
+                    schedule_queue_message_cleanup(
+                        state,
+                        interaction.message,
+                        QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
+                    )
         finally:
             if refresh_panel:
                 await update_control_panel(self.guild_id, state)
+
+        if authorization_error is not None:
+            await send_ephemeral_followup(interaction, authorization_error)
 
 
 class MusicControlView(discord.ui.View):
