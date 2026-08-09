@@ -3409,6 +3409,417 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             bot.cancel_autoplay_refill(state)
         bot.music_states.clear()
 
+    def _make_pause_case(self, guild_id: int, action: str):
+        state = bot.get_state(guild_id)
+        state.current = make_track(f"current-{guild_id}")
+        channel = MagicMock(id=7000 + guild_id)
+        flags = {"playing": action == "pause", "paused": action == "resume"}
+        operations: list[str] = []
+        acknowledged = {"done": False}
+        voice = MagicMock(channel=channel)
+        voice.is_connected.return_value = True
+        voice.is_playing.side_effect = lambda: flags["playing"]
+        voice.is_paused.side_effect = lambda: flags["paused"]
+
+        def pause_voice() -> None:
+            operations.append("pause")
+            flags.update(playing=False, paused=True)
+
+        def resume_voice() -> None:
+            operations.append("resume")
+            flags.update(playing=True, paused=False)
+
+        voice.pause.side_effect = pause_voice
+        voice.resume.side_effect = resume_voice
+        state.voice = voice
+        member = MagicMock()
+        member.voice = type("VoiceState", (), {"channel": channel})()
+        interaction = MagicMock(
+            guild_id=guild_id,
+            message=MagicMock(id=8000 + guild_id),
+            user=member,
+        )
+        interaction.response.defer = AsyncMock()
+        interaction.response.is_done.side_effect = lambda: acknowledged["done"]
+        interaction.response.send_message = AsyncMock()
+        interaction.edit_original_response = AsyncMock()
+        interaction.followup.send = AsyncMock(return_value=None)
+        return state, voice, flags, operations, acknowledged, interaction
+
+    async def test_pause_resume_acknowledges_and_revalidates_before_toggle(
+        self,
+    ) -> None:
+        def make_case(guild_id: int, *, paused: bool):
+            action = "resume" if paused else "pause"
+            state, voice, flags, operations, acknowledged, interaction = (
+                self._make_pause_case(guild_id, action)
+            )
+            lock_states: list[bool] = []
+            view = bot.MusicControlView(guild_id)
+            return state, voice, flags, operations, lock_states, acknowledged, interaction, view
+
+        with patch.object(
+            bot,
+            "create_housekeeping_task",
+            side_effect=lambda coroutine: coroutine.close(),
+        ):
+            for guild_id, initial_state, expected_message in (
+                (341, "missing", "봇이 음성 채널에 없어요."),
+                (342, "idle", "지금 재생 중인 곡이 없어요."),
+            ):
+                with self.subTest(initial_state=initial_state):
+                    state, voice, flags, _ops, _locks, _ack, interaction, view = (
+                        make_case(guild_id, paused=False)
+                    )
+                    if initial_state == "missing":
+                        state.voice = None
+                    else:
+                        flags.update(playing=False, paused=False)
+                    await view.pause_resume.callback(interaction)
+                    interaction.response.send_message.assert_awaited_once_with(
+                        expected_message, ephemeral=True
+                    )
+                    interaction.response.defer.assert_not_awaited()
+                    interaction.followup.send.assert_not_awaited()
+                    interaction.edit_original_response.assert_not_awaited()
+                    self.assertEqual(_ops, [])
+                    bot.music_states.pop(guild_id, None)
+
+        for guild_id, initially_paused, expected_action in (
+            (343, False, "pause"),
+            (344, True, "resume"),
+        ):
+            with self.subTest(expected_action=expected_action):
+                state, voice, flags, operations, lock_states, acknowledged, interaction, view = (
+                    make_case(guild_id, paused=initially_paused)
+                )
+
+                async def defer_response() -> None:
+                    operations.append("defer")
+                    lock_states.append(state.control_panel_lock.locked())
+                    voice.pause.assert_not_called()
+                    voice.resume.assert_not_called()
+                    acknowledged["done"] = True
+
+                async def edit_response(**_kwargs: object) -> None:
+                    operations.append("edit")
+                    lock_states.append(state.control_panel_lock.locked())
+
+                interaction.response.defer.side_effect = defer_response
+                interaction.edit_original_response.side_effect = edit_response
+                await view.pause_resume.callback(interaction)
+                self.assertEqual(operations, ["defer", expected_action, "edit"])
+                self.assertEqual(lock_states, [False, True])
+                interaction.response.defer.assert_awaited_once_with()
+                interaction.edit_original_response.assert_awaited_once()
+                interaction.response.send_message.assert_not_awaited()
+                interaction.followup.send.assert_not_awaited()
+                self.assertEqual(
+                    flags,
+                    {"playing": initially_paused, "paused": not initially_paused},
+                )
+                bot.music_states.pop(guild_id, None)
+
+        state, voice, flags, operations, _locks, _ack, interaction, view = (
+            make_case(345, paused=False)
+        )
+        response_error = bot.discord.DiscordServerError(
+            MagicMock(status=500, reason="Internal Server Error"),
+            "<html>temporary failure</html>",
+        )
+        interaction.response.defer.side_effect = response_error
+        with self.assertRaises(bot.discord.DiscordServerError) as raised:
+            await view.pause_resume.callback(interaction)
+        self.assertIs(raised.exception, response_error)
+        self.assertEqual(flags, {"playing": True, "paused": False})
+        self.assertIs(state.voice, voice)
+        self.assertEqual(operations, [])
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.edit_original_response.assert_not_awaited()
+        interaction.response.send_message.assert_not_awaited()
+        interaction.followup.send.assert_not_awaited()
+        bot.music_states.pop(345, None)
+
+        state, voice, flags, operations, lock_states, _ack, interaction, view = (
+            make_case(346, paused=False)
+        )
+        defer_started = asyncio.Event()
+        release_defer = asyncio.Event()
+
+        async def block_defer() -> None:
+            operations.append("defer")
+            lock_states.append(state.control_panel_lock.locked())
+            defer_started.set()
+            await release_defer.wait()
+
+        interaction.response.defer.side_effect = block_defer
+        callback_task = asyncio.create_task(view.pause_resume.callback(interaction))
+        try:
+            await asyncio.wait_for(defer_started.wait(), timeout=1)
+            self.assertEqual(flags, {"playing": True, "paused": False})
+            self.assertEqual(lock_states, [False])
+            callback_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(callback_task, timeout=1)
+
+            self.assertTrue(callback_task.cancelled())
+            self.assertIs(state.voice, voice)
+            voice.pause.assert_not_called()
+            voice.resume.assert_not_called()
+            interaction.edit_original_response.assert_not_awaited()
+            interaction.response.send_message.assert_not_awaited()
+            interaction.followup.send.assert_not_awaited()
+        finally:
+            release_defer.set()
+            callback_task.cancel()
+            await asyncio.gather(callback_task, return_exceptions=True)
+            bot.music_states.pop(346, None)
+
+        for guild_id, changed_state, expected_message in (
+            (347, "moved", "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."),
+            (348, "idle", "지금 재생 중인 곡이 없어요."),
+            (
+                349,
+                "replacement",
+                "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
+            ),
+        ):
+            with self.subTest(changed_state=changed_state):
+                state, voice, flags, operations, lock_states, acknowledged, interaction, view = (
+                    make_case(guild_id, paused=False)
+                )
+                replacement_voice = None
+
+                async def defer_response() -> None:
+                    nonlocal replacement_voice
+                    operations.append("defer")
+                    lock_states.append(state.control_panel_lock.locked())
+                    if changed_state == "moved":
+                        interaction.user.voice.channel = MagicMock(id=9000 + guild_id)
+                    elif changed_state == "idle":
+                        flags.update(playing=False, paused=False)
+                    else:
+                        replacement_voice = MagicMock(
+                            channel=MagicMock(id=9000 + guild_id)
+                        )
+                        replacement_voice.is_connected.return_value = False
+                        state.voice = replacement_voice
+                    acknowledged["done"] = True
+
+                async def send_followup(*_args: object, **_kwargs: object) -> None:
+                    operations.append("followup")
+                    return None
+
+                interaction.response.defer.side_effect = defer_response
+                interaction.followup.send.side_effect = send_followup
+                await view.pause_resume.callback(interaction)
+                self.assertEqual(operations, ["defer", "followup"])
+                self.assertEqual(lock_states, [False])
+                if changed_state == "replacement":
+                    self.assertIs(state.voice, replacement_voice)
+                    replacement_voice.pause.assert_not_called()
+                    replacement_voice.resume.assert_not_called()
+                else:
+                    self.assertIs(state.voice, voice)
+                interaction.response.defer.assert_awaited_once_with()
+                interaction.response.send_message.assert_not_awaited()
+                interaction.edit_original_response.assert_not_awaited()
+                interaction.followup.send.assert_awaited_once_with(
+                    expected_message, ephemeral=True, wait=True
+                )
+                bot.music_states.pop(guild_id, None)
+
+    async def test_slash_pause_resume_acknowledge_and_revalidate_before_toggle(
+        self,
+    ) -> None:
+        def make_case(guild_id: int, action: str):
+            command = bot.pause if action == "pause" else bot.resume
+            return (*self._make_pause_case(guild_id, action), command)
+
+        with patch.object(
+            bot,
+            "create_housekeeping_task",
+            side_effect=lambda coroutine: coroutine.close(),
+        ):
+            for guild_id, action, expected_message in (
+                (358, "pause", "지금 재생 중인 곡이 없어요."),
+                (359, "resume", "일시정지된 곡이 없어요."),
+            ):
+                with self.subTest(action=action, outcome="initial_noop"):
+                    state, voice, flags, _ops, _ack, interaction, command = (
+                        make_case(guild_id, action)
+                    )
+                    flags.update(playing=False, paused=False)
+                    await command.callback(interaction)
+                    interaction.response.send_message.assert_awaited_once_with(
+                        expected_message, ephemeral=True
+                    )
+                    interaction.response.defer.assert_not_awaited()
+                    interaction.followup.send.assert_not_awaited()
+                    self.assertEqual(_ops, [])
+                    bot.music_states.pop(guild_id, None)
+
+        for guild_id, action, success_message in (
+            (350, "pause", "일시정지했어요."),
+            (351, "resume", "다시 재생할게요."),
+        ):
+            with self.subTest(action=action, outcome="success"):
+                state, voice, flags, operations, acknowledged, interaction, command = (
+                    make_case(guild_id, action)
+                )
+
+                async def defer_response(*, ephemeral: bool) -> None:
+                    self.assertTrue(ephemeral)
+                    operations.append("defer")
+                    voice.pause.assert_not_called()
+                    voice.resume.assert_not_called()
+                    acknowledged["done"] = True
+
+                async def send_followup(*_args: object, **_kwargs: object) -> None:
+                    operations.append("followup")
+                    return None
+
+                interaction.response.defer.side_effect = defer_response
+                interaction.followup.send.side_effect = send_followup
+                await command.callback(interaction)
+                self.assertEqual(operations, ["defer", action, "followup"])
+                interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+                interaction.response.send_message.assert_not_awaited()
+                interaction.edit_original_response.assert_not_awaited()
+                interaction.followup.send.assert_awaited_once_with(
+                    success_message, ephemeral=True, wait=True
+                )
+                self.assertEqual(
+                    flags,
+                    {"playing": action == "resume", "paused": action == "pause"},
+                )
+                self.assertIs(state.voice, voice)
+                bot.music_states.pop(guild_id, None)
+
+        state, voice, flags, operations, _ack, interaction, command = make_case(
+            352, "pause"
+        )
+        response_error = bot.discord.DiscordServerError(
+            MagicMock(status=500, reason="Internal Server Error"),
+            "<html>temporary failure</html>",
+        )
+        interaction.response.defer.side_effect = response_error
+        with self.assertRaises(bot.discord.DiscordServerError) as raised:
+            await command.callback(interaction)
+        self.assertIs(raised.exception, response_error)
+        self.assertEqual(flags, {"playing": True, "paused": False})
+        self.assertIs(state.voice, voice)
+        self.assertEqual(operations, [])
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        interaction.response.send_message.assert_not_awaited()
+        interaction.followup.send.assert_not_awaited()
+        bot.music_states.pop(352, None)
+
+        state, voice, flags, operations, _ack, interaction, command = make_case(
+            353, "resume"
+        )
+        defer_started = asyncio.Event()
+        release_defer = asyncio.Event()
+
+        async def block_defer(*, ephemeral: bool) -> None:
+            self.assertTrue(ephemeral)
+            operations.append("defer")
+            defer_started.set()
+            await release_defer.wait()
+
+        interaction.response.defer.side_effect = block_defer
+        callback_task = asyncio.create_task(command.callback(interaction))
+        try:
+            await asyncio.wait_for(defer_started.wait(), timeout=1)
+            self.assertEqual(flags, {"playing": False, "paused": True})
+            callback_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(callback_task, timeout=1)
+
+            self.assertTrue(callback_task.cancelled())
+            self.assertIs(state.voice, voice)
+            interaction.response.send_message.assert_not_awaited()
+            interaction.followup.send.assert_not_awaited()
+            voice.pause.assert_not_called()
+            voice.resume.assert_not_called()
+        finally:
+            release_defer.set()
+            callback_task.cancel()
+            await asyncio.gather(callback_task, return_exceptions=True)
+            bot.music_states.pop(353, None)
+
+        for guild_id, action, changed_state, expected_message in (
+            (
+                354,
+                "pause",
+                "replacement",
+                "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
+            ),
+            (
+                355,
+                "resume",
+                "moved",
+                "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
+            ),
+            (
+                356,
+                "pause",
+                "idle",
+                "지금 재생 중인 곡이 없어요.",
+            ),
+            (357, "pause", "moved", "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."),
+            (
+                360,
+                "resume",
+                "replacement",
+                "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
+            ),
+            (361, "resume", "idle", "일시정지된 곡이 없어요."),
+        ):
+            with self.subTest(action=action, changed_state=changed_state):
+                state, voice, flags, operations, acknowledged, interaction, command = (
+                    make_case(guild_id, action)
+                )
+                replacement_voice = None
+
+                async def defer_response(*, ephemeral: bool) -> None:
+                    nonlocal replacement_voice
+                    self.assertTrue(ephemeral)
+                    operations.append("defer")
+                    if changed_state == "replacement":
+                        replacement_voice = MagicMock(
+                            channel=MagicMock(id=9000 + guild_id)
+                        )
+                        replacement_voice.is_connected.return_value = False
+                        state.voice = replacement_voice
+                    elif changed_state == "moved":
+                        interaction.user.voice.channel = MagicMock(id=9000 + guild_id)
+                    else:
+                        flags.update(playing=False, paused=False)
+                    acknowledged["done"] = True
+
+                async def send_followup(*_args: object, **_kwargs: object) -> None:
+                    operations.append("followup")
+                    return None
+
+                interaction.response.defer.side_effect = defer_response
+                interaction.followup.send.side_effect = send_followup
+                await command.callback(interaction)
+                self.assertEqual(operations, ["defer", "followup"])
+                interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+                interaction.response.send_message.assert_not_awaited()
+                interaction.edit_original_response.assert_not_awaited()
+                interaction.followup.send.assert_awaited_once_with(
+                    expected_message, ephemeral=True, wait=True
+                )
+                if changed_state == "replacement":
+                    self.assertIs(state.voice, replacement_voice)
+                    replacement_voice.pause.assert_not_called()
+                    replacement_voice.resume.assert_not_called()
+                else:
+                    self.assertIs(state.voice, voice)
+                bot.music_states.pop(guild_id, None)
+
     async def test_component_edit_cannot_overwrite_newer_idle_panel(self) -> None:
         guild_id = 320
         playing_edit_started = asyncio.Event()

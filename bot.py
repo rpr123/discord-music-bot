@@ -2250,16 +2250,30 @@ class MusicControlView(discord.ui.View):
     @discord.ui.button(label="재생/일시정지", emoji="⏯️", style=discord.ButtonStyle.secondary, row=0)
     async def pause_resume(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
-        if state.voice is None:
+        voice = state.voice
+        if voice is None:
             await send_ephemeral_response(interaction, "봇이 음성 채널에 없어요.")
             return
-
-        if state.voice.is_paused():
-            state.voice.resume()
-        elif state.voice.is_playing():
-            state.voice.pause()
-        else:
+        if not voice.is_paused() and not voice.is_playing():
             await send_ephemeral_response(interaction, "지금 재생 중인 곡이 없어요.")
+            return
+
+        await interaction.response.defer()
+        if state.voice is not voice:
+            await send_ephemeral_followup(
+                interaction,
+                "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
+            )
+            return
+        if not await ensure_same_voice_channel(interaction, state):
+            return
+
+        if voice.is_paused():
+            voice.resume()
+        elif voice.is_playing():
+            voice.pause()
+        else:
+            await send_ephemeral_followup(interaction, "지금 재생 중인 곡이 없어요.")
             return
 
         await self.edit_panel(interaction)
@@ -5416,12 +5430,26 @@ async def pause(interaction: discord.Interaction) -> None:
     state = get_state(interaction.guild_id)
     if not await ensure_same_voice_channel(interaction, state):
         return
-    if state.voice and state.voice.is_playing():
-        state.voice.pause()
-        await send_ephemeral_response(interaction, "일시정지했어요.")
+    voice = state.voice
+    if voice is None or not voice.is_playing():
+        await send_ephemeral_response(interaction, "지금 재생 중인 곡이 없어요.")
         return
 
-    await send_ephemeral_response(interaction, "지금 재생 중인 곡이 없어요.")
+    await interaction.response.defer(ephemeral=True)
+    if state.voice is not voice:
+        await send_ephemeral_followup(
+            interaction,
+            "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
+        )
+        return
+    if not await ensure_same_voice_channel(interaction, state):
+        return
+    if not voice.is_playing():
+        await send_ephemeral_followup(interaction, "지금 재생 중인 곡이 없어요.")
+        return
+
+    voice.pause()
+    await send_ephemeral_followup(interaction, "일시정지했어요.")
 
 
 @bot.tree.command(name="resume", description="Resume the paused track.")
@@ -5434,12 +5462,26 @@ async def resume(interaction: discord.Interaction) -> None:
     state = get_state(interaction.guild_id)
     if not await ensure_same_voice_channel(interaction, state):
         return
-    if state.voice and state.voice.is_paused():
-        state.voice.resume()
-        await send_ephemeral_response(interaction, "다시 재생할게요.")
+    voice = state.voice
+    if voice is None or not voice.is_paused():
+        await send_ephemeral_response(interaction, "일시정지된 곡이 없어요.")
         return
 
-    await send_ephemeral_response(interaction, "일시정지된 곡이 없어요.")
+    await interaction.response.defer(ephemeral=True)
+    if state.voice is not voice:
+        await send_ephemeral_followup(
+            interaction,
+            "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
+        )
+        return
+    if not await ensure_same_voice_channel(interaction, state):
+        return
+    if not voice.is_paused():
+        await send_ephemeral_followup(interaction, "일시정지된 곡이 없어요.")
+        return
+
+    voice.resume()
+    await send_ephemeral_followup(interaction, "다시 재생할게요.")
 
 
 @bot.tree.command(name="skip", description="Skip the current track.")
