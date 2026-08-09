@@ -2143,7 +2143,8 @@ class MusicControlView(discord.ui.View):
 
     async def edit_panel(self, interaction: discord.Interaction) -> None:
         state = self.get_state()
-        await interaction.response.defer()
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         async with state.control_panel_lock:
             if state.current is None:
                 embed = make_idle_player_embed()
@@ -2245,6 +2246,7 @@ class MusicControlView(discord.ui.View):
         _: discord.ui.Button,
     ) -> None:
         state = self.get_state()
+        await interaction.response.defer()
         state.autoplay_enabled = not state.autoplay_enabled
         set_autoplay_enabled(self.guild_id, state.autoplay_enabled)
         if state.autoplay_enabled:

@@ -3475,6 +3475,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             await record_remote_edit("interaction_response", **kwargs)
 
         interaction.response.defer = AsyncMock(side_effect=defer_response)
+        interaction.response.is_done.return_value = False
         interaction.response.edit_message = AsyncMock()
         interaction.edit_original_response = AsyncMock(
             side_effect=edit_interaction_response
@@ -3582,6 +3583,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         interaction = MagicMock()
         interaction.message = clicked_message
         interaction.response.defer = AsyncMock(side_effect=defer_response)
+        interaction.response.is_done.return_value = False
         interaction.response.edit_message = AsyncMock()
         interaction.edit_original_response = AsyncMock(
             side_effect=edit_clicked_message
@@ -4079,31 +4081,174 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             for item in view.children
             if item.custom_id == bot.AUTOPLAY_BUTTON_CUSTOM_ID
         )
-        interaction = object()
+        enable_interaction = MagicMock()
+        enable_interaction.response.defer = AsyncMock()
 
         with (
             patch.object(bot, "set_autoplay_enabled") as save_setting,
             patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
             patch.object(view, "edit_panel", new=AsyncMock()) as edit_panel,
         ):
-            await button.callback(interaction)
+            await button.callback(enable_interaction)
 
         self.assertTrue(state.autoplay_enabled)
+        enable_interaction.response.defer.assert_awaited_once_with()
         save_setting.assert_called_once_with(guild_id, True)
         schedule_refill.assert_called_once_with(guild_id)
-        edit_panel.assert_awaited_once_with(interaction)
+        edit_panel.assert_awaited_once_with(enable_interaction)
+
+        disable_interaction = MagicMock()
+        disable_interaction.response.defer = AsyncMock()
 
         with (
             patch.object(bot, "set_autoplay_enabled") as save_setting,
             patch.object(bot, "cancel_autoplay_refill") as cancel_refill,
             patch.object(view, "edit_panel", new=AsyncMock()) as edit_panel,
         ):
-            await button.callback(interaction)
+            await button.callback(disable_interaction)
 
         self.assertFalse(state.autoplay_enabled)
+        disable_interaction.response.defer.assert_awaited_once_with()
         save_setting.assert_called_once_with(guild_id, False)
         cancel_refill.assert_called_once_with(state)
-        edit_panel.assert_awaited_once_with(interaction)
+        edit_panel.assert_awaited_once_with(disable_interaction)
+
+    async def test_autoplay_acknowledges_before_persistence_and_mutation(
+        self,
+    ) -> None:
+        guild_id = 445
+        state = bot.get_state(guild_id)
+        state.current = make_track("seed")
+        view = bot.MusicControlView(guild_id)
+        button = next(
+            item
+            for item in view.children
+            if item.custom_id == bot.AUTOPLAY_BUTTON_CUSTOM_ID
+        )
+        acknowledged = False
+        operation_order: list[str] = []
+        edit_lock_states: list[bool] = []
+        interaction = MagicMock()
+
+        async def defer_response() -> None:
+            nonlocal acknowledged
+            self.assertFalse(state.autoplay_enabled)
+            acknowledged = True
+            operation_order.append("defer")
+
+        def persist_setting(requested_guild_id: int, enabled: bool) -> None:
+            self.assertTrue(acknowledged)
+            self.assertEqual((requested_guild_id, enabled), (guild_id, True))
+            operation_order.append("persist")
+
+        def schedule_refill(requested_guild_id: int) -> None:
+            self.assertEqual(requested_guild_id, guild_id)
+            operation_order.append("refill")
+
+        async def edit_response(**_kwargs: object) -> None:
+            edit_lock_states.append(state.control_panel_lock.locked())
+            operation_order.append("edit")
+
+        interaction.response.defer = AsyncMock(side_effect=defer_response)
+        interaction.response.is_done.side_effect = lambda: acknowledged
+        interaction.edit_original_response = AsyncMock(side_effect=edit_response)
+
+        try:
+            with (
+                patch.object(
+                    bot,
+                    "set_autoplay_enabled",
+                    side_effect=persist_setting,
+                ) as save_setting,
+                patch.object(
+                    bot,
+                    "schedule_autoplay_refill",
+                    side_effect=schedule_refill,
+                ) as schedule_autoplay_refill,
+                patch.object(bot, "cancel_autoplay_refill") as cancel_refill,
+            ):
+                await button.callback(interaction)
+
+            self.assertEqual(
+                operation_order,
+                ["defer", "persist", "refill", "edit"],
+            )
+            self.assertTrue(state.autoplay_enabled)
+            interaction.response.defer.assert_awaited_once_with()
+            save_setting.assert_called_once_with(guild_id, True)
+            schedule_autoplay_refill.assert_called_once_with(guild_id)
+            cancel_refill.assert_not_called()
+            interaction.edit_original_response.assert_awaited_once()
+            self.assertEqual(edit_lock_states, [True])
+            edit_kwargs = interaction.edit_original_response.await_args.kwargs
+            self.assertEqual(
+                edit_kwargs["embed"].to_dict(),
+                bot.make_player_embed(state.current, state).to_dict(),
+            )
+            edited_view = edit_kwargs["view"]
+            self.assertIsInstance(edited_view, bot.MusicControlView)
+            self.assertTrue(all(not item.disabled for item in edited_view.children))
+            autoplay_button = next(
+                item
+                for item in edited_view.children
+                if item.custom_id == bot.AUTOPLAY_BUTTON_CUSTOM_ID
+            )
+            self.assertEqual(
+                autoplay_button.style,
+                bot.discord.ButtonStyle.success,
+            )
+
+            failure_guild_id = 446
+            failure_state = bot.get_state(failure_guild_id)
+            failure_state.current = make_track("failure-seed")
+            failure_view = bot.MusicControlView(failure_guild_id)
+            failure_button = next(
+                item
+                for item in failure_view.children
+                if item.custom_id == bot.AUTOPLAY_BUTTON_CUSTOM_ID
+            )
+            failure_response = MagicMock(
+                status=500,
+                reason="Internal Server Error",
+            )
+            response_error = bot.discord.DiscordServerError(
+                failure_response,
+                "<html>temporary failure</html>",
+            )
+            failure_interaction = MagicMock()
+            failure_interaction.response.defer = AsyncMock(
+                side_effect=response_error
+            )
+            failure_interaction.edit_original_response = AsyncMock()
+
+            with (
+                patch.object(bot, "set_autoplay_enabled") as save_setting,
+                patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+                patch.object(bot, "cancel_autoplay_refill") as cancel_refill,
+                self.assertRaises(bot.discord.DiscordServerError) as raised,
+            ):
+                await failure_button.callback(failure_interaction)
+
+            self.assertIs(raised.exception, response_error)
+            self.assertFalse(failure_state.autoplay_enabled)
+            failure_interaction.response.defer.assert_awaited_once_with()
+            save_setting.assert_not_called()
+            schedule_refill.assert_not_called()
+            cancel_refill.assert_not_called()
+            failure_interaction.edit_original_response.assert_not_awaited()
+        finally:
+            for cleanup_guild_id in (guild_id, 446):
+                cleanup_state = bot.music_states.get(cleanup_guild_id)
+                if cleanup_state is None:
+                    continue
+                autoplay_task = cleanup_state.autoplay_task
+                bot.cancel_autoplay_refill(cleanup_state)
+                if autoplay_task is not None:
+                    await asyncio.wait_for(
+                        asyncio.gather(autoplay_task, return_exceptions=True),
+                        timeout=1,
+                    )
+                bot.music_states.pop(cleanup_guild_id, None)
 
 
 class AutoplayTests(unittest.IsolatedAsyncioTestCase):
