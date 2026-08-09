@@ -2525,7 +2525,38 @@ class MusicControlView(discord.ui.View):
     )
     async def repeat(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
+        accepted_voice = state.voice
+        accepted_track = state.current
+        accepted_generation = state.playback_generation
         await interaction.response.defer()
+        if (
+            state.voice is not accepted_voice
+            or self.is_finished()
+            or state.current is not accepted_track
+            or state.playback_generation != accepted_generation
+        ):
+            await send_ephemeral_followup(
+                interaction,
+                "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
+            )
+            return
+
+        member_channel = getattr(
+            getattr(interaction.user, "voice", None),
+            "channel",
+            None,
+        )
+        if (
+            accepted_voice is None
+            or not accepted_voice.is_connected()
+            or member_channel != accepted_voice.channel
+        ):
+            await send_ephemeral_followup(
+                interaction,
+                "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
+            )
+            return
+
         state.repeat_one = not state.repeat_one
         await self.edit_panel(interaction, refresh_canonical=True)
 
@@ -2538,7 +2569,36 @@ class MusicControlView(discord.ui.View):
     )
     async def shuffle(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
+        accepted_voice = state.voice
+        accepted_generation = state.playback_generation
         await interaction.response.defer()
+        if (
+            state.voice is not accepted_voice
+            or self.is_finished()
+            or state.playback_generation != accepted_generation
+        ):
+            await send_ephemeral_followup(
+                interaction,
+                "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
+            )
+            return
+
+        member_channel = getattr(
+            getattr(interaction.user, "voice", None),
+            "channel",
+            None,
+        )
+        if (
+            accepted_voice is None
+            or not accepted_voice.is_connected()
+            or member_channel != accepted_voice.channel
+        ):
+            await send_ephemeral_followup(
+                interaction,
+                "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
+            )
+            return
+
         tracks = list(state.queue)
         random.shuffle(tracks)
         state.queue = deque(tracks)
@@ -2599,7 +2659,44 @@ class MusicControlView(discord.ui.View):
         _: discord.ui.Button,
     ) -> None:
         state = self.get_state()
+        accepted_voice = state.voice
+        accepted_voice_connected = bool(
+            accepted_voice and accepted_voice.is_connected()
+        )
         await interaction.response.defer()
+        if state.voice is not accepted_voice or self.is_finished():
+            await send_ephemeral_followup(
+                interaction,
+                "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
+            )
+            return
+
+        accepted_voice_connected_now = bool(
+            accepted_voice and accepted_voice.is_connected()
+        )
+        member_channel = getattr(
+            getattr(interaction.user, "voice", None),
+            "channel",
+            None,
+        )
+        if accepted_voice_connected or accepted_voice_connected_now:
+            if (
+                not accepted_voice_connected_now
+                or accepted_voice is None
+                or member_channel != accepted_voice.channel
+            ):
+                await send_ephemeral_followup(
+                    interaction,
+                    "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
+                )
+                return
+        elif member_channel is None:
+            await send_ephemeral_followup(
+                interaction,
+                "먼저 음성 채널에 들어가 주세요.",
+            )
+            return
+
         state.autoplay_enabled = not state.autoplay_enabled
         set_autoplay_enabled(self.guild_id, state.autoplay_enabled)
         if state.autoplay_enabled:

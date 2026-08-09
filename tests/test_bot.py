@@ -5399,6 +5399,11 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                     state.queue.extend(queued)
                     channel = MagicMock(id=6000 + guild_id)
                     channel.send = AsyncMock()
+                    voice = MagicMock(channel=channel)
+                    voice.is_connected.return_value = True
+                    state.voice = voice
+                    member = MagicMock()
+                    member.voice = MagicMock(channel=channel)
                     canonical = MagicMock(id=7000 + guild_id, channel=channel)
                     order: list[str] = []
                     lock_states: list[bool] = []
@@ -5428,7 +5433,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                         order.append("shuffle")
                         tracks.reverse()
 
-                    interaction = MagicMock(message=clicked)
+                    interaction = MagicMock(message=clicked, user=member)
                     interaction.response.defer = AsyncMock(side_effect=defer_response)
                     interaction.response.is_done.side_effect = lambda: acknowledged
                     interaction.edit_original_response = AsyncMock(
@@ -5536,6 +5541,288 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 bot.cancel_autoplay_refill(state)
                 bot.cancel_empty_channel_disconnect(state)
                 bot.music_states.pop(guild_id, None)
+
+    async def test_state_buttons_revalidate_voice_after_defer(self) -> None:
+        changed_message = (
+            "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요."
+        )
+        same_channel_message = (
+            "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
+        )
+        enter_channel_message = "먼저 음성 채널에 들어가 주세요."
+        cases = [
+            (action, outcome)
+            for action in ("repeat", "shuffle", "autoplay")
+            for outcome in (
+                "defer-voice",
+                "member",
+                "disconnect",
+                "finished",
+            )
+        ]
+        cases.extend(
+            (
+                ("repeat", "current"),
+                ("repeat", "generation"),
+                ("shuffle", "current-success"),
+                ("shuffle", "generation"),
+                ("autoplay", "current-generation-success"),
+                ("autoplay", "no-voice-member"),
+                ("autoplay", "offline-success"),
+                ("autoplay", "disconnected-connected"),
+                ("autoplay", "disconnected-connected-success"),
+            )
+        )
+
+        async def run_case(guild_id: int, action: str, outcome: str) -> None:
+            state = bot.get_state(guild_id)
+            current = make_track(f"{action}-{outcome}-current")
+            queued = [
+                make_track(f"{action}-{outcome}-{index}")
+                for index in range(3)
+            ]
+            state.current = current
+            state.queue.extend(queued)
+            original_queue = state.queue
+            generation = state.playback_generation
+            member_channel = MagicMock(id=10_000 + guild_id)
+            member_voice = MagicMock(channel=member_channel)
+            member = MagicMock(voice=member_voice)
+            accepted_voice = None
+            if outcome != "no-voice-member":
+                accepted_voice = MagicMock(channel=member_channel)
+                accepted_voice.is_connected.return_value = (
+                    outcome
+                    not in {
+                        "offline-success",
+                        "disconnected-connected",
+                        "disconnected-connected-success",
+                    }
+                )
+                state.voice = accepted_voice
+                if outcome == "offline-success":
+                    accepted_voice.channel = MagicMock(id=10_500 + guild_id)
+
+            panel_channel = MagicMock(id=11_000 + guild_id)
+            panel_channel.send = AsyncMock()
+            canonical = MagicMock(
+                id=12_000 + guild_id,
+                channel=panel_channel,
+            )
+            canonical.edit = AsyncMock()
+            state.control_message = canonical
+            state.announcement_channel = panel_channel
+            view = bot.MusicControlView(guild_id, timeout=180)
+            custom_id = (
+                bot.AUTOPLAY_BUTTON_CUSTOM_ID
+                if action == "autoplay"
+                else f"music:{action}"
+            )
+            button = next(
+                item for item in view.children if item.custom_id == custom_id
+            )
+            clicked = MagicMock(
+                id=canonical.id + 1,
+                channel=panel_channel,
+            )
+            interaction = MagicMock(
+                message=clicked,
+                user=member,
+                data={"custom_id": custom_id},
+            )
+            acknowledged = False
+            defer_completed = asyncio.Event()
+            release_defer = asyncio.Event()
+
+            async def defer_response() -> None:
+                nonlocal acknowledged
+                acknowledged = True
+                defer_completed.set()
+                await release_defer.wait()
+
+            interaction.response.is_done.side_effect = lambda: acknowledged
+            interaction.response.send_message = AsyncMock()
+            interaction.response.defer = AsyncMock(side_effect=defer_response)
+            interaction.edit_original_response = AsyncMock()
+            interaction.followup.send = AsyncMock(return_value=None)
+            callback_task = None
+            replacement_voice = None
+            replacement_current = None
+            with (
+                patch.object(bot, "get_music_channel_id", return_value=None),
+                patch.object(
+                    bot.random,
+                    "shuffle",
+                    side_effect=lambda tracks: tracks.reverse(),
+                ) as shuffle_mock,
+                patch.object(bot, "set_autoplay_enabled") as persist_mock,
+                patch.object(bot, "schedule_autoplay_refill") as refill_mock,
+                patch.object(bot, "cancel_autoplay_refill") as cancel_mock,
+            ):
+                try:
+                    self.assertTrue(await view.interaction_check(interaction))
+                    interaction.response.send_message.assert_not_awaited()
+                    callback_task = asyncio.create_task(
+                        button.callback(interaction)
+                    )
+                    await asyncio.wait_for(defer_completed.wait(), timeout=1)
+                    self.assertFalse(callback_task.done())
+
+                    if outcome == "defer-voice":
+                        replacement_channel = MagicMock(id=13_000 + guild_id)
+                        replacement_voice = MagicMock(
+                            channel=replacement_channel
+                        )
+                        replacement_voice.is_connected.return_value = True
+                        self.assertIsNotNone(accepted_voice)
+                        accepted_voice.is_connected.return_value = False
+                        state.voice = replacement_voice
+                        member_voice.channel = replacement_channel
+                    elif outcome == "member":
+                        member_voice.channel = None
+                    elif outcome == "disconnect":
+                        self.assertIsNotNone(accepted_voice)
+                        accepted_voice.is_connected.return_value = False
+                    elif outcome == "finished":
+                        bot.discord.ui.View.stop(view)
+                    elif outcome in {
+                        "current",
+                        "current-success",
+                        "current-generation-success",
+                    }:
+                        replacement_current = make_track(
+                            f"{action}-replacement-current"
+                        )
+                        state.current = replacement_current
+                        if outcome == "current-generation-success":
+                            state.playback_generation += 1
+                    elif outcome == "generation":
+                        state.playback_generation += 1
+                    elif outcome == "no-voice-member":
+                        member_voice.channel = None
+                    elif outcome == "disconnected-connected":
+                        self.assertIsNotNone(accepted_voice)
+                        accepted_voice.channel = MagicMock(id=14_000 + guild_id)
+                        accepted_voice.is_connected.return_value = True
+                    elif outcome == "disconnected-connected-success":
+                        self.assertIsNotNone(accepted_voice)
+                        accepted_voice.is_connected.return_value = True
+                    else:
+                        self.assertEqual(outcome, "offline-success")
+
+                    release_defer.set()
+                    await asyncio.wait_for(callback_task, timeout=1)
+
+                    interaction.response.defer.assert_awaited_once_with()
+                    if outcome in {
+                        "current-success",
+                        "current-generation-success",
+                        "offline-success",
+                        "disconnected-connected-success",
+                    }:
+                        if outcome in {
+                            "current-success",
+                            "current-generation-success",
+                        }:
+                            self.assertIs(state.current, replacement_current)
+                            self.assertEqual(
+                                state.playback_generation,
+                                generation
+                                + (outcome == "current-generation-success"),
+                            )
+                        else:
+                            self.assertIs(state.current, current)
+                            self.assertEqual(
+                                state.playback_generation,
+                                generation,
+                            )
+                        interaction.followup.send.assert_not_awaited()
+                        interaction.edit_original_response.assert_awaited_once()
+                        canonical.edit.assert_awaited_once()
+                        if action == "repeat":
+                            self.assertTrue(state.repeat_one)
+                            self.assertIs(state.queue, original_queue)
+                            self.assertEqual(list(state.queue), queued)
+                        elif action == "shuffle":
+                            self.assertFalse(state.repeat_one)
+                            self.assertEqual(
+                                list(state.queue),
+                                list(reversed(queued)),
+                            )
+                            shuffle_mock.assert_called_once()
+                        else:
+                            self.assertTrue(state.autoplay_enabled)
+                            persist_mock.assert_called_once_with(guild_id, True)
+                            refill_mock.assert_called_once_with(guild_id)
+                            cancel_mock.assert_not_called()
+                    else:
+                        expected_message = (
+                            changed_message
+                            if outcome
+                            in {
+                                "defer-voice",
+                                "finished",
+                                "current",
+                                "generation",
+                            }
+                            else (
+                                enter_channel_message
+                                if outcome == "no-voice-member"
+                                else same_channel_message
+                            )
+                        )
+                        self.assertIs(
+                            state.current,
+                            replacement_current
+                            if outcome == "current"
+                            else current,
+                        )
+                        self.assertEqual(
+                            state.playback_generation,
+                            generation + (outcome == "generation"),
+                        )
+                        self.assertIs(state.queue, original_queue)
+                        self.assertEqual(list(state.queue), queued)
+                        self.assertFalse(state.repeat_one)
+                        self.assertFalse(state.autoplay_enabled)
+                        interaction.followup.send.assert_awaited_once_with(
+                            expected_message,
+                            ephemeral=True,
+                            wait=True,
+                        )
+                        interaction.edit_original_response.assert_not_awaited()
+                        canonical.edit.assert_not_awaited()
+                        shuffle_mock.assert_not_called()
+                        persist_mock.assert_not_called()
+                        refill_mock.assert_not_called()
+                        cancel_mock.assert_not_called()
+                        if accepted_voice is not None:
+                            accepted_voice.stop.assert_not_called()
+                        if replacement_voice is not None:
+                            replacement_voice.stop.assert_not_called()
+                    panel_channel.send.assert_not_awaited()
+                finally:
+                    release_defer.set()
+                    if callback_task is not None and not callback_task.done():
+                        callback_task.cancel()
+                    if callback_task is not None:
+                        await asyncio.wait_for(
+                            asyncio.gather(
+                                callback_task,
+                                return_exceptions=True,
+                            ),
+                            timeout=1,
+                        )
+                    bot.cancel_autoplay_refill(state)
+                    bot.cancel_empty_channel_disconnect(state)
+                    if state.control_view is not None:
+                        bot.discord.ui.View.stop(state.control_view)
+                    bot.discord.ui.View.stop(view)
+                    bot.music_states.pop(guild_id, None)
+
+        for offset, (action, outcome) in enumerate(cases):
+            with self.subTest(action=action, outcome=outcome):
+                await run_case(350 + offset, action, outcome)
 
     async def test_component_edit_canonical_refresh_contract(self) -> None:
         def make_case(
@@ -6863,7 +7150,9 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             for item in view.children
             if item.custom_id == bot.AUTOPLAY_BUTTON_CUSTOM_ID
         )
-        enable_interaction = MagicMock()
+        member = MagicMock()
+        member.voice = MagicMock(channel=MagicMock())
+        enable_interaction = MagicMock(user=member)
         enable_interaction.response.defer = AsyncMock()
 
         with (
@@ -6882,7 +7171,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             refresh_canonical=True,
         )
 
-        disable_interaction = MagicMock()
+        disable_interaction = MagicMock(user=member)
         disable_interaction.response.defer = AsyncMock()
 
         with (
@@ -6916,7 +7205,9 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         acknowledged = False
         operation_order: list[str] = []
         edit_lock_states: list[bool] = []
-        interaction = MagicMock()
+        member = MagicMock()
+        member.voice = MagicMock(channel=MagicMock())
+        interaction = MagicMock(user=member)
 
         async def defer_response() -> None:
             nonlocal acknowledged
