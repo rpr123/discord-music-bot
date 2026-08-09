@@ -3435,6 +3435,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 custom_ids = [item.custom_id for item in view.children]
                 self.assertEqual(len(custom_ids), 8)
                 self.assertEqual(set(custom_ids), expected_custom_ids)
+                self.assertIsNone(view.timeout)
                 self.assertTrue(view.is_persistent())
         finally:
             for view in views:
@@ -3474,6 +3475,289 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         finally:
             for view in reversed(registered_views):
                 bot.discord.ui.View.stop(view)
+            bot.music_states.pop(guild_id, None)
+
+    async def test_nowplaying_views_are_finite_bound_and_expire_from_view_store(
+        self,
+    ) -> None:
+        guild_id = 8801
+        state = bot.get_state(guild_id)
+        state.current = make_track("finite-nowplaying")
+        message_id = 91_001
+        channel = MagicMock(spec=bot.discord.TextChannel)
+        channel.id = 91_000
+        channel.type = bot.discord.ChannelType.text
+        channel._state = bot.bot._connection
+        partial_message = bot.discord.PartialMessage(
+            channel=channel,
+            id=message_id,
+        )
+        channel.get_partial_message = MagicMock(return_value=partial_message)
+        resource_message = MagicMock(spec=bot.discord.Message)
+        response = SimpleNamespace(
+            message_id=message_id,
+            resource=resource_message,
+        )
+        interaction = MagicMock(
+            channel=channel,
+            channel_id=channel.id,
+            guild_id=guild_id,
+        )
+        interaction.response.send_message = AsyncMock(return_value=response)
+        views: list[bot.MusicControlView] = []
+        view_store = ViewStore(bot.bot._connection)
+        timeout_message = MagicMock()
+        timeout_edits: list[tuple[object, bool, bool]] = []
+        both_expired = asyncio.Event()
+
+        async def edit_expired_message(*, view: object) -> None:
+            timeout_edits.append(
+                (
+                    view,
+                    state.control_panel_lock.locked(),
+                    all(child.disabled for child in view.children),
+                )
+            )
+            message_id = view._cache_key
+            view_store.remove_message_tracking(message_id)
+            if not view.is_finished() and view.is_dispatchable():
+                view_store.add_view(view, message_id)
+            if len(timeout_edits) == 2:
+                both_expired.set()
+
+        timeout_message.edit = AsyncMock(side_effect=edit_expired_message)
+
+        try:
+            await bot.now_playing.callback(interaction)
+            finite_view = interaction.response.send_message.await_args.kwargs["view"]
+            self.assertEqual(finite_view.timeout, 180)
+            self.assertFalse(finite_view.is_persistent())
+            self.assertIs(finite_view.transient_message, partial_message)
+            self.assertIs(partial_message._state, bot.bot._connection)
+            channel.get_partial_message.assert_called_once_with(message_id)
+
+            canonical_view = bot.MusicControlView(guild_id)
+            self.assertIsNone(canonical_view.timeout)
+            self.assertTrue(canonical_view.is_persistent())
+            second_view = bot.MusicControlView(guild_id, timeout=0.01)
+            finite_view.timeout = 0.01
+            views.extend((finite_view, canonical_view, second_view))
+            for offset, view in enumerate((finite_view, second_view)):
+                view.transient_message = timeout_message
+                view_store.add_view(view, message_id + offset)
+
+            self.assertEqual(sum(map(len, view_store._views.values())), 16)
+            self.assertEqual(len(view_store._synced_message_views), 2)
+            expired_results = await asyncio.wait_for(
+                asyncio.gather(finite_view.wait(), second_view.wait()),
+                timeout=1,
+            )
+            self.assertTrue(all(expired_results))
+            await asyncio.wait_for(both_expired.wait(), timeout=1)
+            await asyncio.sleep(0)
+
+            self.assertCountEqual(
+                [entry[0] for entry in timeout_edits],
+                [finite_view, second_view],
+            )
+            self.assertTrue(all(entry[1] for entry in timeout_edits))
+            self.assertTrue(all(entry[2] for entry in timeout_edits))
+            self.assertEqual(timeout_message.edit.await_count, 2)
+            self.assertFalse(view_store._views)
+            self.assertFalse(view_store._synced_message_views)
+
+            error_view = bot.MusicControlView(guild_id, timeout=1)
+            views.append(error_view)
+            error_message = MagicMock()
+            response = MagicMock(status=500, reason="Internal Server Error")
+            timeout_error = bot.discord.DiscordServerError(
+                response,
+                "<html>expired panel failure</html>",
+            )
+            error_message.edit = AsyncMock(side_effect=timeout_error)
+            error_view.transient_message = error_message
+            with patch.object(bot, "log_discord_http_error") as log_http_error:
+                await error_view.on_timeout()
+            error_message.edit.assert_awaited_once_with(view=error_view)
+            log_http_error.assert_called_once_with(
+                "disabling an expired nowplaying panel",
+                timeout_error,
+            )
+        finally:
+            for view in reversed(views):
+                bot.discord.ui.View.stop(view)
+            bot.music_states.pop(guild_id, None)
+
+    async def test_finite_nowplaying_view_reuses_self_and_serializes_timeout(
+        self,
+    ) -> None:
+        guild_id = 8802
+        state = bot.get_state(guild_id)
+        state.current = make_track("racing-nowplaying")
+        view = bot.MusicControlView(guild_id, timeout=10)
+        view_store = ViewStore(bot.bot._connection)
+        message_id = 92_001
+        component_message = MagicMock(id=message_id)
+        interaction = MagicMock(
+            data={"custom_id": "music:repeat"},
+            message=component_message,
+        )
+        interaction.response.is_done.return_value = True
+        interaction.response.defer = AsyncMock()
+        reset_lock_states: list[bool] = []
+        reset_rendered_views: list[object] = []
+
+        async def reset_view_store(**kwargs: object) -> None:
+            rendered_view = kwargs["view"]
+            reset_lock_states.append(state.control_panel_lock.locked())
+            reset_rendered_views.append(rendered_view)
+            view_store.add_view(rendered_view, message_id)
+
+        interaction.edit_original_response = AsyncMock(
+            side_effect=reset_view_store
+        )
+        late_before_lock = asyncio.Event()
+        is_done_calls = 0
+
+        def response_is_done() -> bool:
+            nonlocal is_done_calls
+            is_done_calls += 1
+            if is_done_calls == 2:
+                late_before_lock.set()
+            return True
+
+        rest_started = asyncio.Event()
+        release_rest = asyncio.Event()
+        timeout_entered = asyncio.Event()
+        timeout_done = asyncio.Event()
+        order: list[str] = []
+        lock_states: list[bool] = []
+        remote_disabled: list[bool] = []
+        rest_views: list[object] = []
+        callback_tasks: list[asyncio.Task] = []
+
+        async def edit_transient(**kwargs: object) -> None:
+            rendered_view = kwargs["view"]
+            rest_views.append(rendered_view)
+            order.append("rest-start")
+            lock_states.append(state.control_panel_lock.locked())
+            rest_started.set()
+            await release_rest.wait()
+            remote_disabled.append(
+                all(child.disabled for child in rendered_view.children)
+            )
+            order.append("rest-finish")
+            if not rendered_view.is_finished() and rendered_view.is_dispatchable():
+                view_store.add_view(rendered_view, message_id)
+
+        timeout_message = MagicMock(id=message_id)
+
+        async def edit_timeout_message(*, view: object) -> None:
+            order.append("timeout")
+            lock_states.append(state.control_panel_lock.locked())
+            remote_disabled.append(all(child.disabled for child in view.children))
+            view_store.remove_message_tracking(message_id)
+            if not view.is_finished() and view.is_dispatchable():
+                view_store.add_view(view, message_id)
+
+        timeout_message.edit = AsyncMock(side_effect=edit_timeout_message)
+        original_on_timeout = view.on_timeout
+
+        async def observe_timeout() -> None:
+            timeout_entered.set()
+            try:
+                await original_on_timeout()
+            finally:
+                timeout_done.set()
+
+        view.on_timeout = observe_timeout
+
+        try:
+            view_store.add_view(view, message_id)
+            first_expiry = view._BaseView__timeout_expiry
+
+            async def assert_rebound_before_check(
+                checked_interaction: object,
+                checked_state: object,
+            ) -> bool:
+                self.assertIs(checked_interaction, interaction)
+                self.assertIs(checked_state, state)
+                self.assertIs(view.transient_message, component_message)
+                return True
+
+            with patch.object(
+                bot,
+                "ensure_same_voice_channel",
+                side_effect=assert_rebound_before_check,
+            ):
+                self.assertTrue(
+                    await view.interaction_check(interaction)
+                )
+            await asyncio.sleep(0)
+            await view.edit_panel(interaction)
+            second_expiry = view._BaseView__timeout_expiry
+
+            self.assertEqual(reset_rendered_views, [view])
+            self.assertEqual(reset_lock_states, [True])
+            self.assertGreater(second_expiry, first_expiry)
+            self.assertEqual(len(view_store._views[message_id]), 8)
+            self.assertIs(
+                view_store._synced_message_views[message_id],
+                view,
+            )
+            self.assertTrue(
+                all(
+                    item.view is view
+                    for item in view_store._views[message_id].values()
+                )
+            )
+
+            interaction.edit_original_response.reset_mock()
+            interaction.edit_original_response.side_effect = edit_transient
+            interaction.response.is_done.side_effect = response_is_done
+            view.timeout = 0.05
+            view.transient_message = timeout_message
+            view_store.add_view(view, message_id)
+            first_task = asyncio.create_task(
+                view.edit_panel(interaction)
+            )
+            callback_tasks.append(first_task)
+            await asyncio.wait_for(rest_started.wait(), timeout=1)
+            late_task = asyncio.create_task(
+                view.edit_panel(interaction)
+            )
+            callback_tasks.append(late_task)
+            await asyncio.wait_for(late_before_lock.wait(), timeout=1)
+            await asyncio.wait_for(view.wait(), timeout=1)
+            await asyncio.wait_for(timeout_entered.wait(), timeout=1)
+            release_rest.set()
+            await asyncio.wait_for(
+                asyncio.gather(first_task, late_task),
+                timeout=1,
+            )
+            await asyncio.wait_for(timeout_done.wait(), timeout=1)
+
+            self.assertEqual(is_done_calls, 2)
+            self.assertEqual(rest_views, [view])
+            self.assertEqual(order, ["rest-start", "rest-finish", "timeout"])
+            self.assertEqual(lock_states, [True, True])
+            self.assertEqual(remote_disabled, [False, True])
+            interaction.edit_original_response.assert_awaited_once()
+            timeout_message.edit.assert_awaited_once_with(view=view)
+            self.assertTrue(view.is_finished())
+            self.assertTrue(all(child.disabled for child in view.children))
+            self.assertNotIn(message_id, view_store._views)
+            self.assertNotIn(message_id, view_store._synced_message_views)
+        finally:
+            release_rest.set()
+            for task in callback_tasks:
+                if not task.done():
+                    task.cancel()
+            if callback_tasks:
+                await asyncio.gather(*callback_tasks, return_exceptions=True)
+            if timeout_entered.is_set() and not timeout_done.is_set():
+                await asyncio.wait_for(timeout_done.wait(), timeout=1)
+            bot.discord.ui.View.stop(view)
             bot.music_states.pop(guild_id, None)
 
     def _make_pause_case(self, guild_id: int, action: str):

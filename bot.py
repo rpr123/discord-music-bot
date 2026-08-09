@@ -2173,10 +2173,24 @@ class QueueRangeDeleteView(discord.ui.View):
 
 
 class MusicControlView(discord.ui.View):
-    def __init__(self, guild_id: int, *, disabled: bool = False):
-        super().__init__(timeout=None)
+    def __init__(
+        self,
+        guild_id: int,
+        *,
+        disabled: bool = False,
+        timeout: float | None = None,
+    ):
+        super().__init__(timeout=timeout)
         self.guild_id = guild_id
-        state = get_state(guild_id)
+        self.transient_message: discord.Message | discord.PartialMessage | None = None
+        self._sync_buttons(get_state(guild_id), disabled=disabled)
+
+    def _sync_buttons(
+        self,
+        state: GuildMusicState,
+        *,
+        disabled: bool,
+    ) -> None:
         for child in self.children:
             if not isinstance(child, discord.ui.Button):
                 continue
@@ -2187,13 +2201,19 @@ class MusicControlView(discord.ui.View):
                     if state.autoplay_enabled
                     else discord.ButtonStyle.secondary
                 )
-            elif disabled:
-                child.disabled = True
+                child.disabled = False
+            else:
+                child.disabled = disabled
 
     def get_state(self) -> GuildMusicState:
         return get_state(self.guild_id)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.timeout is not None and interaction.message is not None:
+            # Component interaction messages use the bot HTTP state, so they
+            # remain editable after the interaction token expires.
+            self.transient_message = interaction.message
+
         custom_id = (interaction.data or {}).get("custom_id")
         if custom_id == AUTOPLAY_BUTTON_CUSTOM_ID:
             state = self.get_state()
@@ -2229,12 +2249,22 @@ class MusicControlView(discord.ui.View):
             if not interaction.response.is_done():
                 await interaction.response.defer()
             async with state.control_panel_lock:
+                if self.timeout is not None and self.is_finished():
+                    return
                 if state.current is None:
                     embed = make_idle_player_embed()
-                    view = MusicControlView(self.guild_id, disabled=True)
+                    if self.timeout is None:
+                        view = MusicControlView(self.guild_id, disabled=True)
+                    else:
+                        self._sync_buttons(state, disabled=True)
+                        view = self
                 else:
                     embed = make_player_embed(state.current, state)
-                    view = MusicControlView(self.guild_id)
+                    if self.timeout is None:
+                        view = MusicControlView(self.guild_id)
+                    else:
+                        self._sync_buttons(state, disabled=False)
+                        view = self
                 await interaction.edit_original_response(embed=embed, view=view)
             clicked_panel_updated = True
         finally:
@@ -2246,6 +2276,30 @@ class MusicControlView(discord.ui.View):
                 )
                 if not clicked_panel_updated or not clicked_is_current:
                     await update_control_panel(self.guild_id, state)
+
+    async def on_timeout(self) -> None:
+        if bot_shutdown_started:
+            return
+
+        message = self.transient_message
+        state = music_states.get(self.guild_id)
+        if message is None or state is None:
+            return
+
+        async with state.control_panel_lock:
+            self._sync_buttons(state, disabled=state.current is None)
+            for child in self.children:
+                if isinstance(child, discord.ui.Button):
+                    child.disabled = True
+            try:
+                await message.edit(view=self)
+            except discord.NotFound:
+                pass
+            except discord.HTTPException as error:
+                log_discord_http_error(
+                    "disabling an expired nowplaying panel",
+                    error,
+                )
 
     @discord.ui.button(
         label="재생/일시정지",
@@ -5711,10 +5765,30 @@ async def now_playing(interaction: discord.Interaction) -> None:
 
     state = get_state(interaction.guild_id)
     if state.current:
-        await interaction.response.send_message(
+        view = MusicControlView(interaction.guild_id, timeout=180)
+        response = await interaction.response.send_message(
             embed=make_player_embed(state.current, state),
-            view=MusicControlView(interaction.guild_id),
+            view=view,
         )
+        message_id = getattr(response, "message_id", None)
+        if message_id is not None:
+            channel = interaction.channel
+            get_partial_message = getattr(channel, "get_partial_message", None)
+            if not callable(get_partial_message):
+                channel_id = getattr(interaction, "channel_id", None)
+                if channel_id is not None:
+                    channel = bot.get_partial_messageable(channel_id)
+                    get_partial_message = getattr(
+                        channel,
+                        "get_partial_message",
+                        None,
+                    )
+            if callable(get_partial_message):
+                view.transient_message = get_partial_message(message_id)
+        if view.transient_message is None:
+            resource = getattr(response, "resource", None)
+            if isinstance(resource, discord.Message):
+                view.transient_message = resource
         return
 
     await send_ephemeral_response(interaction, "지금 재생 중인 곡이 없어요.")
