@@ -2281,13 +2281,48 @@ class MusicControlView(discord.ui.View):
     @discord.ui.button(label="스킵", emoji="⏭️", style=discord.ButtonStyle.primary, row=0)
     async def skip(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
-        if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
-            state.skip_requested = True
-            state.voice.stop()
-            await send_ephemeral_response(interaction, "다음 곡으로 넘어갈게요.")
+        voice = state.voice
+        track = state.current
+        generation = state.playback_generation
+        if (
+            voice is None
+            or track is None
+            or not (voice.is_playing() or voice.is_paused())
+        ):
+            await send_ephemeral_response(interaction, "스킵할 곡이 없어요.")
             return
 
-        await send_ephemeral_response(interaction, "스킵할 곡이 없어요.")
+        await interaction.response.defer()
+        if (
+            state.voice is not voice
+            or state.current is not track
+            or state.playback_generation != generation
+        ):
+            await send_ephemeral_followup(
+                interaction,
+                "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
+            )
+            return
+
+        member_channel = getattr(
+            getattr(interaction.user, "voice", None),
+            "channel",
+            None,
+        )
+        if not voice.is_connected() or member_channel != voice.channel:
+            await send_ephemeral_followup(
+                interaction,
+                "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
+            )
+            return
+
+        if not (voice.is_playing() or voice.is_paused()):
+            await send_ephemeral_followup(interaction, "스킵할 곡이 없어요.")
+            return
+
+        state.skip_requested = True
+        voice.stop()
+        await send_ephemeral_followup(interaction, "다음 곡으로 넘어갈게요.")
 
     @discord.ui.button(label="정지", emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
     async def stop(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -5494,13 +5529,47 @@ async def skip(interaction: discord.Interaction) -> None:
     state = get_state(interaction.guild_id)
     if not await ensure_same_voice_channel(interaction, state):
         return
-    if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
-        state.skip_requested = True
-        state.voice.stop()
-        await interaction.response.send_message("다음 곡으로 넘어갈게요.")
+
+    voice = state.voice
+    track = state.current
+    generation = state.playback_generation
+    if (
+        voice is None
+        or track is None
+        or not (voice.is_playing() or voice.is_paused())
+    ):
+        await send_ephemeral_response(interaction, "스킵할 곡이 없어요.")
         return
 
-    await send_ephemeral_response(interaction, "스킵할 곡이 없어요.")
+    await interaction.response.defer()
+    if (
+        state.voice is not voice
+        or state.current is not track
+        or state.playback_generation != generation
+    ):
+        await interaction.edit_original_response(
+            content="재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요."
+        )
+        return
+
+    member_channel = getattr(
+        getattr(interaction.user, "voice", None),
+        "channel",
+        None,
+    )
+    if not voice.is_connected() or member_channel != voice.channel:
+        await interaction.edit_original_response(
+            content="봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
+        )
+        return
+
+    if not (voice.is_playing() or voice.is_paused()):
+        await interaction.edit_original_response(content="스킵할 곡이 없어요.")
+        return
+
+    state.skip_requested = True
+    voice.stop()
+    await interaction.edit_original_response(content="다음 곡으로 넘어갈게요.")
 
 
 @bot.tree.command(name="stop", description="Stop playback and clear the queue.")

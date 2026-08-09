@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from discord.ui.view import ViewStore
@@ -3445,6 +3446,310 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         interaction.edit_original_response = AsyncMock()
         interaction.followup.send = AsyncMock(return_value=None)
         return state, voice, flags, operations, acknowledged, interaction
+
+    def _make_skip_case(self, guild_id: int) -> SimpleNamespace:
+        state = bot.get_state(guild_id)
+        track = make_track(f"skip-{guild_id}")
+        state.current = track
+        state.playback_generation = 7
+        state.skip_requested = False
+        channel = MagicMock(id=9000 + guild_id)
+        flags = {"connected": True, "playing": True, "paused": False}
+        operations: list[str] = []
+        acknowledged = {"done": False}
+        voice = MagicMock(channel=channel)
+        voice.is_connected.side_effect = lambda: flags["connected"]
+        voice.is_playing.side_effect = lambda: flags["playing"]
+        voice.is_paused.side_effect = lambda: flags["paused"]
+
+        def stop_voice() -> None:
+            operations.append(f"stop:{state.skip_requested}")
+
+        voice.stop.side_effect = stop_voice
+        state.voice = voice
+        member = MagicMock()
+        member.voice = type("VoiceState", (), {"channel": channel})()
+        interaction = MagicMock(
+            data={"custom_id": "skip-contract"},
+            guild_id=guild_id,
+            message=MagicMock(id=10000 + guild_id),
+            user=member,
+        )
+        interaction.response.defer = AsyncMock()
+        interaction.response.is_done.side_effect = lambda: acknowledged["done"]
+        interaction.response.send_message = AsyncMock()
+        interaction.edit_original_response = AsyncMock()
+        interaction.followup.send = AsyncMock(return_value=None)
+        return SimpleNamespace(
+            state=state,
+            track=track,
+            voice=voice,
+            flags=flags,
+            operations=operations,
+            acknowledged=acknowledged,
+            interaction=interaction,
+            view=bot.MusicControlView(guild_id),
+        )
+
+    async def _assert_skip_contract(
+        self,
+        *,
+        component: bool,
+        first_guild_id: int,
+    ) -> None:
+        next_guild_id = first_guild_id
+
+        def make_case() -> SimpleNamespace:
+            nonlocal next_guild_id
+            case = self._make_skip_case(next_guild_id)
+            next_guild_id += 1
+            return case
+
+        async def invoke(case: SimpleNamespace, *, check: bool = True) -> None:
+            if component:
+                if check:
+                    self.assertTrue(
+                        await case.view.interaction_check(case.interaction)
+                    )
+                await case.view.skip.callback(case.interaction)
+            else:
+                await bot.skip.callback(case.interaction)
+
+        def set_final_response(case: SimpleNamespace, side_effect) -> None:
+            if component:
+                case.interaction.followup.send.side_effect = side_effect
+            else:
+                case.interaction.edit_original_response.side_effect = side_effect
+
+        def assert_feedback(case: SimpleNamespace, content: str) -> None:
+            case.interaction.response.send_message.assert_not_awaited()
+            if component:
+                case.interaction.followup.send.assert_awaited_once_with(
+                    content, ephemeral=True, wait=True
+                )
+                case.interaction.edit_original_response.assert_not_awaited()
+            else:
+                case.interaction.edit_original_response.assert_awaited_once_with(
+                    content=content
+                )
+                case.interaction.followup.send.assert_not_awaited()
+
+        with patch.object(
+            bot,
+            "create_housekeeping_task",
+            side_effect=lambda coroutine: coroutine.close(),
+        ):
+            for initial_state in ("voice", "track", "idle"):
+                with self.subTest(component=component, initial_state=initial_state):
+                    case = make_case()
+                    if initial_state == "voice":
+                        case.state.voice = None
+                    elif initial_state == "track":
+                        case.state.current = None
+                    else:
+                        case.flags.update(playing=False, paused=False)
+                    await invoke(case, check=False)
+                    expected_message = (
+                        "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
+                        if not component and initial_state == "voice"
+                        else "스킵할 곡이 없어요."
+                    )
+                    case.interaction.response.send_message.assert_awaited_once_with(
+                        expected_message, ephemeral=True
+                    )
+                    case.interaction.response.defer.assert_not_awaited()
+                    case.interaction.followup.send.assert_not_awaited()
+                    case.interaction.edit_original_response.assert_not_awaited()
+                    self.assertFalse(case.state.skip_requested)
+                    case.voice.stop.assert_not_called()
+                    bot.music_states.pop(case.interaction.guild_id, None)
+
+        case = make_case()
+
+        async def acknowledge() -> None:
+            case.operations.append("defer")
+            self.assertFalse(case.state.skip_requested)
+            case.voice.stop.assert_not_called()
+            case.acknowledged["done"] = True
+
+        async def finish_response(*_args: object, **_kwargs: object) -> None:
+            case.operations.append("response")
+            return None
+
+        case.interaction.response.defer.side_effect = acknowledge
+        set_final_response(case, finish_response)
+        await invoke(case)
+        self.assertEqual(case.operations, ["defer", "stop:True", "response"])
+        self.assertTrue(case.state.skip_requested)
+        case.voice.stop.assert_called_once_with()
+        case.interaction.response.defer.assert_awaited_once_with()
+        assert_feedback(case, "다음 곡으로 넘어갈게요.")
+        bot.music_states.pop(case.interaction.guild_id, None)
+
+        case = make_case()
+        defer_error = bot.discord.DiscordServerError(
+            MagicMock(status=500, reason="Internal Server Error"),
+            "<html>skip defer failure</html>",
+        )
+        case.interaction.response.defer.side_effect = defer_error
+        with self.assertRaises(bot.discord.DiscordServerError) as raised:
+            await invoke(case)
+        self.assertIs(raised.exception, defer_error)
+        self.assertFalse(case.state.skip_requested)
+        case.voice.stop.assert_not_called()
+        case.interaction.followup.send.assert_not_awaited()
+        case.interaction.edit_original_response.assert_not_awaited()
+        bot.music_states.pop(case.interaction.guild_id, None)
+
+        case = make_case()
+        defer_started = asyncio.Event()
+        release_defer = asyncio.Event()
+
+        async def block_defer() -> None:
+            defer_started.set()
+            await release_defer.wait()
+
+        case.interaction.response.defer.side_effect = block_defer
+        callback_task = asyncio.create_task(invoke(case))
+        try:
+            await asyncio.wait_for(defer_started.wait(), timeout=1)
+            self.assertFalse(case.state.skip_requested)
+            case.voice.stop.assert_not_called()
+            callback_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(callback_task, timeout=1)
+            self.assertTrue(callback_task.cancelled())
+            case.interaction.followup.send.assert_not_awaited()
+            case.interaction.edit_original_response.assert_not_awaited()
+        finally:
+            release_defer.set()
+            callback_task.cancel()
+            await asyncio.gather(callback_task, return_exceptions=True)
+            bot.music_states.pop(case.interaction.guild_id, None)
+
+        changed_message = "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요."
+        same_channel_message = "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
+        for changed_state, expected_message in (
+            ("voice", changed_message),
+            ("track", changed_message),
+            ("generation", changed_message),
+            ("member", same_channel_message),
+            ("disconnected", same_channel_message),
+            ("idle", "스킵할 곡이 없어요."),
+        ):
+            with self.subTest(component=component, changed_state=changed_state):
+                case = make_case()
+                replacement_voice = None
+
+                async def change_during_defer() -> None:
+                    nonlocal replacement_voice
+                    case.operations.append("defer")
+                    self.assertFalse(case.state.skip_requested)
+                    case.voice.stop.assert_not_called()
+                    if changed_state == "voice":
+                        replacement_voice = MagicMock(
+                            channel=MagicMock(id=20000 + case.interaction.guild_id)
+                        )
+                        replacement_voice.is_connected.return_value = False
+                        case.flags["connected"] = False
+                        case.state.voice = replacement_voice
+                    elif changed_state == "track":
+                        case.state.current = make_track("replacement-skip")
+                    elif changed_state == "generation":
+                        case.state.playback_generation += 1
+                    elif changed_state == "member":
+                        case.interaction.user.voice.channel = None
+                    elif changed_state == "disconnected":
+                        case.flags["connected"] = False
+                    else:
+                        case.flags.update(playing=False, paused=False)
+                    case.acknowledged["done"] = True
+
+                async def record_response(
+                    *_args: object,
+                    **_kwargs: object,
+                ) -> None:
+                    case.operations.append("response")
+                    return None
+
+                case.interaction.response.defer.side_effect = change_during_defer
+                set_final_response(case, record_response)
+                await invoke(case)
+                self.assertEqual(case.operations, ["defer", "response"])
+                self.assertFalse(case.state.skip_requested)
+                case.voice.stop.assert_not_called()
+                if replacement_voice is not None:
+                    replacement_voice.stop.assert_not_called()
+                case.interaction.response.defer.assert_awaited_once_with()
+                assert_feedback(case, expected_message)
+                bot.music_states.pop(case.interaction.guild_id, None)
+
+        case = make_case()
+        response_error = bot.discord.DiscordServerError(
+            MagicMock(status=500, reason="Internal Server Error"),
+            "<html>skip final response failure</html>",
+        )
+
+        async def acknowledge_final_failure() -> None:
+            case.operations.append("defer")
+            case.acknowledged["done"] = True
+
+        async def fail_final_response(*_args: object, **_kwargs: object) -> None:
+            case.operations.append("response")
+            raise response_error
+
+        case.interaction.response.defer.side_effect = acknowledge_final_failure
+        set_final_response(case, fail_final_response)
+        with self.assertRaises(bot.discord.DiscordServerError) as raised:
+            await invoke(case)
+        self.assertIs(raised.exception, response_error)
+        self.assertEqual(case.operations, ["defer", "stop:True", "response"])
+        self.assertTrue(case.state.skip_requested)
+        case.voice.stop.assert_called_once_with()
+        assert_feedback(case, "다음 곡으로 넘어갈게요.")
+        bot.music_states.pop(case.interaction.guild_id, None)
+
+        case = make_case()
+        response_started = asyncio.Event()
+        release_response = asyncio.Event()
+
+        async def acknowledge_final_cancel() -> None:
+            case.operations.append("defer")
+            case.acknowledged["done"] = True
+
+        async def block_final_response(*_args: object, **_kwargs: object) -> None:
+            case.operations.append("response")
+            response_started.set()
+            await release_response.wait()
+
+        case.interaction.response.defer.side_effect = acknowledge_final_cancel
+        set_final_response(case, block_final_response)
+        callback_task = asyncio.create_task(invoke(case))
+        try:
+            await asyncio.wait_for(response_started.wait(), timeout=1)
+            self.assertEqual(case.operations, ["defer", "stop:True", "response"])
+            self.assertTrue(case.state.skip_requested)
+            case.voice.stop.assert_called_once_with()
+            callback_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(callback_task, timeout=1)
+            self.assertTrue(callback_task.cancelled())
+            assert_feedback(case, "다음 곡으로 넘어갈게요.")
+        finally:
+            release_response.set()
+            callback_task.cancel()
+            await asyncio.gather(callback_task, return_exceptions=True)
+            bot.music_states.pop(case.interaction.guild_id, None)
+
+    async def test_component_skip_acknowledges_and_revalidates_before_stop(
+        self,
+    ) -> None:
+        await self._assert_skip_contract(component=True, first_guild_id=362)
+
+    async def test_slash_skip_acknowledges_and_revalidates_before_stop(
+        self,
+    ) -> None:
+        await self._assert_skip_contract(component=False, first_guild_id=382)
 
     async def test_pause_resume_acknowledges_and_revalidates_before_toggle(
         self,
