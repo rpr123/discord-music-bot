@@ -4966,15 +4966,20 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             "<html>temporary failure</html>",
         )
 
-        async def fail_response(*_args: object, **_kwargs: object) -> None:
+        async def fail_followup(*_args: object, **_kwargs: object) -> None:
             response_attempted.set()
             raise response_error
+
+        async def defer_response(**_kwargs: object) -> None:
+            interaction.response.is_done.return_value = True
 
         interaction = MagicMock()
         interaction.guild_id = guild_id
         interaction.user = User()
-        interaction.response.send_message = AsyncMock(side_effect=fail_response)
+        interaction.response.defer = AsyncMock(side_effect=defer_response)
+        interaction.response.send_message = AsyncMock()
         interaction.response.is_done.return_value = False
+        interaction.followup.send = AsyncMock(side_effect=fail_followup)
 
         current = make_track("now-playing")
         first = make_track("remove-first")
@@ -4994,9 +4999,10 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "get_music_channel_id", return_value=None),
             patch.object(
                 bot,
-                "send_ephemeral_response",
-                wraps=bot.send_ephemeral_response,
-            ) as send_ephemeral_response,
+                "send_ephemeral_followup",
+                wraps=bot.send_ephemeral_followup,
+            ) as send_ephemeral_followup,
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
         ):
             try:
                 await asyncio.wait_for(state.control_panel_lock.acquire(), timeout=1)
@@ -5006,15 +5012,19 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await asyncio.wait_for(response_attempted.wait(), timeout=1)
 
-                send_ephemeral_response.assert_awaited_once_with(
+                interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+                send_ephemeral_followup.assert_awaited_once_with(
                     interaction,
                     expected_content,
                     delete_after=bot.QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
                 )
-                interaction.response.send_message.assert_awaited_once_with(
+                interaction.followup.send.assert_awaited_once_with(
                     expected_content,
                     ephemeral=True,
+                    wait=True,
                 )
+                interaction.response.send_message.assert_not_awaited()
+                schedule_refill.assert_called_once_with(guild_id)
                 self.assertEqual(list(state.queue), [second])
                 self.assertIs(state.current, current)
                 self.assertFalse(remove_task.done())
@@ -5065,6 +5075,297 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(active_view, bot.MusicControlView)
         self.assertTrue(all(not item.disabled for item in active_view.children))
         text_channel.send.assert_not_awaited()
+
+    async def test_remove_acknowledges_before_stable_deletion_and_revalidates(
+        self,
+    ) -> None:
+        cases: list[SimpleNamespace] = []
+        callback_tasks: list[asyncio.Task] = []
+        release_events: list[asyncio.Event] = []
+
+        def make_case(guild_id: int, *, playing: bool = False) -> SimpleNamespace:
+            channel = SimpleNamespace(id=20_000 + guild_id)
+            voice = MagicMock(channel=channel)
+            voice.is_connected.return_value = True
+            member = SimpleNamespace(voice=SimpleNamespace(channel=channel))
+            tracks = tuple(make_track(f"remove-{guild_id}-{index}") for index in range(3))
+            state = bot.get_state(guild_id)
+            state.voice = voice
+            state.current = make_track(f"current-{guild_id}") if playing else None
+            state.queue.extend(tracks)
+            acknowledged = {"done": False}
+            interaction = MagicMock(guild_id=guild_id, user=member)
+            interaction.response.send_message = AsyncMock()
+            interaction.response.is_done.side_effect = lambda: acknowledged["done"]
+            interaction.followup.send = AsyncMock(return_value=None)
+
+            async def defer_response(**_kwargs: object) -> None:
+                acknowledged["done"] = True
+
+            interaction.response.defer = AsyncMock(side_effect=defer_response)
+            case = SimpleNamespace(
+                guild_id=guild_id,
+                state=state,
+                voice=voice,
+                member=member,
+                tracks=tracks,
+                interaction=interaction,
+                acknowledged=acknowledged,
+            )
+            cases.append(case)
+            return case
+
+        def make_server_error(label: str) -> bot.discord.DiscordServerError:
+            response = MagicMock(status=500, reason="Internal Server Error")
+            return bot.discord.DiscordServerError(response, f"<html>{label}</html>")
+
+        def discard_housekeeping(coroutine: object) -> None:
+            coroutine.close()
+
+        with (
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+            patch.object(bot, "update_control_panel", new_callable=AsyncMock) as update_panel,
+            patch.object(
+                bot,
+                "create_housekeeping_task",
+                side_effect=discard_housekeeping,
+            ) as create_housekeeping_task,
+        ):
+            try:
+                invalid = make_case(336)
+                not_found_message = "그 번호의 대기열 곡을 찾지 못했어요."
+                with patch.object(
+                    bot,
+                    "send_ephemeral_response",
+                    wraps=bot.send_ephemeral_response,
+                ) as send_response:
+                    await bot.remove_from_queue.callback(invalid.interaction, 0)
+
+                    send_response.assert_awaited_once_with(
+                        invalid.interaction,
+                        not_found_message,
+                    )
+                    invalid.interaction.response.send_message.assert_awaited_once_with(
+                        not_found_message,
+                        ephemeral=True,
+                    )
+                    invalid.interaction.response.defer.assert_not_awaited()
+                    invalid.interaction.followup.send.assert_not_awaited()
+                    self.assertEqual(list(invalid.state.queue), list(invalid.tracks))
+                    schedule_refill.assert_not_called()
+                    update_panel.assert_not_awaited()
+
+                create_housekeeping_task.reset_mock()
+
+                stable = make_case(329)
+                target = stable.tracks[1]
+                ack_started = asyncio.Event()
+                release_ack = asyncio.Event()
+                release_events.append(release_ack)
+
+                async def block_stable_defer(**_kwargs: object) -> None:
+                    stable.acknowledged["done"] = True
+                    ack_started.set()
+                    await release_ack.wait()
+
+                stable.interaction.response.defer.side_effect = block_stable_defer
+                feedback_message = MagicMock()
+                stable.interaction.followup.send.return_value = feedback_message
+                expected_content = f"대기열에서 `{target.title}`을 삭제했어요."
+                with patch.object(
+                    bot,
+                    "send_ephemeral_followup",
+                    wraps=bot.send_ephemeral_followup,
+                ) as send_followup:
+                    stable_task = asyncio.create_task(
+                        bot.remove_from_queue.callback(stable.interaction, 2)
+                    )
+                    callback_tasks.append(stable_task)
+                    await asyncio.wait_for(ack_started.wait(), timeout=1)
+                    self.assertEqual(list(stable.state.queue), list(stable.tracks))
+                    schedule_refill.assert_not_called()
+                    stable.interaction.followup.send.assert_not_awaited()
+
+                    stable.state.queue.clear()
+                    stable.state.queue.extend(
+                        [stable.tracks[2], stable.tracks[0], target]
+                    )
+                    release_ack.set()
+                    await asyncio.wait_for(stable_task, timeout=1)
+
+                    stable.interaction.response.defer.assert_awaited_once_with(
+                        ephemeral=True
+                    )
+                    send_followup.assert_awaited_once_with(
+                        stable.interaction,
+                        expected_content,
+                        delete_after=bot.QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
+                    )
+                    stable.interaction.followup.send.assert_awaited_once_with(
+                        expected_content,
+                        ephemeral=True,
+                        wait=True,
+                    )
+                    self.assertEqual(
+                        list(stable.state.queue),
+                        [stable.tracks[2], stable.tracks[0]],
+                    )
+                    schedule_refill.assert_called_once_with(stable.guild_id)
+                    update_panel.assert_not_awaited()
+                    create_housekeeping_task.assert_called_once()
+                    stable.interaction.response.send_message.assert_not_awaited()
+
+                schedule_refill.reset_mock()
+                update_panel.reset_mock()
+                create_housekeeping_task.reset_mock()
+
+                defer_failure = make_case(330)
+                defer_error = make_server_error("remove defer failure")
+                defer_failure.interaction.response.defer.side_effect = defer_error
+                with self.assertRaises(bot.discord.DiscordServerError) as raised:
+                    await bot.remove_from_queue.callback(defer_failure.interaction, 1)
+                self.assertIs(raised.exception, defer_error)
+                self.assertEqual(
+                    list(defer_failure.state.queue), list(defer_failure.tracks)
+                )
+                schedule_refill.assert_not_called()
+                update_panel.assert_not_awaited()
+                defer_failure.interaction.followup.send.assert_not_awaited()
+
+                defer_cancel = make_case(331)
+                defer_started = asyncio.Event()
+                release_defer = asyncio.Event()
+                release_events.append(release_defer)
+
+                async def block_cancelled_defer(**_kwargs: object) -> None:
+                    defer_started.set()
+                    await release_defer.wait()
+
+                defer_cancel.interaction.response.defer.side_effect = block_cancelled_defer
+                cancel_defer_task = asyncio.create_task(
+                    bot.remove_from_queue.callback(defer_cancel.interaction, 1)
+                )
+                callback_tasks.append(cancel_defer_task)
+                await asyncio.wait_for(defer_started.wait(), timeout=1)
+                cancel_defer_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(cancel_defer_task, timeout=1)
+                self.assertEqual(list(defer_cancel.state.queue), list(defer_cancel.tracks))
+                schedule_refill.assert_not_called()
+                update_panel.assert_not_awaited()
+                defer_cancel.interaction.followup.send.assert_not_awaited()
+
+                guard_specs = (
+                    (
+                        "voice replacement",
+                        "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
+                    ),
+                    (
+                        "member move",
+                        "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
+                    ),
+                    ("target missing", "그 번호의 대기열 곡을 찾지 못했어요."),
+                )
+                for offset, (scenario, expected_message) in enumerate(guard_specs):
+                    with self.subTest(scenario=scenario):
+                        schedule_refill.reset_mock()
+                        update_panel.reset_mock()
+                        guarded = make_case(332 + offset)
+                        target = guarded.tracks[0]
+
+                        async def mutate_during_defer(
+                            _scenario: str = scenario,
+                            **_kwargs: object,
+                        ) -> None:
+                            guarded.acknowledged["done"] = True
+                            if _scenario == "voice replacement":
+                                replacement_voice = MagicMock(
+                                    channel=guarded.voice.channel
+                                )
+                                replacement_voice.is_connected.return_value = True
+                                guarded.state.voice = replacement_voice
+                            elif _scenario == "member move":
+                                guarded.member.voice.channel = object()
+                            else:
+                                bot.remove_queued_track_by_id(
+                                    guarded.state,
+                                    target.track_id,
+                                )
+
+                        guarded.interaction.response.defer.side_effect = mutate_during_defer
+                        await bot.remove_from_queue.callback(guarded.interaction, 1)
+
+                        guarded.interaction.response.defer.assert_awaited_once_with(
+                            ephemeral=True
+                        )
+                        guarded.interaction.followup.send.assert_awaited_once_with(
+                            expected_message,
+                            ephemeral=True,
+                            wait=True,
+                        )
+                        if scenario == "target missing":
+                            self.assertEqual(
+                                list(guarded.state.queue), list(guarded.tracks[1:])
+                            )
+                        else:
+                            self.assertEqual(
+                                list(guarded.state.queue), list(guarded.tracks)
+                            )
+                        schedule_refill.assert_not_called()
+                        update_panel.assert_not_awaited()
+                        guarded.interaction.response.send_message.assert_not_awaited()
+
+                schedule_refill.reset_mock()
+                update_panel.reset_mock()
+                final_cancel = make_case(335, playing=True)
+                followup_started = asyncio.Event()
+                release_followup = asyncio.Event()
+                release_events.append(release_followup)
+
+                async def block_followup(*_args: object, **_kwargs: object) -> None:
+                    followup_started.set()
+                    await release_followup.wait()
+
+                final_cancel.interaction.followup.send.side_effect = block_followup
+                final_task = asyncio.create_task(
+                    bot.remove_from_queue.callback(final_cancel.interaction, 1)
+                )
+                callback_tasks.append(final_task)
+                await asyncio.wait_for(followup_started.wait(), timeout=1)
+                self.assertEqual(
+                    list(final_cancel.state.queue), list(final_cancel.tracks[1:])
+                )
+                schedule_refill.assert_called_once_with(final_cancel.guild_id)
+                update_panel.assert_not_awaited()
+
+                final_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(final_task, timeout=1)
+                update_panel.assert_awaited_once_with(
+                    final_cancel.guild_id,
+                    final_cancel.state,
+                )
+                self.assertEqual(
+                    list(final_cancel.state.queue), list(final_cancel.tracks[1:])
+                )
+                final_cancel.interaction.response.defer.assert_awaited_once_with(
+                    ephemeral=True
+                )
+            finally:
+                for event in release_events:
+                    event.set()
+                for task in callback_tasks:
+                    if not task.done():
+                        task.cancel()
+                if callback_tasks:
+                    await asyncio.wait_for(
+                        asyncio.gather(*callback_tasks, return_exceptions=True),
+                        timeout=1,
+                    )
+                for case in cases:
+                    bot.cancel_autoplay_refill(case.state)
+                    bot.cancel_empty_channel_disconnect(case.state)
+                    bot.music_states.pop(case.guild_id, None)
 
     async def test_idle_panel_becomes_playing_without_creating_another_message(self) -> None:
         class Guild:

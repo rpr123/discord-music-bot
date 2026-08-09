@@ -5659,9 +5659,31 @@ async def remove_from_queue(interaction: discord.Interaction, position: int) -> 
     state = get_state(interaction.guild_id)
     if not await ensure_same_voice_channel(interaction, state):
         return
-    removed = remove_queued_track(state, position - 1)
-    if removed is None:
+
+    queue_index = position - 1
+    queued_tracks = list(state.queue)
+    if queue_index < 0 or queue_index >= len(queued_tracks):
         await send_ephemeral_response(
+            interaction,
+            "그 번호의 대기열 곡을 찾지 못했어요.",
+        )
+        return
+
+    voice = state.voice
+    target_track_id = queued_tracks[queue_index].track_id
+    await interaction.response.defer(ephemeral=True)
+    if state.voice is not voice:
+        await send_ephemeral_followup(
+            interaction,
+            "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
+        )
+        return
+    if not await ensure_same_voice_channel(interaction, state):
+        return
+
+    removed = remove_queued_track_by_id(state, target_track_id)
+    if removed is None:
+        await send_ephemeral_followup(
             interaction,
             "그 번호의 대기열 곡을 찾지 못했어요.",
         )
@@ -5670,7 +5692,7 @@ async def remove_from_queue(interaction: discord.Interaction, position: int) -> 
     schedule_autoplay_refill(interaction.guild_id)
     refresh_panel = state.current is not None
     try:
-        await send_ephemeral_response(
+        await send_ephemeral_followup(
             interaction,
             f"대기열에서 `{removed.title}`을 삭제했어요.",
             delete_after=QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
