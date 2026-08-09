@@ -4474,8 +4474,11 @@ async def discard_stale_voice_client(
     guild: discord.Guild,
     state: GuildMusicState,
     voice: discord.VoiceProtocol,
+    *,
+    reset_playback: bool = True,
 ) -> None:
-    stop_playback(state, guild.id)
+    if reset_playback:
+        stop_playback(state, guild.id)
     try:
         await asyncio.wait_for(
             voice.disconnect(force=True),
@@ -4509,6 +4512,7 @@ async def use_connected_voice(
     voice: discord.VoiceProtocol,
     channel: discord.abc.Connectable,
     state: GuildMusicState,
+    guild_id: int,
 ) -> tuple[bool, str | None]:
     if bot_shutdown_started:
         return False, "The bot is shutting down."
@@ -4522,6 +4526,7 @@ async def use_connected_voice(
         )
     if bot_shutdown_started:
         return False, "The bot is shutting down."
+    stop_playback(state, guild_id)
     await voice.move_to(channel)
     if bot_shutdown_started:
         return False, "The bot is shutting down."
@@ -4591,24 +4596,87 @@ async def _ensure_voice_channel(
                     voice = None
 
             if voice is not None and voice.is_connected():
+                generation_before_move = state.playback_generation
+                ok = False
+                error: str | None = None
+                move_exception: BaseException | None = None
                 try:
-                    original_channel = voice.channel
-                    ok, error = await use_connected_voice(voice, channel, state)
-                    moved = (
-                        ok
-                        and original_channel != channel
-                        and voice.channel == channel
-                    )
-                    if moved:
-                        stop_playback(state, guild.id)
-                    return ok, error, moved
-                except (asyncio.TimeoutError, discord.DiscordException):
-                    logger.warning(
-                        "Failed to move voice client in guild %s",
+                    ok, error = await use_connected_voice(
+                        voice,
+                        channel,
+                        state,
                         guild.id,
-                        exc_info=True,
                     )
-                    return False, "음성 채널 이동에 실패했어요. 잠시 후 다시 시도해 주세요.", False
+                except BaseException as caught_error:
+                    move_exception = caught_error
+
+                move_attempted = (
+                    state.playback_generation != generation_before_move
+                )
+                moved = (
+                    ok
+                    and move_attempted
+                    and voice.channel == channel
+                )
+                if move_attempted and not moved:
+                    cleanup_task = asyncio.create_task(
+                        discard_stale_voice_client(
+                            guild,
+                            state,
+                            voice,
+                            reset_playback=False,
+                        )
+                    )
+                    cleanup_cancelled, cleanup_error = (
+                        await wait_for_task_completion_despite_cancellation(
+                            cleanup_task
+                        )
+                    )
+                    if cleanup_error is not None:
+                        logger.warning(
+                            "Failed to finish cleaning up a failed voice move: %s",
+                            cleanup_error,
+                            exc_info=(
+                                type(cleanup_error),
+                                cleanup_error,
+                                cleanup_error.__traceback__,
+                            ),
+                        )
+                    if cleanup_cancelled and (
+                        move_exception is None
+                        or isinstance(
+                            move_exception,
+                            (asyncio.TimeoutError, discord.DiscordException),
+                        )
+                    ):
+                        move_exception = asyncio.CancelledError()
+
+                if move_attempted:
+                    create_housekeeping_task(show_idle_panel(guild.id, state))
+
+                if move_exception is not None:
+                    if isinstance(
+                        move_exception,
+                        (asyncio.TimeoutError, discord.DiscordException),
+                    ):
+                        logger.warning(
+                            "Failed to move voice client in guild %s",
+                            guild.id,
+                            exc_info=(
+                                type(move_exception),
+                                move_exception,
+                                move_exception.__traceback__,
+                            ),
+                        )
+                        return (
+                            False,
+                            "음성 채널 이동에 실패했어요. "
+                            "잠시 후 다시 시도해 주세요.",
+                            False,
+                        )
+                    raise move_exception
+
+                return ok, error, moved
 
             if bot_shutdown_started:
                 return False, "The bot is shutting down.", False
@@ -4653,12 +4721,10 @@ async def ensure_voice_channel(
         return False, "The bot is shutting down."
     operation_task = track_voice_operation()
     try:
-        ok, error, moved = await _ensure_voice_channel(guild, channel, state)
+        ok, error, _ = await _ensure_voice_channel(guild, channel, state)
         if ok:
             cancel_empty_channel_disconnect(state)
             update_empty_channel_disconnect(state, guild.id)
-            if moved:
-                create_housekeeping_task(show_idle_panel(guild.id, state))
         return ok, error
     finally:
         voice_operation_tasks.discard(operation_task)
