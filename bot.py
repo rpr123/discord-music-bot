@@ -2218,8 +2218,19 @@ class MusicControlView(discord.ui.View):
     async def stop(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
         stop_playback(state, self.guild_id)
-        await interaction.response.defer()
-        await show_idle_panel(self.guild_id, state)
+        clicked_message_id = getattr(interaction.message, "id", None)
+        clicked_panel_updated = False
+        try:
+            await self.edit_panel(interaction)
+            clicked_panel_updated = True
+        finally:
+            control_message_id = getattr(state.control_message, "id", None)
+            clicked_is_current = (
+                clicked_message_id is not None
+                and clicked_message_id == control_message_id
+            )
+            if not clicked_panel_updated or not clicked_is_current:
+                await show_idle_panel(self.guild_id, state)
 
     @discord.ui.button(label="반복", emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
     async def repeat(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:

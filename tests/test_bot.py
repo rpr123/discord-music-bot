@@ -3631,6 +3631,274 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(edited_view, bot.MusicControlView)
         self.assertTrue(all(not item.disabled for item in edited_view.children))
 
+    async def test_stop_button_converges_clicked_and_canonical_panels(
+        self,
+    ) -> None:
+        def assert_idle_panel(kwargs: dict[str, object]) -> None:
+            self.assertEqual(kwargs["embed"].title, bot.IDLE_PANEL_TITLE)
+            idle_view = kwargs["view"]
+            self.assertIsInstance(idle_view, bot.MusicControlView)
+            self.assertTrue(
+                all(
+                    item.disabled
+                    for item in idle_view.children
+                    if item.custom_id != bot.AUTOPLAY_BUTTON_CUSTOM_ID
+                )
+            )
+
+        guild_ids = (325, 326)
+        try:
+            for guild_id, clicked_is_canonical in zip(
+                guild_ids,
+                (False, True),
+            ):
+                with self.subTest(clicked_is_canonical=clicked_is_canonical):
+                    state = bot.get_state(guild_id)
+                    state.current = make_track("current")
+                    state.queue.append(make_track("queued"))
+                    generation = state.playback_generation
+                    voice = MagicMock()
+                    voice.playing = True
+                    voice.is_connected.return_value = True
+                    voice.is_playing.side_effect = lambda: voice.playing
+                    voice.is_paused.return_value = False
+                    voice.stop.side_effect = lambda: setattr(
+                        voice,
+                        "playing",
+                        False,
+                    )
+                    state.voice = voice
+
+                    channel = MagicMock(id=660 + guild_id)
+                    channel.send = AsyncMock()
+                    canonical_message = MagicMock(id=760 + guild_id)
+                    canonical_message.channel = channel
+                    operation_order: list[str] = []
+                    canonical_message.edit = AsyncMock(
+                        side_effect=lambda **_kwargs: operation_order.append(
+                            "canonical"
+                        )
+                    )
+                    state.control_message = canonical_message
+                    state.announcement_channel = channel
+                    clicked_message = MagicMock(
+                        id=(
+                            canonical_message.id
+                            if clicked_is_canonical
+                            else canonical_message.id + 1
+                        )
+                    )
+                    clicked_message.channel = channel
+
+                    interaction = MagicMock(message=clicked_message)
+                    interaction.response.is_done.return_value = False
+                    interaction.response.defer = AsyncMock(
+                        side_effect=lambda: operation_order.append("defer")
+                    )
+                    interaction.edit_original_response = AsyncMock(
+                        side_effect=lambda **_kwargs: operation_order.append(
+                            "clicked"
+                        )
+                    )
+                    view = bot.MusicControlView(guild_id)
+                    button = next(
+                        item
+                        for item in view.children
+                        if isinstance(item, bot.discord.ui.Button)
+                        and item.style == bot.discord.ButtonStyle.danger
+                    )
+
+                    with patch.object(
+                        bot,
+                        "get_music_channel_id",
+                        return_value=None,
+                    ):
+                        await button.callback(interaction)
+
+                    self.assertIsNone(state.current)
+                    self.assertFalse(state.queue)
+                    self.assertEqual(state.playback_generation, generation + 1)
+                    self.assertFalse(voice.is_playing())
+                    voice.stop.assert_called_once_with()
+                    interaction.response.defer.assert_awaited_once_with()
+                    interaction.edit_original_response.assert_awaited_once()
+                    assert_idle_panel(
+                        interaction.edit_original_response.await_args.kwargs
+                    )
+                    self.assertIsNot(clicked_message, canonical_message)
+
+                    if clicked_is_canonical:
+                        self.assertEqual(clicked_message.id, canonical_message.id)
+                        self.assertEqual(operation_order, ["defer", "clicked"])
+                        canonical_message.edit.assert_not_awaited()
+                    else:
+                        self.assertNotEqual(clicked_message.id, canonical_message.id)
+                        self.assertEqual(
+                            operation_order,
+                            ["defer", "clicked", "canonical"],
+                        )
+                        canonical_message.edit.assert_awaited_once()
+                        canonical_kwargs = canonical_message.edit.await_args.kwargs
+                        self.assertIsNone(canonical_kwargs["content"])
+                        assert_idle_panel(canonical_kwargs)
+                    channel.send.assert_not_awaited()
+        finally:
+            for guild_id in guild_ids:
+                state = bot.music_states.get(guild_id)
+                if state is None:
+                    continue
+                bot.cancel_autoplay_refill(state)
+                bot.cancel_empty_channel_disconnect(state)
+                bot.music_states.pop(guild_id, None)
+
+    async def test_stop_button_converges_canonical_panel_when_ack_fails(
+        self,
+    ) -> None:
+        def assert_stopped(
+            state: bot.GuildMusicState,
+            voice: MagicMock,
+            generation: int,
+        ) -> None:
+            self.assertIsNone(state.current)
+            self.assertFalse(state.queue)
+            self.assertEqual(state.playback_generation, generation + 1)
+            self.assertFalse(voice.is_playing())
+            voice.stop.assert_called_once_with()
+
+        def assert_idle_panel(kwargs: dict[str, object]) -> None:
+            self.assertIsNone(kwargs["content"])
+            self.assertEqual(kwargs["embed"].title, bot.IDLE_PANEL_TITLE)
+            idle_view = kwargs["view"]
+            self.assertIsInstance(idle_view, bot.MusicControlView)
+            self.assertTrue(
+                all(
+                    item.disabled
+                    for item in idle_view.children
+                    if item.custom_id != bot.AUTOPLAY_BUTTON_CUSTOM_ID
+                )
+            )
+
+        async def run_case(guild_id: int, *, cancel: bool) -> None:
+            state = bot.get_state(guild_id)
+            state.current = make_track("current")
+            state.queue.append(make_track("queued"))
+            generation = state.playback_generation
+            voice = MagicMock()
+            voice.playing = True
+            voice.is_connected.return_value = True
+            voice.is_playing.side_effect = lambda: voice.playing
+            voice.is_paused.return_value = False
+            voice.stop.side_effect = lambda: setattr(voice, "playing", False)
+            state.voice = voice
+
+            channel = MagicMock(id=860 + guild_id)
+            channel.send = AsyncMock()
+            canonical_message = MagicMock(id=960 + guild_id)
+            canonical_message.channel = channel
+            operation_order: list[str] = []
+            canonical_message.edit = AsyncMock(
+                side_effect=lambda **_kwargs: operation_order.append("canonical")
+            )
+            state.control_message = canonical_message
+            state.announcement_channel = channel
+            clicked_message = MagicMock(id=canonical_message.id)
+            clicked_message.channel = channel
+
+            response = MagicMock(status=500, reason="Internal Server Error")
+            response_error = bot.discord.DiscordServerError(
+                response,
+                "<html>temporary failure</html>",
+            )
+            defer_started = asyncio.Event()
+            release_defer = asyncio.Event()
+            defer_lock_states: list[bool] = []
+            interaction = MagicMock(message=clicked_message)
+            interaction.response.is_done.return_value = False
+            interaction.edit_original_response = AsyncMock()
+
+            async def defer_response() -> None:
+                assert_stopped(state, voice, generation)
+                defer_lock_states.append(state.control_panel_lock.locked())
+                operation_order.append("defer")
+                defer_started.set()
+                await release_defer.wait()
+                if not cancel:
+                    raise response_error
+
+            interaction.response.defer = AsyncMock(side_effect=defer_response)
+            view = bot.MusicControlView(guild_id)
+            button = next(
+                item
+                for item in view.children
+                if isinstance(item, bot.discord.ui.Button)
+                and item.style == bot.discord.ButtonStyle.danger
+            )
+            callback_task = None
+            test_holds_lock = False
+            try:
+                with patch.object(
+                    bot,
+                    "get_music_channel_id",
+                    return_value=None,
+                ):
+                    callback_task = asyncio.create_task(
+                        button.callback(interaction)
+                    )
+                    await asyncio.wait_for(defer_started.wait(), timeout=1)
+                    self.assertEqual(defer_lock_states, [False])
+                    await asyncio.wait_for(
+                        state.control_panel_lock.acquire(),
+                        timeout=1,
+                    )
+                    test_holds_lock = True
+                    if cancel:
+                        callback_task.cancel()
+                    else:
+                        release_defer.set()
+                    await asyncio.sleep(0)
+
+                    assert_stopped(state, voice, generation)
+                    self.assertFalse(callback_task.done())
+                    interaction.edit_original_response.assert_not_awaited()
+                    canonical_message.edit.assert_not_awaited()
+
+                    state.control_panel_lock.release()
+                    test_holds_lock = False
+                    if cancel:
+                        with self.assertRaises(asyncio.CancelledError):
+                            await asyncio.wait_for(callback_task, timeout=1)
+                        self.assertTrue(callback_task.cancelled())
+                    else:
+                        with self.assertRaises(
+                            bot.discord.DiscordServerError
+                        ) as raised:
+                            await asyncio.wait_for(callback_task, timeout=1)
+                        self.assertIs(raised.exception, response_error)
+
+                self.assertEqual(operation_order, ["defer", "canonical"])
+                interaction.response.defer.assert_awaited_once_with()
+                interaction.edit_original_response.assert_not_awaited()
+                canonical_message.edit.assert_awaited_once()
+                assert_idle_panel(canonical_message.edit.await_args.kwargs)
+                channel.send.assert_not_awaited()
+            finally:
+                release_defer.set()
+                if test_holds_lock:
+                    state.control_panel_lock.release()
+                if callback_task is not None and not callback_task.done():
+                    callback_task.cancel()
+                if callback_task is not None:
+                    await asyncio.wait_for(
+                        asyncio.gather(callback_task, return_exceptions=True),
+                        timeout=1,
+                    )
+                bot.cancel_autoplay_refill(state)
+                bot.cancel_empty_channel_disconnect(state)
+                bot.music_states.pop(guild_id, None)
+
+        await run_case(327, cancel=False)
+        await run_case(328, cancel=True)
+
     async def test_remove_responds_before_blocked_panel_and_converges_after_response_failure(
         self,
     ) -> None:
