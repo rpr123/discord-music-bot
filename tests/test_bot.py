@@ -6444,10 +6444,12 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             and item.boundary == "start"
         )
         interaction = MagicMock(message=MagicMock(id=997))
-        interaction.response.edit_message = AsyncMock()
         operation_order: list[str] = []
-        interaction.response.edit_message.side_effect = (
-            lambda **_kwargs: operation_order.append("response")
+        interaction.response.defer = AsyncMock(
+            side_effect=lambda: operation_order.append("defer")
+        )
+        interaction.edit_original_response = AsyncMock(
+            side_effect=lambda **_kwargs: operation_order.append("edit")
         )
 
         with patch.object(
@@ -6458,7 +6460,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             start._values = [tracks[0].track_id]
             await start.callback(interaction)
 
-            self.assertEqual(operation_order, ["response", "cleanup"])
+            self.assertEqual(operation_order, ["defer", "edit", "cleanup"])
             expected_cleanup = (
                 state,
                 interaction.message,
@@ -6475,12 +6477,13 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             )
             failed_start._values = [tracks[1].track_id]
             failed_interaction = MagicMock(message=MagicMock(id=998))
+            failed_interaction.response.defer = AsyncMock()
             response = MagicMock(status=500, reason="Internal Server Error")
             response_error = bot.discord.DiscordServerError(
                 response,
                 "<html>temporary failure</html>",
             )
-            failed_interaction.response.edit_message = AsyncMock(
+            failed_interaction.edit_original_response = AsyncMock(
                 side_effect=response_error
             )
 
@@ -6494,9 +6497,393 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             [tracks[0].track_id],
         )
         self.assertTrue(view.confirm_button.disabled)
-        interaction.response.edit_message.assert_awaited_once()
-        failed_interaction.response.edit_message.assert_awaited_once()
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.edit_original_response.assert_awaited_once()
+        failed_interaction.response.defer.assert_awaited_once_with()
+        failed_interaction.edit_original_response.assert_awaited_once()
         schedule_cleanup.assert_not_called()
+
+    async def test_range_boundary_responses_are_serialized_from_live_state(
+        self,
+    ) -> None:
+        def make_case(guild_id: int):
+            tracks = [make_track("first"), make_track("second"), make_track("third")]
+            state = bot.get_state(guild_id)
+            state.queue.extend(tracks)
+            view = bot.QueueRangeDeleteView(guild_id)
+            start = next(
+                item
+                for item in view.children
+                if isinstance(item, bot.QueueRangeBoundarySelect)
+                and item.boundary == "start"
+            )
+            end = next(
+                item
+                for item in view.children
+                if isinstance(item, bot.QueueRangeBoundarySelect)
+                and item.boundary == "end"
+            )
+            start._values = [tracks[0].track_id]
+            end._values = [tracks[2].track_id]
+            return state, tracks, view, start, end
+
+        def render_snapshot(
+            state: bot.GuildMusicState,
+            view: bot.QueueRangeDeleteView,
+            start: bot.QueueRangeBoundarySelect,
+            end: bot.QueueRangeBoundarySelect,
+            kwargs: dict[str, object],
+        ) -> tuple[object, ...]:
+            return (
+                kwargs["content"],
+                kwargs["embed"].to_dict(),
+                view.start_track_id,
+                view.end_track_id,
+                tuple(option.value for option in start.options if option.default),
+                tuple(option.value for option in end.options if option.default),
+                view.confirm_button.disabled,
+            )
+
+        def expected_snapshot(
+            state: bot.GuildMusicState,
+            tracks: list[bot.Track],
+            view: bot.QueueRangeDeleteView,
+        ) -> tuple[object, ...]:
+            return (
+                view.make_selection_content(state),
+                bot.make_queue_embed(state).to_dict(),
+                tracks[0].track_id,
+                tracks[2].track_id,
+                (tracks[0].track_id,),
+                (tracks[2].track_id,),
+                False,
+            )
+
+        state, tracks, view, start, end = make_case(997)
+        first_edit_started = asyncio.Event()
+        second_deferred = asyncio.Event()
+        release_first_edit = asyncio.Event()
+        operations: list[str] = []
+        remote_snapshots: list[tuple[object, ...]] = []
+        edit_lock_states: list[bool] = []
+        start_interaction = MagicMock(message=MagicMock(id=1001))
+        end_interaction = MagicMock(message=MagicMock(id=1002))
+
+        async def defer_start() -> None:
+            operations.append("start-defer")
+
+        async def defer_end() -> None:
+            operations.append("end-defer")
+            second_deferred.set()
+
+        async def edit_start(**kwargs: object) -> None:
+            operations.append("start-edit")
+            edit_lock_states.append(view.interaction_lock.locked())
+            snapshot = render_snapshot(state, view, start, end, kwargs)
+            first_edit_started.set()
+            await release_first_edit.wait()
+            remote_snapshots.append(snapshot)
+
+        async def edit_end(**kwargs: object) -> None:
+            operations.append("end-edit")
+            edit_lock_states.append(view.interaction_lock.locked())
+            remote_snapshots.append(
+                render_snapshot(state, view, start, end, kwargs)
+            )
+
+        start_interaction.response.defer = AsyncMock(side_effect=defer_start)
+        start_interaction.edit_original_response = AsyncMock(side_effect=edit_start)
+        end_interaction.response.defer = AsyncMock(side_effect=defer_end)
+        end_interaction.edit_original_response = AsyncMock(side_effect=edit_end)
+        tasks: list[asyncio.Task] = []
+
+        def record_cleanup(
+            _state: bot.GuildMusicState,
+            message: object,
+            _delay: float,
+        ) -> None:
+            operations.append(f"cleanup-{message.id}")
+
+        with patch.object(
+            bot,
+            "schedule_queue_message_cleanup",
+            side_effect=record_cleanup,
+        ) as schedule_cleanup:
+            try:
+                tasks.append(asyncio.create_task(start.callback(start_interaction)))
+                await asyncio.wait_for(first_edit_started.wait(), timeout=1)
+                tasks.append(asyncio.create_task(end.callback(end_interaction)))
+                await asyncio.wait_for(second_deferred.wait(), timeout=1)
+                await asyncio.sleep(0)
+
+                self.assertFalse(tasks[1].done())
+                end_interaction.edit_original_response.assert_not_awaited()
+                release_first_edit.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+            finally:
+                release_first_edit.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                if tasks:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=1,
+                    )
+                bot.music_states.pop(997, None)
+
+        self.assertEqual(edit_lock_states, [True, True])
+        self.assertEqual(remote_snapshots[-1], expected_snapshot(state, tracks, view))
+        self.assertEqual(
+            operations,
+            [
+                "start-defer",
+                "start-edit",
+                "end-defer",
+                "cleanup-1001",
+                "end-edit",
+                "cleanup-1002",
+            ],
+        )
+        self.assertEqual(
+            [call.args for call in schedule_cleanup.call_args_list],
+            [
+                (
+                    state,
+                    start_interaction.message,
+                    bot.EPHEMERAL_RESPONSE_DELETE_SECONDS,
+                ),
+                (
+                    state,
+                    end_interaction.message,
+                    bot.EPHEMERAL_RESPONSE_DELETE_SECONDS,
+                ),
+            ],
+        )
+
+        state, tracks, view, start, end = make_case(998)
+        first_defer_started = asyncio.Event()
+        second_deferred = asyncio.Event()
+        release_first_defer = asyncio.Event()
+        operations = []
+        remote_snapshots = []
+        defer_lock_states: list[bool] = []
+        edit_lock_states = []
+        start_interaction = MagicMock(message=MagicMock(id=1003))
+        end_interaction = MagicMock(message=MagicMock(id=1004))
+
+        async def slow_defer_start() -> None:
+            operations.append("start-defer")
+            defer_lock_states.append(view.interaction_lock.locked())
+            first_defer_started.set()
+            await release_first_defer.wait()
+
+        async def record_defer_end() -> None:
+            operations.append("end-defer")
+            defer_lock_states.append(view.interaction_lock.locked())
+            second_deferred.set()
+
+        async def record_edit_start(**kwargs: object) -> None:
+            operations.append("start-edit")
+            edit_lock_states.append(view.interaction_lock.locked())
+            remote_snapshots.append(
+                render_snapshot(state, view, start, end, kwargs)
+            )
+
+        async def record_edit_end(**kwargs: object) -> None:
+            operations.append("end-edit")
+            edit_lock_states.append(view.interaction_lock.locked())
+            remote_snapshots.append(
+                render_snapshot(state, view, start, end, kwargs)
+            )
+
+        start_interaction.response.defer = AsyncMock(side_effect=slow_defer_start)
+        start_interaction.edit_original_response = AsyncMock(
+            side_effect=record_edit_start
+        )
+        end_interaction.response.defer = AsyncMock(side_effect=record_defer_end)
+        end_interaction.edit_original_response = AsyncMock(side_effect=record_edit_end)
+        tasks = []
+
+        def record_second_cleanup(
+            _state: bot.GuildMusicState,
+            message: object,
+            _delay: float,
+        ) -> None:
+            operations.append(f"cleanup-{message.id}")
+
+        with patch.object(
+            bot,
+            "schedule_queue_message_cleanup",
+            side_effect=record_second_cleanup,
+        ) as schedule_cleanup:
+            try:
+                tasks.append(asyncio.create_task(start.callback(start_interaction)))
+                await asyncio.wait_for(first_defer_started.wait(), timeout=1)
+                tasks.append(asyncio.create_task(end.callback(end_interaction)))
+                await asyncio.wait_for(second_deferred.wait(), timeout=1)
+                await asyncio.wait_for(tasks[1], timeout=1)
+
+                self.assertFalse(tasks[0].done())
+                release_first_defer.set()
+                await asyncio.wait_for(tasks[0], timeout=1)
+            finally:
+                release_first_defer.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                if tasks:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=1,
+                    )
+                bot.music_states.pop(998, None)
+
+        self.assertEqual(defer_lock_states, [False, False])
+        self.assertEqual(edit_lock_states, [True, True])
+        self.assertEqual(remote_snapshots[-1], expected_snapshot(state, tracks, view))
+        self.assertEqual(
+            operations,
+            [
+                "start-defer",
+                "end-defer",
+                "end-edit",
+                "cleanup-1004",
+                "start-edit",
+                "cleanup-1003",
+            ],
+        )
+        self.assertEqual(
+            [call.args for call in schedule_cleanup.call_args_list],
+            [
+                (
+                    state,
+                    end_interaction.message,
+                    bot.EPHEMERAL_RESPONSE_DELETE_SECONDS,
+                ),
+                (
+                    state,
+                    start_interaction.message,
+                    bot.EPHEMERAL_RESPONSE_DELETE_SECONDS,
+                ),
+            ],
+        )
+
+    async def test_range_confirm_cannot_be_revived_by_waiting_boundary(
+        self,
+    ) -> None:
+        guild_id = 999
+        tracks = [make_track(f"track-{index}") for index in range(1, 7)]
+        state = bot.get_state(guild_id)
+        state.current = make_track("current")
+        state.queue.extend(tracks)
+        view = bot.QueueRangeDeleteView(guild_id)
+        view.start_track_id = tracks[1].track_id
+        view.end_track_id = tracks[3].track_id
+        view.confirm_button.disabled = False
+        start = next(
+            item
+            for item in view.children
+            if isinstance(item, bot.QueueRangeBoundarySelect)
+            and item.boundary == "start"
+        )
+        start._values = [tracks[0].track_id]
+
+        confirm_deferred = asyncio.Event()
+        boundary_deferred = asyncio.Event()
+        confirm_interaction = MagicMock(message=MagicMock(id=1101))
+        boundary_interaction = MagicMock(message=MagicMock(id=1102))
+        panel_lock_states: list[bool] = []
+
+        async def defer_confirm() -> None:
+            confirm_deferred.set()
+
+        async def defer_boundary() -> None:
+            boundary_deferred.set()
+
+        confirm_interaction.response.defer = AsyncMock(side_effect=defer_confirm)
+        confirm_interaction.edit_original_response = AsyncMock()
+        boundary_interaction.response.defer = AsyncMock(side_effect=defer_boundary)
+        boundary_interaction.edit_original_response = AsyncMock()
+
+        def record_panel(*_args: object, **_kwargs: object) -> None:
+            panel_lock_states.append(view.interaction_lock.locked())
+
+        confirm_task = None
+        boundary_task = None
+        test_holds_lock = False
+        with (
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+            patch.object(bot, "schedule_queue_message_cleanup") as schedule_cleanup,
+            patch.object(
+                bot,
+                "update_control_panel",
+                new=AsyncMock(side_effect=record_panel),
+            ) as update_control_panel,
+        ):
+            try:
+                await asyncio.wait_for(view.interaction_lock.acquire(), timeout=1)
+                test_holds_lock = True
+                confirm_task = asyncio.create_task(
+                    view.confirm_button.callback(confirm_interaction)
+                )
+                await asyncio.wait_for(confirm_deferred.wait(), timeout=1)
+                await asyncio.sleep(0)
+                self.assertFalse(confirm_task.done())
+
+                boundary_task = asyncio.create_task(start.callback(boundary_interaction))
+                await asyncio.wait_for(boundary_deferred.wait(), timeout=1)
+                self.assertEqual(view.start_track_id, tracks[0].track_id)
+                self.assertFalse(boundary_task.done())
+                confirm_interaction.response.defer.assert_awaited_once_with()
+                boundary_interaction.response.defer.assert_awaited_once_with()
+                confirm_interaction.edit_original_response.assert_not_awaited()
+                boundary_interaction.edit_original_response.assert_not_awaited()
+
+                view.interaction_lock.release()
+                test_holds_lock = False
+                await asyncio.wait_for(
+                    asyncio.gather(confirm_task, boundary_task),
+                    timeout=1,
+                )
+            finally:
+                if test_holds_lock:
+                    view.interaction_lock.release()
+                for task in (confirm_task, boundary_task):
+                    if task is not None and not task.done():
+                        task.cancel()
+                tasks = [
+                    task
+                    for task in (confirm_task, boundary_task)
+                    if task is not None
+                ]
+                if tasks:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=1,
+                    )
+                bot.music_states.pop(guild_id, None)
+
+        self.assertEqual(list(state.queue), [tracks[0], tracks[4], tracks[5]])
+        self.assertTrue(view.is_finished())
+        confirm_interaction.edit_original_response.assert_awaited_once()
+        confirm_kwargs = confirm_interaction.edit_original_response.await_args.kwargs
+        self.assertIn("2~4번", confirm_kwargs["content"])
+        self.assertIn("3곡", confirm_kwargs["content"])
+        self.assertEqual(
+            confirm_kwargs["embed"].to_dict(),
+            bot.make_queue_embed(state).to_dict(),
+        )
+        self.assertIsNone(confirm_kwargs["view"])
+        boundary_interaction.edit_original_response.assert_not_awaited()
+        schedule_refill.assert_called_once_with(guild_id)
+        schedule_cleanup.assert_called_once_with(
+            state,
+            confirm_interaction.message,
+            bot.QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
+        )
+        update_control_panel.assert_awaited_once_with(guild_id, state)
+        self.assertEqual(panel_lock_states, [False])
 
     async def test_confirm_deletes_inclusive_range(self) -> None:
         guild_id = 988
@@ -6509,7 +6896,8 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         view.end_track_id = tracks[12].track_id
         view.confirm_button.disabled = False
         interaction = MagicMock()
-        interaction.response.edit_message = AsyncMock()
+        interaction.response.defer = AsyncMock()
+        interaction.edit_original_response = AsyncMock()
         interaction.message = MagicMock()
         interaction.message.id = 989
         operation_order: list[str] = []
@@ -6519,8 +6907,11 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             operation_order.append("cleanup")
             raise cleanup_error
 
-        interaction.response.edit_message.side_effect = (
-            lambda **_kwargs: operation_order.append("response")
+        interaction.response.defer.side_effect = (
+            lambda: operation_order.append("defer")
+        )
+        interaction.edit_original_response.side_effect = (
+            lambda **_kwargs: operation_order.append("edit")
         )
 
         with (
@@ -6542,13 +6933,17 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
                 await view.confirm_button.callback(interaction)
 
         self.assertIs(raised.exception, cleanup_error)
-        self.assertEqual(operation_order, ["response", "cleanup", "panel"])
+        self.assertEqual(
+            operation_order,
+            ["defer", "edit", "cleanup", "panel"],
+        )
 
         self.assertEqual(len(state.queue), 11)
         self.assertEqual(list(state.queue), tracks[:4] + tracks[13:])
         schedule_refill.assert_called_once_with(guild_id)
-        interaction.response.edit_message.assert_awaited_once()
-        kwargs = interaction.response.edit_message.await_args.kwargs
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.edit_original_response.assert_awaited_once()
+        kwargs = interaction.edit_original_response.await_args.kwargs
         self.assertIn("5~13번", kwargs["content"])
         self.assertIn("9곡", kwargs["content"])
         self.assertIsNone(kwargs["view"])
@@ -6558,6 +6953,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             bot.QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
         )
         update_control_panel.assert_awaited_once_with(guild_id, state)
+        self.assertTrue(view.is_finished())
 
     async def test_range_delete_response_failure_still_refreshes_panel(self) -> None:
         guild_id = 995
@@ -6570,7 +6966,8 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         view.end_track_id = tracks[1].track_id
         view.confirm_button.disabled = False
         interaction = MagicMock()
-        interaction.response.edit_message = AsyncMock()
+        interaction.response.defer = AsyncMock()
+        interaction.edit_original_response = AsyncMock()
         operation_order: list[str] = []
         response = MagicMock(status=500, reason="Internal Server Error")
         response_error = bot.discord.DiscordServerError(
@@ -6578,11 +6975,15 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             "<html>temporary failure</html>",
         )
 
+        interaction.response.defer.side_effect = (
+            lambda: operation_order.append("defer")
+        )
+
         def fail_response(**_kwargs: object) -> None:
-            operation_order.append("response")
+            operation_order.append("edit")
             raise response_error
 
-        interaction.response.edit_message.side_effect = fail_response
+        interaction.edit_original_response.side_effect = fail_response
         with (
             patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
             patch.object(bot, "schedule_queue_message_cleanup") as schedule_cleanup,
@@ -6598,12 +6999,181 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
                 await view.confirm_button.callback(interaction)
 
         self.assertIs(raised.exception, response_error)
-        self.assertEqual(operation_order, ["response", "panel"])
+        self.assertEqual(operation_order, ["defer", "edit", "panel"])
         self.assertEqual(list(state.queue), [tracks[2]])
         schedule_refill.assert_called_once_with(guild_id)
-        interaction.response.edit_message.assert_awaited_once()
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.edit_original_response.assert_awaited_once()
         schedule_cleanup.assert_not_called()
         update_control_panel.assert_awaited_once_with(guild_id, state)
+        self.assertFalse(view.is_finished())
+
+    async def test_range_confirm_defer_failure_keeps_selection_and_queue(
+        self,
+    ) -> None:
+        guild_id = 993
+        tracks = [make_track("first"), make_track("second"), make_track("third")]
+        state = bot.get_state(guild_id)
+        state.current = make_track("current")
+        state.queue.extend(tracks)
+        view = bot.QueueRangeDeleteView(guild_id)
+        view.start_track_id = tracks[0].track_id
+        view.end_track_id = tracks[1].track_id
+        view.confirm_button.disabled = False
+        response = MagicMock(status=500, reason="Internal Server Error")
+        response_error = bot.discord.DiscordServerError(
+            response,
+            "<html>temporary failure</html>",
+        )
+        interaction = MagicMock(message=MagicMock(id=994))
+        interaction.response.defer = AsyncMock(side_effect=response_error)
+        interaction.edit_original_response = AsyncMock()
+
+        with (
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+            patch.object(bot, "schedule_queue_message_cleanup") as schedule_cleanup,
+            patch.object(
+                bot,
+                "update_control_panel",
+                new=AsyncMock(),
+            ) as update_control_panel,
+        ):
+            with self.assertRaises(bot.discord.DiscordServerError) as raised:
+                await view.confirm_button.callback(interaction)
+
+        self.assertIs(raised.exception, response_error)
+        self.assertEqual(list(state.queue), tracks)
+        self.assertEqual(view.start_track_id, tracks[0].track_id)
+        self.assertEqual(view.end_track_id, tracks[1].track_id)
+        self.assertFalse(view.confirm_button.disabled)
+        self.assertFalse(view.is_finished())
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.edit_original_response.assert_not_awaited()
+        schedule_refill.assert_not_called()
+        schedule_cleanup.assert_not_called()
+        update_control_panel.assert_not_awaited()
+
+    async def test_missing_range_replaces_and_finishes_old_view(self) -> None:
+        guild_id = 994
+        first = make_track("first")
+        second = make_track("second")
+        missing = make_track("missing")
+        state = bot.get_state(guild_id)
+        state.queue.extend([first, second])
+        view = bot.QueueRangeDeleteView(guild_id)
+        view.start_track_id = missing.track_id
+        view.end_track_id = second.track_id
+        view.confirm_button.disabled = False
+        interaction = MagicMock(message=MagicMock(id=995))
+        interaction.response.defer = AsyncMock()
+
+        async def edit_replacement(**_kwargs: object) -> None:
+            self.assertFalse(view.is_finished())
+
+        interaction.edit_original_response = AsyncMock(
+            side_effect=edit_replacement
+        )
+
+        with (
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+            patch.object(
+                bot,
+                "schedule_queue_message_cleanup",
+            ) as schedule_cleanup,
+            patch.object(
+                bot,
+                "update_control_panel",
+                new=AsyncMock(),
+            ) as update_control_panel,
+        ):
+            await view.confirm_button.callback(interaction)
+
+        self.assertEqual(list(state.queue), [first, second])
+        self.assertTrue(view.is_finished())
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.edit_original_response.assert_awaited_once()
+        edit_kwargs = interaction.edit_original_response.await_args.kwargs
+        self.assertIn("다시 선택", edit_kwargs["content"])
+        self.assertEqual(
+            edit_kwargs["embed"].to_dict(),
+            bot.make_queue_embed(state).to_dict(),
+        )
+        replacement_view = edit_kwargs["view"]
+        self.assertIsInstance(replacement_view, bot.QueueRangeDeleteView)
+        self.assertIsNot(replacement_view, view)
+        self.assertFalse(replacement_view.is_finished())
+        schedule_cleanup.assert_called_once_with(
+            state,
+            interaction.message,
+            bot.EPHEMERAL_RESPONSE_DELETE_SECONDS,
+        )
+        schedule_refill.assert_not_called()
+        update_control_panel.assert_not_awaited()
+
+        empty_state = bot.get_state(992)
+        empty_view = bot.QueueRangeDeleteView(992)
+        empty_view.start_track_id = first.track_id
+        empty_view.end_track_id = second.track_id
+        empty_view.confirm_button.disabled = False
+        empty_interaction = MagicMock(message=MagicMock(id=996))
+        empty_interaction.response.defer = AsyncMock()
+        empty_interaction.edit_original_response = AsyncMock()
+        with patch.object(
+            bot,
+            "schedule_queue_message_cleanup",
+        ) as empty_cleanup:
+            await empty_view.confirm_button.callback(empty_interaction)
+
+        self.assertTrue(empty_view.is_finished())
+        empty_interaction.edit_original_response.assert_awaited_once()
+        self.assertIsNone(
+            empty_interaction.edit_original_response.await_args.kwargs["view"]
+        )
+        empty_cleanup.assert_not_called()
+
+    async def test_missing_range_edit_failure_keeps_old_view_active(self) -> None:
+        guild_id = 991
+        first = make_track("first")
+        second = make_track("second")
+        missing = make_track("missing")
+        state = bot.get_state(guild_id)
+        state.current = make_track("current")
+        state.queue.extend([first, second])
+        view = bot.QueueRangeDeleteView(guild_id)
+        view.start_track_id = missing.track_id
+        view.end_track_id = second.track_id
+        view.confirm_button.disabled = False
+        response = MagicMock(status=500, reason="Internal Server Error")
+        response_error = bot.discord.DiscordServerError(
+            response,
+            "<html>temporary failure</html>",
+        )
+        interaction = MagicMock(message=MagicMock(id=997))
+        interaction.response.defer = AsyncMock()
+        interaction.edit_original_response = AsyncMock(
+            side_effect=response_error
+        )
+
+        with (
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+            patch.object(bot, "schedule_queue_message_cleanup") as schedule_cleanup,
+            patch.object(
+                bot,
+                "update_control_panel",
+                new=AsyncMock(),
+            ) as update_control_panel,
+        ):
+            with self.assertRaises(bot.discord.DiscordServerError) as raised:
+                await view.confirm_button.callback(interaction)
+
+        self.assertIs(raised.exception, response_error)
+        self.assertEqual(list(state.queue), [first, second])
+        self.assertFalse(view.is_finished())
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.edit_original_response.assert_awaited_once()
+        schedule_refill.assert_not_called()
+        schedule_cleanup.assert_not_called()
+        update_control_panel.assert_not_awaited()
 
     async def test_single_delete_resets_queue_message_expiry(self) -> None:
         guild_id = 990

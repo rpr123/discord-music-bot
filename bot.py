@@ -2004,17 +2004,22 @@ class QueueRangeBoundarySelect(discord.ui.Select):
         self.range_view.confirm_button.disabled = not (
             self.range_view.start_track_id and self.range_view.end_track_id
         )
-        state = get_state(self.range_view.guild_id)
-        await interaction.response.edit_message(
-            content=self.range_view.make_selection_content(state),
-            embed=make_queue_embed(state),
-            view=self.range_view,
-        )
-        schedule_queue_message_cleanup(
-            state,
-            interaction.message,
-            EPHEMERAL_RESPONSE_DELETE_SECONDS,
-        )
+        await interaction.response.defer()
+        async with self.range_view.interaction_lock:
+            if self.range_view.is_finished():
+                return
+
+            state = get_state(self.range_view.guild_id)
+            await interaction.edit_original_response(
+                content=self.range_view.make_selection_content(state),
+                embed=make_queue_embed(state),
+                view=self.range_view,
+            )
+            schedule_queue_message_cleanup(
+                state,
+                interaction.message,
+                EPHEMERAL_RESPONSE_DELETE_SECONDS,
+            )
 
 
 class QueueRangeDeleteButton(discord.ui.Button):
@@ -2038,6 +2043,7 @@ class QueueRangeDeleteView(discord.ui.View):
         self.guild_id = guild_id
         self.start_track_id: str | None = None
         self.end_track_id: str | None = None
+        self.interaction_lock = asyncio.Lock()
         self.add_item(QueueRangeBoundarySelect(self, "start", row=0))
         self.add_item(QueueRangeBoundarySelect(self, "end", row=1))
         self.confirm_button = QueueRangeDeleteButton(self)
@@ -2054,49 +2060,70 @@ class QueueRangeDeleteView(discord.ui.View):
         return await ensure_same_voice_channel(interaction, get_state(self.guild_id))
 
     async def delete_selected_range(self, interaction: discord.Interaction) -> None:
-        if self.start_track_id is None or self.end_track_id is None:
-            await interaction.response.edit_message(
-                content=self.make_selection_content(get_state(self.guild_id)),
-                view=self,
-            )
-            return
-
+        start_track_id = self.start_track_id
+        end_track_id = self.end_track_id
+        await interaction.response.defer()
         state = get_state(self.guild_id)
-        async with state.lock:
-            result = remove_queued_track_range_by_ids(
-                state,
-                self.start_track_id,
-                self.end_track_id,
-            )
-
-        if result is None:
-            await interaction.response.edit_message(
-                content=(
-                    "대기열이 변경되어 선택한 곡을 찾을 수 없어요. "
-                    "삭제할 구간을 다시 선택해 주세요."
-                ),
-                embed=make_queue_embed(state),
-                view=QueueRangeDeleteView(self.guild_id) if state.queue else None,
-            )
-            return
-
-        removed, start_index, end_index = result
-        schedule_autoplay_refill(self.guild_id)
-        refresh_panel = state.current is not None
+        refresh_panel = False
         try:
-            await interaction.response.edit_message(
-                content=(
-                    f"대기열 {start_index + 1}~{end_index + 1}번, "
-                    f"{len(removed)}곡을 삭제했어요."
-                ),
-                embed=make_queue_embed(state),
-                view=None,
-            )
-            schedule_queue_message_cleanup(
-                state,
-                interaction.message,
-                QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
-            )
+            async with self.interaction_lock:
+                if self.is_finished():
+                    return
+
+                if start_track_id is None or end_track_id is None:
+                    await interaction.edit_original_response(
+                        content=self.make_selection_content(state),
+                        view=self,
+                    )
+                    return
+
+                async with state.lock:
+                    result = remove_queued_track_range_by_ids(
+                        state,
+                        start_track_id,
+                        end_track_id,
+                    )
+
+                if result is None:
+                    replacement_view = (
+                        QueueRangeDeleteView(self.guild_id)
+                        if state.queue
+                        else None
+                    )
+                    await interaction.edit_original_response(
+                        content=(
+                            "대기열이 변경되어 선택한 곡을 찾을 수 없어요. "
+                            "삭제할 구간을 다시 선택해 주세요."
+                        ),
+                        embed=make_queue_embed(state),
+                        view=replacement_view,
+                    )
+                    self.stop()
+                    if replacement_view is not None:
+                        schedule_queue_message_cleanup(
+                            state,
+                            interaction.message,
+                            EPHEMERAL_RESPONSE_DELETE_SECONDS,
+                        )
+                    return
+
+                removed, start_index, end_index = result
+                schedule_autoplay_refill(self.guild_id)
+                refresh_panel = state.current is not None
+                await interaction.edit_original_response(
+                    content=(
+                        f"대기열 {start_index + 1}~{end_index + 1}번, "
+                        f"{len(removed)}곡을 삭제했어요."
+                    ),
+                    embed=make_queue_embed(state),
+                    view=None,
+                )
+                self.stop()
+                schedule_queue_message_cleanup(
+                    state,
+                    interaction.message,
+                    QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
+                )
         finally:
             if refresh_panel:
                 await update_control_panel(self.guild_id, state)
