@@ -2173,18 +2173,36 @@ class MusicControlView(discord.ui.View):
 
         return await ensure_same_voice_channel(interaction, self.get_state())
 
-    async def edit_panel(self, interaction: discord.Interaction) -> None:
+    async def edit_panel(
+        self,
+        interaction: discord.Interaction,
+        *,
+        refresh_canonical: bool = False,
+    ) -> None:
         state = self.get_state()
-        if not interaction.response.is_done():
-            await interaction.response.defer()
-        async with state.control_panel_lock:
-            if state.current is None:
-                embed = make_idle_player_embed()
-                view = MusicControlView(self.guild_id, disabled=True)
-            else:
-                embed = make_player_embed(state.current, state)
-                view = MusicControlView(self.guild_id)
-            await interaction.edit_original_response(embed=embed, view=view)
+        clicked_message_id = getattr(interaction.message, "id", None)
+        clicked_panel_updated = False
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+            async with state.control_panel_lock:
+                if state.current is None:
+                    embed = make_idle_player_embed()
+                    view = MusicControlView(self.guild_id, disabled=True)
+                else:
+                    embed = make_player_embed(state.current, state)
+                    view = MusicControlView(self.guild_id)
+                await interaction.edit_original_response(embed=embed, view=view)
+            clicked_panel_updated = True
+        finally:
+            if refresh_canonical:
+                control_message_id = getattr(state.control_message, "id", None)
+                clicked_is_current = (
+                    clicked_message_id is not None
+                    and clicked_message_id == control_message_id
+                )
+                if not clicked_panel_updated or not clicked_is_current:
+                    await update_control_panel(self.guild_id, state)
 
     @discord.ui.button(label="재생/일시정지", emoji="⏯️", style=discord.ButtonStyle.secondary, row=0)
     async def pause_resume(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -2235,16 +2253,18 @@ class MusicControlView(discord.ui.View):
     @discord.ui.button(label="반복", emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
     async def repeat(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
+        await interaction.response.defer()
         state.repeat_one = not state.repeat_one
-        await self.edit_panel(interaction)
+        await self.edit_panel(interaction, refresh_canonical=True)
 
     @discord.ui.button(label="셔플", emoji="🔀", style=discord.ButtonStyle.secondary, row=1)
     async def shuffle(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
+        await interaction.response.defer()
         tracks = list(state.queue)
         random.shuffle(tracks)
         state.queue = deque(tracks)
-        await self.edit_panel(interaction)
+        await self.edit_panel(interaction, refresh_canonical=True)
 
     @discord.ui.button(label="대기열 삭제", emoji="📋", style=discord.ButtonStyle.secondary, row=1)
     async def queue(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -2296,7 +2316,7 @@ class MusicControlView(discord.ui.View):
             schedule_autoplay_refill(self.guild_id)
         else:
             cancel_autoplay_refill(state)
-        await self.edit_panel(interaction)
+        await self.edit_panel(interaction, refresh_canonical=True)
 
 
 def select_youtube_music_song_result(query: str, results: list[dict]) -> dict | None:

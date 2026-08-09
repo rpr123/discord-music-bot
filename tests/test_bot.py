@@ -3540,96 +3540,328 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_noncanonical_component_edit_updates_only_clicked_message(
+    async def test_nowplaying_state_buttons_refresh_canonical_panel(
         self,
     ) -> None:
-        guild_id = 323
+        async def get_nowplaying_view(guild_id: int) -> bot.MusicControlView:
+            interaction = MagicMock(guild_id=guild_id)
+            interaction.response.send_message = AsyncMock()
+            await bot.now_playing.callback(interaction)
+            view = interaction.response.send_message.await_args.kwargs["view"]
+            self.assertIsInstance(view, bot.MusicControlView)
+            return view
 
-        class Guild:
-            id = guild_id
+        normal_cases = ((334, "repeat"), (335, "shuffle"), (336, "autoplay"))
+        failure_cases = ((337, "repeat"), (338, "shuffle"))
+        guild_ids = tuple(guild_id for guild_id, _ in normal_cases + failure_cases)
 
-        class Channel:
-            id = 656
-            guild = Guild()
+        try:
+            for guild_id, action in normal_cases:
+                with self.subTest(action=action, outcome="success"):
+                    state = bot.get_state(guild_id)
+                    current = make_track(f"current-{action}")
+                    queued = [make_track(f"{action}-{index}") for index in range(3)]
+                    state.current = current
+                    state.queue.extend(queued)
+                    channel = MagicMock(id=6000 + guild_id)
+                    channel.send = AsyncMock()
+                    canonical = MagicMock(id=7000 + guild_id, channel=channel)
+                    order: list[str] = []
+                    lock_states: list[bool] = []
 
-            def __init__(self) -> None:
-                self.send = AsyncMock()
+                    async def edit_canonical(**_kwargs: object) -> None:
+                        order.append("canonical")
+                        lock_states.append(state.control_panel_lock.locked())
 
-        class Message:
-            def __init__(self, message_id: int, channel: Channel) -> None:
-                self.id = message_id
-                self.channel = channel
-                self.edit = AsyncMock()
+                    canonical.edit = AsyncMock(side_effect=edit_canonical)
+                    state.control_message = canonical
+                    state.announcement_channel = channel
+                    view = await get_nowplaying_view(guild_id)
+                    clicked = MagicMock(id=canonical.id + 1, channel=channel)
+                    acknowledged = False
 
-        channel = Channel()
-        canonical_message = Message(989, channel)
-        clicked_message = Message(990, channel)
-        state = bot.get_state(guild_id)
-        initial_track = make_track("initial")
-        replacement_track = make_track("replacement")
-        state.current = initial_track
-        state.control_message = canonical_message
-        state.announcement_channel = channel
-        view = bot.MusicControlView(guild_id)
-        defer_seen = asyncio.Event()
-        edit_lock_states: list[bool] = []
+                    async def defer_response() -> None:
+                        nonlocal acknowledged
+                        order.append("defer")
+                        lock_states.append(state.control_panel_lock.locked())
+                        acknowledged = True
 
-        async def defer_response() -> None:
-            defer_seen.set()
+                    async def edit_clicked(**_kwargs: object) -> None:
+                        order.append("clicked")
+                        lock_states.append(state.control_panel_lock.locked())
 
-        async def edit_clicked_message(**_kwargs: object) -> None:
-            edit_lock_states.append(state.control_panel_lock.locked())
+                    def shuffle_tracks(tracks: list[bot.Track]) -> None:
+                        order.append("shuffle")
+                        tracks.reverse()
 
-        interaction = MagicMock()
-        interaction.message = clicked_message
-        interaction.response.defer = AsyncMock(side_effect=defer_response)
-        interaction.response.is_done.return_value = False
-        interaction.response.edit_message = AsyncMock()
-        interaction.edit_original_response = AsyncMock(
-            side_effect=edit_clicked_message
+                    interaction = MagicMock(message=clicked)
+                    interaction.response.defer = AsyncMock(side_effect=defer_response)
+                    interaction.response.is_done.side_effect = lambda: acknowledged
+                    interaction.edit_original_response = AsyncMock(
+                        side_effect=edit_clicked
+                    )
+
+                    with (
+                        patch.object(bot, "get_music_channel_id", return_value=None),
+                        patch.object(
+                            bot.random,
+                            "shuffle",
+                            side_effect=shuffle_tracks,
+                        ) as shuffle_mock,
+                        patch.object(
+                            bot,
+                            "set_autoplay_enabled",
+                            side_effect=lambda *_args: order.append("persist"),
+                        ) as persist_mock,
+                        patch.object(
+                            bot,
+                            "schedule_autoplay_refill",
+                            side_effect=lambda *_args: order.append("refill"),
+                        ) as refill_mock,
+                        patch.object(bot, "cancel_autoplay_refill") as cancel_mock,
+                    ):
+                        await getattr(view, action).callback(interaction)
+
+                    interaction.response.defer.assert_awaited_once_with()
+                    interaction.edit_original_response.assert_awaited_once()
+                    canonical.edit.assert_awaited_once()
+                    self.assertEqual(lock_states, [False, True, True])
+                    expected_embed = bot.make_player_embed(current, state).to_dict()
+                    self.assertEqual(
+                        interaction.edit_original_response.await_args.kwargs[
+                            "embed"
+                        ].to_dict(),
+                        expected_embed,
+                    )
+                    self.assertEqual(
+                        canonical.edit.await_args.kwargs["embed"].to_dict(),
+                        expected_embed,
+                    )
+                    self.assertIsNone(canonical.edit.await_args.kwargs["content"])
+                    channel.send.assert_not_awaited()
+
+                    if action == "repeat":
+                        self.assertTrue(state.repeat_one)
+                        self.assertEqual(order, ["defer", "clicked", "canonical"])
+                    elif action == "shuffle":
+                        self.assertEqual(list(state.queue), list(reversed(queued)))
+                        self.assertEqual(
+                            order,
+                            ["defer", "shuffle", "clicked", "canonical"],
+                        )
+                    else:
+                        self.assertTrue(state.autoplay_enabled)
+                        self.assertEqual(
+                            order,
+                            ["defer", "persist", "refill", "clicked", "canonical"],
+                        )
+                        persist_mock.assert_called_once_with(guild_id, True)
+                        refill_mock.assert_called_once_with(guild_id)
+                        cancel_mock.assert_not_called()
+                    if action != "shuffle":
+                        shuffle_mock.assert_not_called()
+
+            for guild_id, action in failure_cases:
+                with self.subTest(action=action, outcome="defer failure"):
+                    state = bot.get_state(guild_id)
+                    state.current = make_track(f"failure-{action}")
+                    original_queue = state.queue
+                    original_queue.extend(make_track(str(index)) for index in range(2))
+                    original_tracks = list(original_queue)
+                    state.control_message = MagicMock()
+                    state.control_message.edit = AsyncMock()
+                    view = await get_nowplaying_view(guild_id)
+                    response = MagicMock(status=500, reason="Internal Server Error")
+                    defer_error = bot.discord.DiscordServerError(
+                        response,
+                        f"<html>{action} defer failure</html>",
+                    )
+                    interaction = MagicMock()
+                    interaction.response.defer = AsyncMock(side_effect=defer_error)
+                    interaction.edit_original_response = AsyncMock()
+
+                    with patch.object(bot.random, "shuffle") as shuffle_mock:
+                        with self.assertRaises(
+                            bot.discord.DiscordServerError
+                        ) as raised:
+                            await getattr(view, action).callback(interaction)
+
+                    self.assertIs(raised.exception, defer_error)
+                    self.assertFalse(state.repeat_one)
+                    self.assertIs(state.queue, original_queue)
+                    self.assertEqual(list(state.queue), original_tracks)
+                    shuffle_mock.assert_not_called()
+                    interaction.response.defer.assert_awaited_once_with()
+                    interaction.edit_original_response.assert_not_awaited()
+                    state.control_message.edit.assert_not_awaited()
+        finally:
+            for guild_id in guild_ids:
+                state = bot.music_states.get(guild_id)
+                if state is None:
+                    continue
+                bot.cancel_autoplay_refill(state)
+                bot.cancel_empty_channel_disconnect(state)
+                bot.music_states.pop(guild_id, None)
+
+    async def test_component_edit_canonical_refresh_contract(self) -> None:
+        def make_case(
+            guild_id: int,
+            *,
+            same_id: bool,
+        ) -> tuple[
+            bot.GuildMusicState,
+            MagicMock,
+            MagicMock,
+            MagicMock,
+            bot.MusicControlView,
+        ]:
+            state = bot.get_state(guild_id)
+            state.current = make_track(f"current-{guild_id}")
+            channel = MagicMock(id=6000 + guild_id)
+            channel.send = AsyncMock()
+            canonical = MagicMock(id=7000 + guild_id, channel=channel)
+            canonical.edit = AsyncMock()
+            state.control_message = canonical
+            state.announcement_channel = channel
+            clicked = MagicMock(
+                id=canonical.id if same_id else canonical.id + 1,
+                channel=channel,
+            )
+            interaction = MagicMock(message=clicked)
+            interaction.response.is_done.return_value = False
+            interaction.response.defer = AsyncMock()
+            interaction.edit_original_response = AsyncMock()
+            return state, channel, canonical, interaction, bot.MusicControlView(guild_id)
+
+        async def run_failure_case(guild_id: int, *, cancel: bool) -> None:
+            state, channel, canonical, interaction, view = make_case(
+                guild_id,
+                same_id=True,
+            )
+            self.assertIsNot(interaction.message, canonical)
+            replacement = make_track(f"replacement-{guild_id}")
+            order: list[str] = []
+            lock_states: list[bool] = []
+            clicked_started = asyncio.Event()
+            release_clicked = asyncio.Event()
+            response = MagicMock(status=500, reason="Internal Server Error")
+            clicked_error = bot.discord.DiscordServerError(
+                response,
+                f"<html>clicked failure {guild_id}</html>",
+            )
+
+            async def defer_response() -> None:
+                order.append("defer")
+                lock_states.append(state.control_panel_lock.locked())
+
+            async def fail_clicked(**_kwargs: object) -> None:
+                order.append("clicked")
+                lock_states.append(state.control_panel_lock.locked())
+                state.current = replacement
+                clicked_started.set()
+                if cancel:
+                    await release_clicked.wait()
+                raise clicked_error
+
+            async def edit_canonical(**_kwargs: object) -> None:
+                order.append("canonical")
+                lock_states.append(state.control_panel_lock.locked())
+
+            interaction.response.defer = AsyncMock(side_effect=defer_response)
+            interaction.edit_original_response = AsyncMock(side_effect=fail_clicked)
+            canonical.edit = AsyncMock(side_effect=edit_canonical)
+            task = None
+            try:
+                with patch.object(bot, "get_music_channel_id", return_value=None):
+                    task = asyncio.create_task(
+                        view.edit_panel(interaction, refresh_canonical=True)
+                    )
+                    await asyncio.wait_for(clicked_started.wait(), timeout=1)
+                    if cancel:
+                        self.assertFalse(task.done())
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await asyncio.wait_for(task, timeout=1)
+                        self.assertTrue(task.cancelled())
+                    else:
+                        with self.assertRaises(
+                            bot.discord.DiscordServerError
+                        ) as raised:
+                            await asyncio.wait_for(task, timeout=1)
+                        self.assertIs(raised.exception, clicked_error)
+
+                self.assertEqual(order, ["defer", "clicked", "canonical"])
+                self.assertEqual(lock_states, [False, True, True])
+                interaction.response.defer.assert_awaited_once_with()
+                interaction.edit_original_response.assert_awaited_once()
+                canonical.edit.assert_awaited_once()
+                self.assertEqual(
+                    canonical.edit.await_args.kwargs["embed"].to_dict(),
+                    bot.make_player_embed(replacement, state).to_dict(),
+                )
+                channel.send.assert_not_awaited()
+            finally:
+                release_clicked.set()
+                if task is not None and not task.done():
+                    task.cancel()
+                if task is not None:
+                    await asyncio.gather(task, return_exceptions=True)
+                bot.cancel_empty_channel_disconnect(state)
+                bot.music_states.pop(guild_id, None)
+
+        state, channel, canonical, interaction, view = make_case(
+            339,
+            same_id=False,
         )
+        replacement = make_track("default-live")
+        defer_seen = asyncio.Event()
+        interaction.response.defer = AsyncMock(side_effect=defer_seen.set)
         edit_task = None
         test_holds_lock = False
-
         try:
             await asyncio.wait_for(state.control_panel_lock.acquire(), timeout=1)
             test_holds_lock = True
             edit_task = asyncio.create_task(view.edit_panel(interaction))
             await asyncio.wait_for(defer_seen.wait(), timeout=1)
-
-            interaction.response.defer.assert_awaited_once_with()
             self.assertFalse(edit_task.done())
-            interaction.edit_original_response.assert_not_awaited()
-
-            state.current = replacement_track
+            state.current = replacement
             state.control_panel_lock.release()
             test_holds_lock = False
             await asyncio.wait_for(edit_task, timeout=1)
+            canonical.edit.assert_not_awaited()
+            self.assertEqual(
+                interaction.edit_original_response.await_args.kwargs[
+                    "embed"
+                ].to_dict(),
+                bot.make_player_embed(replacement, state).to_dict(),
+            )
+            channel.send.assert_not_awaited()
         finally:
             if test_holds_lock:
                 state.control_panel_lock.release()
             if edit_task is not None and not edit_task.done():
                 edit_task.cancel()
             if edit_task is not None:
-                await asyncio.wait_for(
-                    asyncio.gather(edit_task, return_exceptions=True),
-                    timeout=1,
-                )
-            bot.music_states.pop(guild_id, None)
+                await asyncio.gather(edit_task, return_exceptions=True)
+            bot.cancel_empty_channel_disconnect(state)
+            bot.music_states.pop(339, None)
 
-        canonical_message.edit.assert_not_awaited()
-        channel.send.assert_not_awaited()
-        interaction.response.edit_message.assert_not_awaited()
-        interaction.edit_original_response.assert_awaited_once()
-        self.assertEqual(edit_lock_states, [True])
-        edit_kwargs = interaction.edit_original_response.await_args.kwargs
-        self.assertEqual(
-            edit_kwargs["embed"].to_dict(),
-            bot.make_player_embed(replacement_track, state).to_dict(),
+        state, channel, canonical, interaction, view = make_case(
+            340,
+            same_id=True,
         )
-        edited_view = edit_kwargs["view"]
-        self.assertIsInstance(edited_view, bot.MusicControlView)
-        self.assertTrue(all(not item.disabled for item in edited_view.children))
+        self.assertIsNot(interaction.message, canonical)
+        try:
+            await view.edit_panel(interaction, refresh_canonical=True)
+            interaction.edit_original_response.assert_awaited_once()
+            canonical.edit.assert_not_awaited()
+            channel.send.assert_not_awaited()
+        finally:
+            bot.cancel_empty_channel_disconnect(state)
+            bot.music_states.pop(340, None)
+
+        await run_failure_case(341, cancel=False)
+        await run_failure_case(342, cancel=True)
 
     async def test_stop_button_converges_clicked_and_canonical_panels(
         self,
@@ -4363,7 +4595,10 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         enable_interaction.response.defer.assert_awaited_once_with()
         save_setting.assert_called_once_with(guild_id, True)
         schedule_refill.assert_called_once_with(guild_id)
-        edit_panel.assert_awaited_once_with(enable_interaction)
+        edit_panel.assert_awaited_once_with(
+            enable_interaction,
+            refresh_canonical=True,
+        )
 
         disable_interaction = MagicMock()
         disable_interaction.response.defer = AsyncMock()
@@ -4379,7 +4614,10 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         disable_interaction.response.defer.assert_awaited_once_with()
         save_setting.assert_called_once_with(guild_id, False)
         cancel_refill.assert_called_once_with(state)
-        edit_panel.assert_awaited_once_with(disable_interaction)
+        edit_panel.assert_awaited_once_with(
+            disable_interaction,
+            refresh_canonical=True,
+        )
 
     async def test_autoplay_acknowledges_before_persistence_and_mutation(
         self,
