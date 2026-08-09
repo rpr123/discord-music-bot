@@ -2415,6 +2415,32 @@ class MusicControlView(discord.ui.View):
     )
     async def stop(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         state = self.get_state()
+        voice = state.voice
+        generation = state.playback_generation
+        await interaction.response.defer()
+        if state.voice is not voice or state.playback_generation != generation:
+            await send_ephemeral_followup(
+                interaction,
+                "재생 상태가 변경되어 조작이 취소됐어요. 다시 시도해 주세요.",
+            )
+            return
+
+        member_channel = getattr(
+            getattr(interaction.user, "voice", None),
+            "channel",
+            None,
+        )
+        if (
+            voice is None
+            or not voice.is_connected()
+            or member_channel != voice.channel
+        ):
+            await send_ephemeral_followup(
+                interaction,
+                "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
+            )
+            return
+
         stop_playback(state, self.guild_id)
         clicked_message_id = getattr(interaction.message, "id", None)
         clicked_panel_updated = False
@@ -5797,10 +5823,37 @@ async def stop(interaction: discord.Interaction) -> None:
     state = get_state(interaction.guild_id)
     if not await ensure_same_voice_channel(interaction, state):
         return
+
+    voice = state.voice
+    generation = state.playback_generation
+    await interaction.response.defer()
+    if state.voice is not voice or state.playback_generation != generation:
+        await interaction.edit_original_response(
+            content="재생 상태가 변경되어 조작이 취소됐어요. 다시 시도해 주세요."
+        )
+        return
+
+    member_channel = getattr(
+        getattr(interaction.user, "voice", None),
+        "channel",
+        None,
+    )
+    if (
+        voice is None
+        or not voice.is_connected()
+        or member_channel != voice.channel
+    ):
+        await interaction.edit_original_response(
+            content="봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
+        )
+        return
+
     stop_playback(state, interaction.guild_id)
 
     try:
-        await interaction.response.send_message("재생을 멈추고 대기열을 비웠어요.")
+        await interaction.edit_original_response(
+            content="재생을 멈추고 대기열을 비웠어요."
+        )
     finally:
         await show_idle_panel(interaction.guild_id, state)
 

@@ -3566,6 +3566,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
 
         channel = MagicMock(id=9349)
         channel.send = AsyncMock()
+        voice.channel = channel
+        voice.is_connected.return_value = True
         message = MagicMock(id=message_id, channel=channel)
         message.id = message_id
         message.channel = channel
@@ -3600,11 +3602,14 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             remote_edits.append(kwargs)
 
         message.edit = AsyncMock(side_effect=edit_canonical)
-        interaction = MagicMock(message=message)
+        member = MagicMock()
+        member.voice = type("MemberVoice", (), {"channel": channel})()
+        interaction = MagicMock(message=message, user=member)
         interaction.response.is_done.return_value = False
 
         async def defer_response() -> None:
             order.append("defer")
+            interaction.response.is_done.return_value = True
             defer_seen.set()
 
         interaction.response.defer = AsyncMock(side_effect=defer_response)
@@ -4023,6 +4028,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 state.voice = voice
                 channel = MagicMock(id=10_100 + offset)
                 channel.send = AsyncMock()
+                voice.channel = channel
+                voice.is_connected.return_value = True
                 message = MagicMock(id=message_id, channel=channel)
                 message.id = message_id
                 message.channel = channel
@@ -4047,7 +4054,9 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                     await release_clicked.wait()
                     raise clicked_error
 
-                interaction = MagicMock(message=message)
+                member = MagicMock()
+                member.voice = type("MemberVoice", (), {"channel": channel})()
+                interaction = MagicMock(message=message, user=member)
                 acknowledged = False
 
                 async def defer_response() -> None:
@@ -5736,10 +5745,11 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                         "playing",
                         False,
                     )
-                    state.voice = voice
 
                     channel = MagicMock(id=660 + guild_id)
                     channel.send = AsyncMock()
+                    voice.channel = channel
+                    state.voice = voice
                     canonical_message = MagicMock(id=760 + guild_id)
                     canonical_message.channel = channel
                     operation_order: list[str] = []
@@ -5759,10 +5769,28 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                     )
                     clicked_message.channel = channel
 
-                    interaction = MagicMock(message=clicked_message)
+                    member = MagicMock()
+                    member.voice = type(
+                        "MemberVoice",
+                        (),
+                        {"channel": channel},
+                    )()
+                    interaction = MagicMock(
+                        message=clicked_message,
+                        user=member,
+                    )
                     interaction.response.is_done.return_value = False
+
+                    async def defer_response() -> None:
+                        operation_order.append("defer")
+                        self.assertIsNotNone(state.current)
+                        self.assertTrue(state.queue)
+                        self.assertEqual(state.playback_generation, generation)
+                        voice.stop.assert_not_called()
+                        interaction.response.is_done.return_value = True
+
                     interaction.response.defer = AsyncMock(
-                        side_effect=lambda: operation_order.append("defer")
+                        side_effect=defer_response
                     )
                     interaction.edit_original_response = AsyncMock(
                         side_effect=lambda **_kwargs: operation_order.append(
@@ -5827,7 +5855,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                     bot.discord.ui.View.stop(state.control_view)
                 bot.music_states.pop(guild_id, None)
 
-    async def test_stop_button_converges_canonical_panel_when_ack_fails(
+    async def test_stop_button_acknowledges_revalidates_and_converges(
         self,
     ) -> None:
         def assert_stopped(
@@ -5854,10 +5882,12 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-        async def run_case(guild_id: int, *, cancel: bool) -> None:
+        async def run_case(guild_id: int, outcome: str) -> None:
             state = bot.get_state(guild_id)
-            state.current = make_track("current")
-            state.queue.append(make_track("queued"))
+            current = make_track("current")
+            queued = make_track("queued")
+            state.current = current
+            state.queue.append(queued)
             generation = state.playback_generation
             voice = MagicMock()
             voice.playing = True
@@ -5865,10 +5895,11 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             voice.is_playing.side_effect = lambda: voice.playing
             voice.is_paused.return_value = False
             voice.stop.side_effect = lambda: setattr(voice, "playing", False)
-            state.voice = voice
 
             channel = MagicMock(id=860 + guild_id)
             channel.send = AsyncMock()
+            voice.channel = channel
+            state.voice = voice
             canonical_message = MagicMock(id=960 + guild_id)
             canonical_message.channel = channel
             operation_order: list[str] = []
@@ -5887,21 +5918,63 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             )
             defer_started = asyncio.Event()
             release_defer = asyncio.Event()
-            defer_lock_states: list[bool] = []
-            interaction = MagicMock(message=clicked_message)
+            edit_started = asyncio.Event()
+            release_edit = asyncio.Event()
+            member = MagicMock()
+            member.voice = type(
+                "MemberVoice",
+                (),
+                {"channel": channel},
+            )()
+            interaction = MagicMock(message=clicked_message, user=member)
             interaction.response.is_done.return_value = False
-            interaction.edit_original_response = AsyncMock()
+            interaction.followup.send = AsyncMock(return_value=None)
+            replacement_voice = None
+
+            def assert_not_stopped() -> None:
+                self.assertIs(state.current, current)
+                self.assertEqual(list(state.queue), [queued])
+                self.assertFalse(state.stop_requested)
+                voice.stop.assert_not_called()
 
             async def defer_response() -> None:
-                assert_stopped(state, voice, generation)
-                defer_lock_states.append(state.control_panel_lock.locked())
+                nonlocal replacement_voice
                 operation_order.append("defer")
-                defer_started.set()
-                await release_defer.wait()
-                if not cancel:
+                assert_not_stopped()
+                self.assertEqual(state.playback_generation, generation)
+                if outcome == "voice":
+                    replacement_voice = MagicMock()
+                    state.voice = replacement_voice
+                    voice.is_connected.return_value = False
+                elif outcome == "generation":
+                    state.playback_generation += 1
+                elif outcome == "member":
+                    interaction.user.voice.channel = None
+                elif outcome == "disconnected":
+                    voice.is_connected.return_value = False
+                elif outcome == "current":
+                    state.current = make_track("replacement-current")
+                elif outcome == "defer-error":
+                    raise response_error
+                elif outcome == "defer-cancel":
+                    defer_started.set()
+                    await release_defer.wait()
+                interaction.response.is_done.return_value = True
+
+            async def edit_clicked_panel(**_kwargs: object) -> None:
+                operation_order.append("clicked")
+                self.assertTrue(state.control_panel_lock.locked())
+                assert_stopped(state, voice, generation)
+                edit_started.set()
+                if outcome in {"current", "final-error", "final-cancel"}:
+                    await release_edit.wait()
+                if outcome == "final-error":
                     raise response_error
 
             interaction.response.defer = AsyncMock(side_effect=defer_response)
+            interaction.edit_original_response = AsyncMock(
+                side_effect=edit_clicked_panel
+            )
             view = bot.MusicControlView(guild_id)
             state.control_view = view
             button = next(
@@ -5911,7 +5984,6 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 and item.style == bot.discord.ButtonStyle.danger
             )
             callback_task = None
-            test_holds_lock = False
             try:
                 with patch.object(
                     bot,
@@ -5921,47 +5993,90 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                     callback_task = asyncio.create_task(
                         button.callback(interaction)
                     )
-                    await asyncio.wait_for(defer_started.wait(), timeout=1)
-                    self.assertEqual(defer_lock_states, [False])
-                    await asyncio.wait_for(
-                        state.control_panel_lock.acquire(),
-                        timeout=1,
-                    )
-                    test_holds_lock = True
-                    if cancel:
+                    if outcome == "defer-cancel":
+                        await asyncio.wait_for(defer_started.wait(), timeout=1)
                         callback_task.cancel()
-                    else:
-                        release_defer.set()
-                    await asyncio.sleep(0)
-
-                    assert_stopped(state, voice, generation)
-                    self.assertFalse(callback_task.done())
-                    interaction.edit_original_response.assert_not_awaited()
-                    canonical_message.edit.assert_not_awaited()
-
-                    state.control_panel_lock.release()
-                    test_holds_lock = False
-                    if cancel:
                         with self.assertRaises(asyncio.CancelledError):
                             await asyncio.wait_for(callback_task, timeout=1)
                         self.assertTrue(callback_task.cancelled())
-                    else:
+                    elif outcome == "defer-error":
                         with self.assertRaises(
                             bot.discord.DiscordServerError
                         ) as raised:
                             await asyncio.wait_for(callback_task, timeout=1)
                         self.assertIs(raised.exception, response_error)
+                    elif outcome in {"voice", "generation", "member", "disconnected"}:
+                        await asyncio.wait_for(callback_task, timeout=1)
+                    else:
+                        await asyncio.wait_for(edit_started.wait(), timeout=1)
+                        self.assertEqual(operation_order, ["defer", "clicked"])
+                        self.assertFalse(callback_task.done())
+                        canonical_message.edit.assert_not_awaited()
+                        assert_stopped(state, voice, generation)
+                        if outcome == "final-cancel":
+                            callback_task.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await asyncio.wait_for(callback_task, timeout=1)
+                            self.assertTrue(callback_task.cancelled())
+                        else:
+                            release_edit.set()
+                            if outcome == "final-error":
+                                with self.assertRaises(
+                                    bot.discord.DiscordServerError
+                                ) as raised:
+                                    await asyncio.wait_for(callback_task, timeout=1)
+                                self.assertIs(raised.exception, response_error)
+                            else:
+                                await asyncio.wait_for(callback_task, timeout=1)
 
-                self.assertEqual(operation_order, ["defer", "canonical"])
                 interaction.response.defer.assert_awaited_once_with()
-                interaction.edit_original_response.assert_not_awaited()
-                canonical_message.edit.assert_awaited_once()
-                assert_idle_panel(canonical_message.edit.await_args.kwargs)
+                if outcome in {"defer-error", "defer-cancel"}:
+                    self.assertEqual(operation_order, ["defer"])
+                    self.assertEqual(state.playback_generation, generation)
+                    assert_not_stopped()
+                    interaction.edit_original_response.assert_not_awaited()
+                    interaction.followup.send.assert_not_awaited()
+                    canonical_message.edit.assert_not_awaited()
+                elif outcome in {"voice", "generation", "member", "disconnected"}:
+                    expected_message = (
+                        "재생 상태가 변경되어 조작이 취소됐어요. 다시 시도해 주세요."
+                        if outcome in {"voice", "generation"}
+                        else "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
+                    )
+                    self.assertIs(state.current, current)
+                    self.assertEqual(list(state.queue), [queued])
+                    self.assertFalse(state.stop_requested)
+                    self.assertEqual(
+                        state.playback_generation,
+                        generation + (outcome == "generation"),
+                    )
+                    voice.stop.assert_not_called()
+                    if replacement_voice is not None:
+                        replacement_voice.stop.assert_not_called()
+                    interaction.edit_original_response.assert_not_awaited()
+                    interaction.followup.send.assert_awaited_once_with(
+                        expected_message,
+                        ephemeral=True,
+                        wait=True,
+                    )
+                    canonical_message.edit.assert_not_awaited()
+                elif outcome == "current":
+                    self.assertEqual(operation_order, ["defer", "clicked"])
+                    assert_stopped(state, voice, generation)
+                    interaction.edit_original_response.assert_awaited_once()
+                    canonical_message.edit.assert_not_awaited()
+                else:
+                    self.assertEqual(
+                        operation_order,
+                        ["defer", "clicked", "canonical"],
+                    )
+                    interaction.edit_original_response.assert_awaited_once()
+                    canonical_message.edit.assert_awaited_once()
+                    assert_idle_panel(canonical_message.edit.await_args.kwargs)
                 channel.send.assert_not_awaited()
             finally:
                 release_defer.set()
-                if test_holds_lock:
-                    state.control_panel_lock.release()
+                release_edit.set()
                 if callback_task is not None and not callback_task.done():
                     callback_task.cancel()
                 if callback_task is not None:
@@ -5975,8 +6090,22 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                     bot.discord.ui.View.stop(state.control_view)
                 bot.music_states.pop(guild_id, None)
 
-        await run_case(327, cancel=False)
-        await run_case(328, cancel=True)
+        for guild_id, outcome in enumerate(
+            (
+                "defer-error",
+                "defer-cancel",
+                "voice",
+                "generation",
+                "member",
+                "disconnected",
+                "current",
+                "final-error",
+                "final-cancel",
+            ),
+            start=327,
+        ):
+            with self.subTest(outcome=outcome):
+                await run_case(guild_id, outcome)
 
     async def test_remove_responds_before_blocked_panel_and_converges_after_response_failure(
         self,
@@ -6124,6 +6253,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                         asyncio.gather(empty_timer, return_exceptions=True),
                         timeout=1,
                     )
+                if state.control_view is not None:
+                    bot.discord.ui.View.stop(state.control_view)
                 bot.music_states.pop(guild_id, None)
 
         message.edit.assert_awaited_once()
@@ -11385,7 +11516,145 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(voice.channel, new_channel)
         self.assertIsNone(state.empty_channel_task)
 
-    async def test_stop_attempts_response_before_blocked_panel_and_converges_after_response_failure(
+    async def test_slash_stop_ack_failures_and_revalidation_are_non_mutating(
+        self,
+    ) -> None:
+        changed_message = "재생 상태가 변경되어 조작이 취소됐어요. 다시 시도해 주세요."
+        channel_message = "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
+        outcomes = (
+            "defer-error",
+            "defer-cancel",
+            "voice",
+            "generation",
+            "member",
+            "disconnected",
+            "current",
+            "success",
+            "final-cancel",
+        )
+        for offset, outcome in enumerate(outcomes):
+            with self.subTest(outcome=outcome):
+                guild_id = 830 + offset
+                state = bot.get_state(guild_id)
+                current = make_track(f"current-{outcome}")
+                queued = make_track(f"queued-{outcome}")
+                state.current = current
+                state.queue.append(queued)
+                generation = state.playback_generation
+                channel = MagicMock(id=1300 + guild_id)
+                connected = {"value": True}
+                voice = MagicMock(channel=channel)
+                voice.is_connected.side_effect = lambda: connected["value"]
+                voice.is_playing.return_value = True
+                voice.is_paused.return_value = False
+                state.voice = voice
+                member = MagicMock()
+                member.voice = type("MemberVoice", (), {"channel": channel})()
+                interaction = MagicMock(guild_id=guild_id, user=member)
+                interaction.response.is_done.return_value = False
+                interaction.response.send_message = AsyncMock()
+                interaction.edit_original_response = AsyncMock()
+                response_error = bot.discord.DiscordServerError(
+                    MagicMock(status=500, reason="Internal Server Error"),
+                    f"<html>stop {outcome}</html>",
+                )
+                operation_started = asyncio.Event()
+                release_operation = asyncio.Event()
+                replacement_voice = None
+
+                async def defer_response() -> None:
+                    nonlocal replacement_voice
+                    self.assertIs(state.current, current)
+                    self.assertEqual(list(state.queue), [queued])
+                    voice.stop.assert_not_called()
+                    if outcome == "defer-error":
+                        raise response_error
+                    if outcome == "defer-cancel":
+                        operation_started.set()
+                        await release_operation.wait()
+                    elif outcome == "voice":
+                        replacement_voice = MagicMock()
+                        state.voice = replacement_voice
+                        connected["value"] = False
+                    elif outcome == "generation":
+                        state.playback_generation += 1
+                    elif outcome == "member":
+                        interaction.user.voice.channel = None
+                    elif outcome == "disconnected":
+                        connected["value"] = False
+                    elif outcome == "current":
+                        state.current = make_track("replacement-current")
+
+                async def edit_response(**_kwargs: object) -> None:
+                    if outcome == "final-cancel":
+                        operation_started.set()
+                        await release_operation.wait()
+
+                interaction.response.defer = AsyncMock(
+                    side_effect=defer_response
+                )
+                interaction.edit_original_response.side_effect = edit_response
+                show_idle_panel = AsyncMock()
+                stop_task = asyncio.create_task(bot.stop.callback(interaction))
+                try:
+                    with patch.object(bot, "show_idle_panel", show_idle_panel):
+                        if outcome in {"defer-cancel", "final-cancel"}:
+                            await asyncio.wait_for(operation_started.wait(), timeout=1)
+                            stop_task.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await asyncio.wait_for(stop_task, timeout=1)
+                            self.assertTrue(stop_task.cancelled())
+                        elif outcome == "defer-error":
+                            with self.assertRaises(
+                                bot.discord.DiscordServerError
+                            ) as raised:
+                                await asyncio.wait_for(stop_task, timeout=1)
+                            self.assertIs(raised.exception, response_error)
+                        else:
+                            await asyncio.wait_for(stop_task, timeout=1)
+
+                    interaction.response.defer.assert_awaited_once_with()
+                    interaction.response.send_message.assert_not_awaited()
+                    if outcome in {"current", "success", "final-cancel"}:
+                        self.assertIsNone(state.current)
+                        self.assertFalse(state.queue)
+                        self.assertEqual(state.playback_generation, generation + 1)
+                        voice.stop.assert_called_once_with()
+                        interaction.edit_original_response.assert_awaited_once_with(
+                            content="재생을 멈추고 대기열을 비웠어요."
+                        )
+                        show_idle_panel.assert_awaited_once_with(guild_id, state)
+                    else:
+                        self.assertIs(state.current, current)
+                        self.assertEqual(list(state.queue), [queued])
+                        self.assertFalse(state.stop_requested)
+                        self.assertEqual(
+                            state.playback_generation,
+                            generation + (outcome == "generation"),
+                        )
+                        voice.stop.assert_not_called()
+                        show_idle_panel.assert_not_awaited()
+                        if outcome in {"voice", "generation", "member", "disconnected"}:
+                            interaction.edit_original_response.assert_awaited_once_with(
+                                content=(
+                                    changed_message
+                                    if outcome in {"voice", "generation"}
+                                    else channel_message
+                                )
+                            )
+                        else:
+                            interaction.edit_original_response.assert_not_awaited()
+                        if replacement_voice is not None:
+                            replacement_voice.stop.assert_not_called()
+                finally:
+                    release_operation.set()
+                    if not stop_task.done():
+                        stop_task.cancel()
+                    await asyncio.gather(stop_task, return_exceptions=True)
+                    bot.cancel_empty_channel_disconnect(state)
+                    bot.music_states.pop(guild_id, None)
+
+    async def test_slash_stop_defers_before_mutation_and_converges_after_response_failure(
         self,
     ) -> None:
         guild_id = 821
@@ -11445,7 +11714,9 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         interaction = MagicMock()
         interaction.guild_id = guild_id
         interaction.user = User()
-        interaction.response.send_message = AsyncMock(side_effect=fail_response)
+        interaction.response.defer = AsyncMock()
+        interaction.response.send_message = AsyncMock()
+        interaction.edit_original_response = AsyncMock(side_effect=fail_response)
         interaction.response.is_done.return_value = False
 
         state = bot.get_state(guild_id)
@@ -11455,6 +11726,14 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         state.control_message = message
         state.announcement_channel = channel
         original_generation = state.playback_generation
+
+        async def defer_response() -> None:
+            self.assertIsNotNone(state.current)
+            self.assertTrue(state.queue)
+            self.assertEqual(state.playback_generation, original_generation)
+            self.assertEqual(voice.stop_calls, 0)
+
+        interaction.response.defer.side_effect = defer_response
         stop_task = None
         test_holds_lock = False
 
@@ -11465,9 +11744,11 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
                 stop_task = asyncio.create_task(bot.stop.callback(interaction))
                 await asyncio.wait_for(response_attempted.wait(), timeout=1)
 
-                interaction.response.send_message.assert_awaited_once_with(
-                    "재생을 멈추고 대기열을 비웠어요."
+                interaction.response.defer.assert_awaited_once_with()
+                interaction.edit_original_response.assert_awaited_once_with(
+                    content="재생을 멈추고 대기열을 비웠어요."
                 )
+                interaction.response.send_message.assert_not_awaited()
                 self.assertFalse(stop_task.done())
                 message.edit.assert_not_awaited()
                 self.assertIsNone(state.current)
