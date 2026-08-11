@@ -1525,11 +1525,9 @@ class MusicControlView(discord.ui.View):
         guild_id: int,
         *,
         disabled: bool = False,
-        timeout: float | None = None,
     ):
-        super().__init__(timeout=timeout)
+        super().__init__(timeout=None)
         self.guild_id = guild_id
-        self.transient_message: discord.Message | discord.PartialMessage | None = None
         self._sync_buttons(get_state(guild_id), disabled=disabled)
 
     def _sync_buttons(
@@ -1556,11 +1554,6 @@ class MusicControlView(discord.ui.View):
         return get_state(self.guild_id)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if self.timeout is not None and interaction.message is not None:
-            # Component interaction messages use the bot HTTP state, so they
-            # remain editable after the interaction token expires.
-            self.transient_message = interaction.message
-
         custom_id = (interaction.data or {}).get("custom_id")
         if custom_id == AUTOPLAY_BUTTON_CUSTOM_ID:
             state = self.get_state()
@@ -1600,25 +1593,17 @@ class MusicControlView(discord.ui.View):
                     return False
                 if state.current is None:
                     embed = make_idle_player_embed()
-                    if self.timeout is None:
-                        view = MusicControlView(self.guild_id, disabled=True)
-                    else:
-                        self._sync_buttons(state, disabled=True)
-                        view = self
+                    view = MusicControlView(self.guild_id, disabled=True)
                 else:
                     embed = make_player_embed(state.current, state)
-                    if self.timeout is None:
-                        view = MusicControlView(self.guild_id)
-                    else:
-                        self._sync_buttons(state, disabled=False)
-                        view = self
+                    view = MusicControlView(self.guild_id)
                 await interaction.edit_original_response(embed=embed, view=view)
                 control_message_id = getattr(state.control_message, "id", None)
                 clicked_is_current = (
                     clicked_message_id is not None
                     and clicked_message_id == control_message_id
                 )
-                if self.timeout is None and clicked_is_current:
+                if clicked_is_current:
                     replace_control_panel_view(
                         state,
                         view,
@@ -1636,33 +1621,9 @@ class MusicControlView(discord.ui.View):
                     await update_control_panel(
                         self.guild_id,
                         state,
-                        require_control_view=self.timeout is None,
+                        require_control_view=True,
                     )
         return clicked_panel_updated
-
-    async def on_timeout(self) -> None:
-        if bot_shutdown_started:
-            return
-
-        message = self.transient_message
-        state = music_states.get(self.guild_id)
-        if message is None or state is None:
-            return
-
-        async with state.control_panel_lock:
-            self._sync_buttons(state, disabled=state.current is None)
-            for child in self.children:
-                if isinstance(child, discord.ui.Button):
-                    child.disabled = True
-            try:
-                await message.edit(view=self)
-            except discord.NotFound:
-                pass
-            except discord.HTTPException as error:
-                log_discord_http_error(
-                    "disabling an expired nowplaying panel",
-                    error,
-                )
 
     @discord.ui.button(
         label="재생/일시정지",
@@ -1803,7 +1764,7 @@ class MusicControlView(discord.ui.View):
                 await show_idle_panel(
                     self.guild_id,
                     state,
-                    require_control_view=self.timeout is None,
+                    require_control_view=True,
                 )
 
     @discord.ui.button(
@@ -3539,32 +3500,6 @@ async def ensure_voice_channel(
         voice_operation_tasks.discard(operation_task)
 
 
-async def ensure_voice(interaction: discord.Interaction, state: GuildMusicState) -> bool:
-    user = interaction.user
-    voice_state = getattr(user, "voice", None)
-    channel = getattr(voice_state, "channel", None)
-
-    if channel is None:
-        await send_ephemeral_followup(
-            interaction,
-            "먼저 음성 채널에 들어가 주세요.",
-        )
-        return False
-
-    guild = interaction.guild
-    if guild is None:
-        await send_ephemeral_followup(interaction, guild_only_error())
-        return False
-
-    ok, error = await ensure_voice_channel(guild, channel, state)
-    if not ok:
-        await send_ephemeral_followup(
-            interaction,
-            error or "음성 채널 연결에 실패했어요.",
-        )
-    return ok
-
-
 async def ensure_voice_for_member(
     member: discord.Member,
     state: GuildMusicState,
@@ -4711,198 +4646,6 @@ async def setup_music_channel_error(
     await send_error("전용 채널을 설정하는 중 문제가 생겼어요.")
 
 
-@bot.tree.command(name="join", description="Join your current voice channel.")
-@app_commands.guild_only()
-async def join(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(ephemeral=True)
-    if interaction.guild_id is None:
-        await send_ephemeral_followup(interaction, guild_only_error())
-        return
-
-    state = get_state(interaction.guild_id)
-    if await ensure_voice(interaction, state):
-        state.announcement_channel = interaction.channel
-        await send_ephemeral_followup(interaction, "음성 채널에 들어왔어요.")
-
-
-@bot.tree.command(name="pause", description="Pause the current track.")
-@app_commands.guild_only()
-async def pause(interaction: discord.Interaction) -> None:
-    if interaction.guild_id is None:
-        await send_ephemeral_response(interaction, guild_only_error())
-        return
-
-    state = get_state(interaction.guild_id)
-    if not await ensure_same_voice_channel(interaction, state):
-        return
-    voice = state.voice
-    if voice is None or not voice.is_playing():
-        await send_ephemeral_response(interaction, "지금 재생 중인 곡이 없어요.")
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    if state.voice is not voice:
-        await send_ephemeral_followup(
-            interaction,
-            "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
-        )
-        return
-    if not await ensure_same_voice_channel(interaction, state):
-        return
-    if not voice.is_playing():
-        await send_ephemeral_followup(interaction, "지금 재생 중인 곡이 없어요.")
-        return
-
-    voice.pause()
-    await send_ephemeral_followup(interaction, "일시정지했어요.")
-
-
-@bot.tree.command(name="resume", description="Resume the paused track.")
-@app_commands.guild_only()
-async def resume(interaction: discord.Interaction) -> None:
-    if interaction.guild_id is None:
-        await send_ephemeral_response(interaction, guild_only_error())
-        return
-
-    state = get_state(interaction.guild_id)
-    if not await ensure_same_voice_channel(interaction, state):
-        return
-    voice = state.voice
-    if voice is None or not voice.is_paused():
-        await send_ephemeral_response(interaction, "일시정지된 곡이 없어요.")
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    if state.voice is not voice:
-        await send_ephemeral_followup(
-            interaction,
-            "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
-        )
-        return
-    if not await ensure_same_voice_channel(interaction, state):
-        return
-    if not voice.is_paused():
-        await send_ephemeral_followup(interaction, "일시정지된 곡이 없어요.")
-        return
-
-    voice.resume()
-    await send_ephemeral_followup(interaction, "다시 재생할게요.")
-
-
-@bot.tree.command(name="skip", description="Skip the current track.")
-@app_commands.guild_only()
-async def skip(interaction: discord.Interaction) -> None:
-    if interaction.guild_id is None:
-        await send_ephemeral_response(interaction, guild_only_error())
-        return
-
-    state = get_state(interaction.guild_id)
-    if not await ensure_same_voice_channel(interaction, state):
-        return
-
-    voice = state.voice
-    track = state.current
-    generation = state.playback_generation
-    if (
-        voice is None
-        or track is None
-        or not (voice.is_playing() or voice.is_paused())
-    ):
-        await send_ephemeral_response(interaction, "스킵할 곡이 없어요.")
-        return
-
-    await interaction.response.defer()
-    if (
-        state.voice is not voice
-        or state.current is not track
-        or state.playback_generation != generation
-    ):
-        await interaction.edit_original_response(
-            content="재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요."
-        )
-        return
-
-    member_channel = getattr(
-        getattr(interaction.user, "voice", None),
-        "channel",
-        None,
-    )
-    if not voice.is_connected() or member_channel != voice.channel:
-        await interaction.edit_original_response(
-            content="봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
-        )
-        return
-
-    if not (voice.is_playing() or voice.is_paused()):
-        await interaction.edit_original_response(content="스킵할 곡이 없어요.")
-        return
-
-    state.skip_requested = True
-    voice.stop()
-    await interaction.edit_original_response(content="다음 곡으로 넘어갈게요.")
-
-
-@bot.tree.command(name="stop", description="Stop playback and clear the queue.")
-@app_commands.guild_only()
-async def stop(interaction: discord.Interaction) -> None:
-    if interaction.guild_id is None:
-        await send_ephemeral_response(interaction, guild_only_error())
-        return
-
-    state = get_state(interaction.guild_id)
-    if not await ensure_same_voice_channel(interaction, state):
-        return
-
-    voice = state.voice
-    generation = state.playback_generation
-    await interaction.response.defer()
-    if state.voice is not voice or state.playback_generation != generation:
-        await interaction.edit_original_response(
-            content="재생 상태가 변경되어 조작이 취소됐어요. 다시 시도해 주세요."
-        )
-        return
-
-    member_channel = getattr(
-        getattr(interaction.user, "voice", None),
-        "channel",
-        None,
-    )
-    if (
-        voice is None
-        or not voice.is_connected()
-        or member_channel != voice.channel
-    ):
-        await interaction.edit_original_response(
-            content="봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
-        )
-        return
-
-    stop_playback(state, interaction.guild_id)
-
-    try:
-        await interaction.edit_original_response(
-            content="재생을 멈추고 대기열을 비웠어요."
-        )
-    finally:
-        await show_idle_panel(interaction.guild_id, state)
-
-
-@bot.tree.command(name="queue", description="Show the current music queue.")
-@app_commands.guild_only()
-async def show_queue(interaction: discord.Interaction) -> None:
-    if interaction.guild_id is None:
-        await send_ephemeral_response(interaction, guild_only_error())
-        return
-
-    state = get_state(interaction.guild_id)
-    await send_queue_management_response(
-        interaction,
-        interaction.guild_id,
-        embed=make_queue_embed(state),
-        view=QueueManageView(interaction.guild_id) if state.queue else None,
-    )
-
-
 @bot.tree.command(name="remove", description="Remove a track from the queue by position.")
 @app_commands.describe(position="Queue position to remove, starting from 1")
 @app_commands.guild_only()
@@ -4955,44 +4698,6 @@ async def remove_from_queue(interaction: discord.Interaction, position: int) -> 
     finally:
         if refresh_panel:
             await update_control_panel(interaction.guild_id, state)
-
-
-@bot.tree.command(name="nowplaying", description="Show the current track.")
-@app_commands.guild_only()
-async def now_playing(interaction: discord.Interaction) -> None:
-    if interaction.guild_id is None:
-        await send_ephemeral_response(interaction, guild_only_error())
-        return
-
-    state = get_state(interaction.guild_id)
-    if state.current:
-        view = MusicControlView(interaction.guild_id, timeout=180)
-        response = await interaction.response.send_message(
-            embed=make_player_embed(state.current, state),
-            view=view,
-        )
-        message_id = getattr(response, "message_id", None)
-        if message_id is not None:
-            channel = interaction.channel
-            get_partial_message = getattr(channel, "get_partial_message", None)
-            if not callable(get_partial_message):
-                channel_id = getattr(interaction, "channel_id", None)
-                if channel_id is not None:
-                    channel = bot.get_partial_messageable(channel_id)
-                    get_partial_message = getattr(
-                        channel,
-                        "get_partial_message",
-                        None,
-                    )
-            if callable(get_partial_message):
-                view.transient_message = get_partial_message(message_id)
-        if view.transient_message is None:
-            resource = getattr(response, "resource", None)
-            if isinstance(resource, discord.Message):
-                view.transient_message = resource
-        return
-
-    await send_ephemeral_response(interaction, "지금 재생 중인 곡이 없어요.")
 
 
 @bot.tree.command(name="leave", description="Disconnect from voice and clear the queue.")

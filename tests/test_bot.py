@@ -1914,14 +1914,7 @@ class CommandSurfaceTests(unittest.TestCase):
             command_names,
             {
                 "setupmusic",
-                "join",
-                "pause",
-                "resume",
-                "skip",
-                "stop",
-                "queue",
                 "remove",
-                "nowplaying",
                 "leave",
             },
         )
@@ -2930,288 +2923,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bot.discord.ui.View.stop(view)
 
-    async def test_nowplaying_views_are_finite_bound_and_expire_from_view_store(
-        self,
-    ) -> None:
-        guild_id = 8801
-        state = bot.get_state(guild_id)
-        state.current = make_track("finite-nowplaying")
-        message_id = 91_001
-        channel = MagicMock(spec=bot.discord.TextChannel)
-        channel.id = 91_000
-        channel.type = bot.discord.ChannelType.text
-        channel._state = bot.bot._connection
-        partial_message = bot.discord.PartialMessage(
-            channel=channel,
-            id=message_id,
-        )
-        channel.get_partial_message = MagicMock(return_value=partial_message)
-        resource_message = MagicMock(spec=bot.discord.Message)
-        response = SimpleNamespace(
-            message_id=message_id,
-            resource=resource_message,
-        )
-        interaction = MagicMock(
-            channel=channel,
-            channel_id=channel.id,
-            guild_id=guild_id,
-        )
-        interaction.response.send_message = AsyncMock(return_value=response)
-        views: list[bot.MusicControlView] = []
-        view_store = ViewStore(bot.bot._connection)
-        timeout_message = MagicMock()
-        timeout_edits: list[tuple[object, bool, bool]] = []
-        both_expired = asyncio.Event()
 
-        async def edit_expired_message(*, view: object) -> None:
-            timeout_edits.append(
-                (
-                    view,
-                    state.control_panel_lock.locked(),
-                    all(child.disabled for child in view.children),
-                )
-            )
-            message_id = view._cache_key
-            view_store.remove_message_tracking(message_id)
-            if not view.is_finished() and view.is_dispatchable():
-                view_store.add_view(view, message_id)
-            if len(timeout_edits) == 2:
-                both_expired.set()
-
-        timeout_message.edit = AsyncMock(side_effect=edit_expired_message)
-
-        try:
-            await bot.now_playing.callback(interaction)
-            finite_view = interaction.response.send_message.await_args.kwargs["view"]
-            self.assertEqual(finite_view.timeout, 180)
-            self.assertFalse(finite_view.is_persistent())
-            self.assertIs(finite_view.transient_message, partial_message)
-            self.assertIs(partial_message._state, bot.bot._connection)
-            channel.get_partial_message.assert_called_once_with(message_id)
-
-            canonical_view = bot.MusicControlView(guild_id)
-            self.assertIsNone(canonical_view.timeout)
-            self.assertTrue(canonical_view.is_persistent())
-            second_view = bot.MusicControlView(guild_id, timeout=0.01)
-            finite_view.timeout = 0.01
-            views.extend((finite_view, canonical_view, second_view))
-            for offset, view in enumerate((finite_view, second_view)):
-                view.transient_message = timeout_message
-                view_store.add_view(view, message_id + offset)
-
-            self.assertEqual(sum(map(len, view_store._views.values())), 16)
-            self.assertEqual(len(view_store._synced_message_views), 2)
-            expired_results = await asyncio.wait_for(
-                asyncio.gather(finite_view.wait(), second_view.wait()),
-                timeout=1,
-            )
-            self.assertTrue(all(expired_results))
-            await asyncio.wait_for(both_expired.wait(), timeout=1)
-            await asyncio.sleep(0)
-
-            self.assertCountEqual(
-                [entry[0] for entry in timeout_edits],
-                [finite_view, second_view],
-            )
-            self.assertTrue(all(entry[1] for entry in timeout_edits))
-            self.assertTrue(all(entry[2] for entry in timeout_edits))
-            self.assertEqual(timeout_message.edit.await_count, 2)
-            self.assertFalse(view_store._views)
-            self.assertFalse(view_store._synced_message_views)
-
-            error_view = bot.MusicControlView(guild_id, timeout=1)
-            views.append(error_view)
-            error_message = MagicMock()
-            response = MagicMock(status=500, reason="Internal Server Error")
-            timeout_error = bot.discord.DiscordServerError(
-                response,
-                "<html>expired panel failure</html>",
-            )
-            error_message.edit = AsyncMock(side_effect=timeout_error)
-            error_view.transient_message = error_message
-            with patch.object(bot, "log_discord_http_error") as log_http_error:
-                await error_view.on_timeout()
-            error_message.edit.assert_awaited_once_with(view=error_view)
-            log_http_error.assert_called_once_with(
-                "disabling an expired nowplaying panel",
-                timeout_error,
-            )
-        finally:
-            for view in reversed(views):
-                bot.discord.ui.View.stop(view)
-            bot.music_states.pop(guild_id, None)
-
-    async def test_finite_nowplaying_view_reuses_self_and_serializes_timeout(
-        self,
-    ) -> None:
-        guild_id = 8802
-        state = bot.get_state(guild_id)
-        state.current = make_track("racing-nowplaying")
-        view = bot.MusicControlView(guild_id, timeout=10)
-        view_store = ViewStore(bot.bot._connection)
-        message_id = 92_001
-        component_message = MagicMock(id=message_id)
-        interaction = MagicMock(
-            data={"custom_id": "music:repeat"},
-            message=component_message,
-        )
-        interaction.response.is_done.return_value = True
-        interaction.response.defer = AsyncMock()
-        reset_lock_states: list[bool] = []
-        reset_rendered_views: list[object] = []
-
-        async def reset_view_store(**kwargs: object) -> None:
-            rendered_view = kwargs["view"]
-            reset_lock_states.append(state.control_panel_lock.locked())
-            reset_rendered_views.append(rendered_view)
-            view_store.add_view(rendered_view, message_id)
-
-        interaction.edit_original_response = AsyncMock(
-            side_effect=reset_view_store
-        )
-        late_before_lock = asyncio.Event()
-        is_done_calls = 0
-
-        def response_is_done() -> bool:
-            nonlocal is_done_calls
-            is_done_calls += 1
-            if is_done_calls == 2:
-                late_before_lock.set()
-            return True
-
-        rest_started = asyncio.Event()
-        release_rest = asyncio.Event()
-        timeout_entered = asyncio.Event()
-        timeout_done = asyncio.Event()
-        order: list[str] = []
-        lock_states: list[bool] = []
-        remote_disabled: list[bool] = []
-        rest_views: list[object] = []
-        callback_tasks: list[asyncio.Task] = []
-
-        async def edit_transient(**kwargs: object) -> None:
-            rendered_view = kwargs["view"]
-            rest_views.append(rendered_view)
-            order.append("rest-start")
-            lock_states.append(state.control_panel_lock.locked())
-            rest_started.set()
-            await release_rest.wait()
-            remote_disabled.append(
-                all(child.disabled for child in rendered_view.children)
-            )
-            order.append("rest-finish")
-            if not rendered_view.is_finished() and rendered_view.is_dispatchable():
-                view_store.add_view(rendered_view, message_id)
-
-        timeout_message = MagicMock(id=message_id)
-
-        async def edit_timeout_message(*, view: object) -> None:
-            order.append("timeout")
-            lock_states.append(state.control_panel_lock.locked())
-            remote_disabled.append(all(child.disabled for child in view.children))
-            view_store.remove_message_tracking(message_id)
-            if not view.is_finished() and view.is_dispatchable():
-                view_store.add_view(view, message_id)
-
-        timeout_message.edit = AsyncMock(side_effect=edit_timeout_message)
-        original_on_timeout = view.on_timeout
-
-        async def observe_timeout() -> None:
-            timeout_entered.set()
-            try:
-                await original_on_timeout()
-            finally:
-                timeout_done.set()
-
-        view.on_timeout = observe_timeout
-
-        try:
-            view_store.add_view(view, message_id)
-            first_expiry = view._BaseView__timeout_expiry
-
-            async def assert_rebound_before_check(
-                checked_interaction: object,
-                checked_state: object,
-            ) -> bool:
-                self.assertIs(checked_interaction, interaction)
-                self.assertIs(checked_state, state)
-                self.assertIs(view.transient_message, component_message)
-                return True
-
-            with patch.object(
-                bot,
-                "ensure_same_voice_channel",
-                side_effect=assert_rebound_before_check,
-            ):
-                self.assertTrue(
-                    await view.interaction_check(interaction)
-                )
-            await asyncio.sleep(0)
-            await view.edit_panel(interaction)
-            second_expiry = view._BaseView__timeout_expiry
-
-            self.assertEqual(reset_rendered_views, [view])
-            self.assertEqual(reset_lock_states, [True])
-            self.assertGreater(second_expiry, first_expiry)
-            self.assertEqual(len(view_store._views[message_id]), 8)
-            self.assertIs(
-                view_store._synced_message_views[message_id],
-                view,
-            )
-            self.assertTrue(
-                all(
-                    item.view is view
-                    for item in view_store._views[message_id].values()
-                )
-            )
-
-            interaction.edit_original_response.reset_mock()
-            interaction.edit_original_response.side_effect = edit_transient
-            interaction.response.is_done.side_effect = response_is_done
-            view.timeout = 0.05
-            view.transient_message = timeout_message
-            view_store.add_view(view, message_id)
-            first_task = asyncio.create_task(
-                view.edit_panel(interaction)
-            )
-            callback_tasks.append(first_task)
-            await asyncio.wait_for(rest_started.wait(), timeout=1)
-            late_task = asyncio.create_task(
-                view.edit_panel(interaction)
-            )
-            callback_tasks.append(late_task)
-            await asyncio.wait_for(late_before_lock.wait(), timeout=1)
-            await asyncio.wait_for(view.wait(), timeout=1)
-            await asyncio.wait_for(timeout_entered.wait(), timeout=1)
-            release_rest.set()
-            await asyncio.wait_for(
-                asyncio.gather(first_task, late_task),
-                timeout=1,
-            )
-            await asyncio.wait_for(timeout_done.wait(), timeout=1)
-
-            self.assertEqual(is_done_calls, 2)
-            self.assertEqual(rest_views, [view])
-            self.assertEqual(order, ["rest-start", "rest-finish", "timeout"])
-            self.assertEqual(lock_states, [True, True])
-            self.assertEqual(remote_disabled, [False, True])
-            interaction.edit_original_response.assert_awaited_once()
-            timeout_message.edit.assert_awaited_once_with(view=view)
-            self.assertTrue(view.is_finished())
-            self.assertTrue(all(child.disabled for child in view.children))
-            self.assertNotIn(message_id, view_store._views)
-            self.assertNotIn(message_id, view_store._synced_message_views)
-        finally:
-            release_rest.set()
-            for task in callback_tasks:
-                if not task.done():
-                    task.cancel()
-            if callback_tasks:
-                await asyncio.gather(*callback_tasks, return_exceptions=True)
-            if timeout_entered.is_set() and not timeout_done.is_set():
-                await asyncio.wait_for(timeout_done.wait(), timeout=1)
-            bot.discord.ui.View.stop(view)
-            bot.music_states.pop(guild_id, None)
 
     def _make_pause_case(self, guild_id: int, action: str):
         state = bot.get_state(guild_id)
@@ -3294,10 +3006,9 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             view=bot.MusicControlView(guild_id),
         )
 
-    async def _assert_skip_contract(
+    async def _assert_component_skip_contract(
         self,
         *,
-        component: bool,
         first_guild_id: int,
     ) -> None:
         next_guild_id = first_guild_id
@@ -3309,33 +3020,21 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             return case
 
         async def invoke(case: SimpleNamespace, *, check: bool = True) -> None:
-            if component:
-                if check:
-                    self.assertTrue(
-                        await case.view.interaction_check(case.interaction)
-                    )
-                await case.view.skip.callback(case.interaction)
-            else:
-                await bot.skip.callback(case.interaction)
+            if check:
+                self.assertTrue(
+                    await case.view.interaction_check(case.interaction)
+                )
+            await case.view.skip.callback(case.interaction)
 
         def set_final_response(case: SimpleNamespace, side_effect) -> None:
-            if component:
-                case.interaction.followup.send.side_effect = side_effect
-            else:
-                case.interaction.edit_original_response.side_effect = side_effect
+            case.interaction.followup.send.side_effect = side_effect
 
         def assert_feedback(case: SimpleNamespace, content: str) -> None:
             case.interaction.response.send_message.assert_not_awaited()
-            if component:
-                case.interaction.followup.send.assert_awaited_once_with(
-                    content, ephemeral=True, wait=True
-                )
-                case.interaction.edit_original_response.assert_not_awaited()
-            else:
-                case.interaction.edit_original_response.assert_awaited_once_with(
-                    content=content
-                )
-                case.interaction.followup.send.assert_not_awaited()
+            case.interaction.followup.send.assert_awaited_once_with(
+                content, ephemeral=True, wait=True
+            )
+            case.interaction.edit_original_response.assert_not_awaited()
 
         with patch.object(
             bot,
@@ -3343,7 +3042,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             side_effect=lambda coroutine: coroutine.close(),
         ):
             for initial_state in ("voice", "track", "idle"):
-                with self.subTest(component=component, initial_state=initial_state):
+                with self.subTest(initial_state=initial_state):
                     case = make_case()
                     if initial_state == "voice":
                         case.state.voice = None
@@ -3352,13 +3051,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                     else:
                         case.flags.update(playing=False, paused=False)
                     await invoke(case, check=False)
-                    expected_message = (
-                        "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
-                        if not component and initial_state == "voice"
-                        else "스킵할 곡이 없어요."
-                    )
                     case.interaction.response.send_message.assert_awaited_once_with(
-                        expected_message, ephemeral=True
+                        "스킵할 곡이 없어요.", ephemeral=True
                     )
                     case.interaction.response.defer.assert_not_awaited()
                     case.interaction.followup.send.assert_not_awaited()
@@ -3440,7 +3134,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             ("disconnected", same_channel_message),
             ("idle", "스킵할 곡이 없어요."),
         ):
-            with self.subTest(component=component, changed_state=changed_state):
+            with self.subTest(changed_state=changed_state):
                 case = make_case()
                 replacement_voice = None
 
@@ -3547,12 +3241,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
     async def test_component_skip_acknowledges_and_revalidates_before_stop(
         self,
     ) -> None:
-        await self._assert_skip_contract(component=True, first_guild_id=362)
-
-    async def test_slash_skip_acknowledges_and_revalidates_before_stop(
-        self,
-    ) -> None:
-        await self._assert_skip_contract(component=False, first_guild_id=382)
+        await self._assert_component_skip_contract(first_guild_id=362)
 
     async def test_pause_resume_acknowledges_and_revalidates_before_toggle(
         self,
@@ -3737,196 +3426,6 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 )
                 bot.music_states.pop(guild_id, None)
 
-    async def test_slash_pause_resume_acknowledge_and_revalidate_before_toggle(
-        self,
-    ) -> None:
-        def make_case(guild_id: int, action: str):
-            command = bot.pause if action == "pause" else bot.resume
-            return (*self._make_pause_case(guild_id, action), command)
-
-        with patch.object(
-            bot,
-            "create_housekeeping_task",
-            side_effect=lambda coroutine: coroutine.close(),
-        ):
-            for guild_id, action, expected_message in (
-                (358, "pause", "지금 재생 중인 곡이 없어요."),
-                (359, "resume", "일시정지된 곡이 없어요."),
-            ):
-                with self.subTest(action=action, outcome="initial_noop"):
-                    state, voice, flags, _ops, _ack, interaction, command = (
-                        make_case(guild_id, action)
-                    )
-                    flags.update(playing=False, paused=False)
-                    await command.callback(interaction)
-                    interaction.response.send_message.assert_awaited_once_with(
-                        expected_message, ephemeral=True
-                    )
-                    interaction.response.defer.assert_not_awaited()
-                    interaction.followup.send.assert_not_awaited()
-                    self.assertEqual(_ops, [])
-                    bot.music_states.pop(guild_id, None)
-
-        for guild_id, action, success_message in (
-            (350, "pause", "일시정지했어요."),
-            (351, "resume", "다시 재생할게요."),
-        ):
-            with self.subTest(action=action, outcome="success"):
-                state, voice, flags, operations, acknowledged, interaction, command = (
-                    make_case(guild_id, action)
-                )
-
-                async def defer_response(*, ephemeral: bool) -> None:
-                    self.assertTrue(ephemeral)
-                    operations.append("defer")
-                    voice.pause.assert_not_called()
-                    voice.resume.assert_not_called()
-                    acknowledged["done"] = True
-
-                async def send_followup(*_args: object, **_kwargs: object) -> None:
-                    operations.append("followup")
-                    return None
-
-                interaction.response.defer.side_effect = defer_response
-                interaction.followup.send.side_effect = send_followup
-                await command.callback(interaction)
-                self.assertEqual(operations, ["defer", action, "followup"])
-                interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-                interaction.response.send_message.assert_not_awaited()
-                interaction.edit_original_response.assert_not_awaited()
-                interaction.followup.send.assert_awaited_once_with(
-                    success_message, ephemeral=True, wait=True
-                )
-                self.assertEqual(
-                    flags,
-                    {"playing": action == "resume", "paused": action == "pause"},
-                )
-                self.assertIs(state.voice, voice)
-                bot.music_states.pop(guild_id, None)
-
-        state, voice, flags, operations, _ack, interaction, command = make_case(
-            352, "pause"
-        )
-        response_error = bot.discord.DiscordServerError(
-            MagicMock(status=500, reason="Internal Server Error"),
-            "<html>temporary failure</html>",
-        )
-        interaction.response.defer.side_effect = response_error
-        with self.assertRaises(bot.discord.DiscordServerError) as raised:
-            await command.callback(interaction)
-        self.assertIs(raised.exception, response_error)
-        self.assertEqual(flags, {"playing": True, "paused": False})
-        self.assertIs(state.voice, voice)
-        self.assertEqual(operations, [])
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-        interaction.response.send_message.assert_not_awaited()
-        interaction.followup.send.assert_not_awaited()
-        bot.music_states.pop(352, None)
-
-        state, voice, flags, operations, _ack, interaction, command = make_case(
-            353, "resume"
-        )
-        defer_started = asyncio.Event()
-        release_defer = asyncio.Event()
-
-        async def block_defer(*, ephemeral: bool) -> None:
-            self.assertTrue(ephemeral)
-            operations.append("defer")
-            defer_started.set()
-            await release_defer.wait()
-
-        interaction.response.defer.side_effect = block_defer
-        callback_task = asyncio.create_task(command.callback(interaction))
-        try:
-            await asyncio.wait_for(defer_started.wait(), timeout=1)
-            self.assertEqual(flags, {"playing": False, "paused": True})
-            callback_task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await asyncio.wait_for(callback_task, timeout=1)
-
-            self.assertTrue(callback_task.cancelled())
-            self.assertIs(state.voice, voice)
-            interaction.response.send_message.assert_not_awaited()
-            interaction.followup.send.assert_not_awaited()
-            voice.pause.assert_not_called()
-            voice.resume.assert_not_called()
-        finally:
-            release_defer.set()
-            callback_task.cancel()
-            await asyncio.gather(callback_task, return_exceptions=True)
-            bot.music_states.pop(353, None)
-
-        for guild_id, action, changed_state, expected_message in (
-            (
-                354,
-                "pause",
-                "replacement",
-                "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
-            ),
-            (
-                355,
-                "resume",
-                "moved",
-                "봇과 같은 음성 채널에 들어와야 조작할 수 있어요.",
-            ),
-            (
-                356,
-                "pause",
-                "idle",
-                "지금 재생 중인 곡이 없어요.",
-            ),
-            (357, "pause", "moved", "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."),
-            (
-                360,
-                "resume",
-                "replacement",
-                "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
-            ),
-            (361, "resume", "idle", "일시정지된 곡이 없어요."),
-        ):
-            with self.subTest(action=action, changed_state=changed_state):
-                state, voice, flags, operations, acknowledged, interaction, command = (
-                    make_case(guild_id, action)
-                )
-                replacement_voice = None
-
-                async def defer_response(*, ephemeral: bool) -> None:
-                    nonlocal replacement_voice
-                    self.assertTrue(ephemeral)
-                    operations.append("defer")
-                    if changed_state == "replacement":
-                        replacement_voice = MagicMock(
-                            channel=MagicMock(id=9000 + guild_id)
-                        )
-                        replacement_voice.is_connected.return_value = False
-                        state.voice = replacement_voice
-                    elif changed_state == "moved":
-                        interaction.user.voice.channel = MagicMock(id=9000 + guild_id)
-                    else:
-                        flags.update(playing=False, paused=False)
-                    acknowledged["done"] = True
-
-                async def send_followup(*_args: object, **_kwargs: object) -> None:
-                    operations.append("followup")
-                    return None
-
-                interaction.response.defer.side_effect = defer_response
-                interaction.followup.send.side_effect = send_followup
-                await command.callback(interaction)
-                self.assertEqual(operations, ["defer", "followup"])
-                interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-                interaction.response.send_message.assert_not_awaited()
-                interaction.edit_original_response.assert_not_awaited()
-                interaction.followup.send.assert_awaited_once_with(
-                    expected_message, ephemeral=True, wait=True
-                )
-                if changed_state == "replacement":
-                    self.assertIs(state.voice, replacement_voice)
-                    replacement_voice.pause.assert_not_called()
-                    replacement_voice.resume.assert_not_called()
-                else:
-                    self.assertIs(state.voice, voice)
-                bot.music_states.pop(guild_id, None)
 
     async def test_component_edit_cannot_overwrite_newer_idle_panel(self) -> None:
         guild_id = 320
@@ -4058,173 +3557,6 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_nowplaying_state_buttons_refresh_canonical_panel(
-        self,
-    ) -> None:
-        async def get_nowplaying_view(guild_id: int) -> bot.MusicControlView:
-            interaction = MagicMock(guild_id=guild_id)
-            interaction.response.send_message = AsyncMock()
-            await bot.now_playing.callback(interaction)
-            view = interaction.response.send_message.await_args.kwargs["view"]
-            self.assertIsInstance(view, bot.MusicControlView)
-            return view
-
-        normal_cases = ((334, "repeat"), (335, "shuffle"), (336, "autoplay"))
-        failure_cases = ((337, "repeat"), (338, "shuffle"))
-        guild_ids = tuple(guild_id for guild_id, _ in normal_cases + failure_cases)
-
-        try:
-            for guild_id, action in normal_cases:
-                with self.subTest(action=action, outcome="success"):
-                    state = bot.get_state(guild_id)
-                    current = make_track(f"current-{action}")
-                    queued = [make_track(f"{action}-{index}") for index in range(3)]
-                    state.current = current
-                    state.queue.extend(queued)
-                    channel = MagicMock(id=6000 + guild_id)
-                    channel.send = AsyncMock()
-                    voice = MagicMock(channel=channel)
-                    voice.is_connected.return_value = True
-                    state.voice = voice
-                    member = MagicMock()
-                    member.voice = MagicMock(channel=channel)
-                    canonical = MagicMock(id=7000 + guild_id, channel=channel)
-                    order: list[str] = []
-                    lock_states: list[bool] = []
-
-                    async def edit_canonical(**_kwargs: object) -> None:
-                        order.append("canonical")
-                        lock_states.append(state.control_panel_lock.locked())
-
-                    canonical.edit = AsyncMock(side_effect=edit_canonical)
-                    state.control_message = canonical
-                    state.announcement_channel = channel
-                    view = await get_nowplaying_view(guild_id)
-                    clicked = MagicMock(id=canonical.id + 1, channel=channel)
-                    acknowledged = False
-
-                    async def defer_response() -> None:
-                        nonlocal acknowledged
-                        order.append("defer")
-                        lock_states.append(state.control_panel_lock.locked())
-                        acknowledged = True
-
-                    async def edit_clicked(**_kwargs: object) -> None:
-                        order.append("clicked")
-                        lock_states.append(state.control_panel_lock.locked())
-
-                    def shuffle_tracks(tracks: list[bot.Track]) -> None:
-                        order.append("shuffle")
-                        tracks.reverse()
-
-                    interaction = MagicMock(message=clicked, user=member)
-                    interaction.response.defer = AsyncMock(side_effect=defer_response)
-                    interaction.response.is_done.side_effect = lambda: acknowledged
-                    interaction.edit_original_response = AsyncMock(
-                        side_effect=edit_clicked
-                    )
-
-                    with (
-                        patch.object(bot, "get_music_channel_id", return_value=None),
-                        patch.object(
-                            bot.random,
-                            "shuffle",
-                            side_effect=shuffle_tracks,
-                        ) as shuffle_mock,
-                        patch.object(
-                            bot,
-                            "set_autoplay_enabled",
-                            side_effect=lambda *_args: order.append("persist"),
-                        ) as persist_mock,
-                        patch.object(
-                            bot,
-                            "schedule_autoplay_refill",
-                            side_effect=lambda *_args: order.append("refill"),
-                        ) as refill_mock,
-                        patch.object(bot, "cancel_autoplay_refill") as cancel_mock,
-                    ):
-                        await getattr(view, action).callback(interaction)
-
-                    interaction.response.defer.assert_awaited_once_with()
-                    interaction.edit_original_response.assert_awaited_once()
-                    canonical.edit.assert_awaited_once()
-                    self.assertEqual(lock_states, [False, True, True])
-                    expected_embed = bot.make_player_embed(current, state).to_dict()
-                    self.assertEqual(
-                        interaction.edit_original_response.await_args.kwargs[
-                            "embed"
-                        ].to_dict(),
-                        expected_embed,
-                    )
-                    self.assertEqual(
-                        canonical.edit.await_args.kwargs["embed"].to_dict(),
-                        expected_embed,
-                    )
-                    self.assertIsNone(canonical.edit.await_args.kwargs["content"])
-                    channel.send.assert_not_awaited()
-
-                    if action == "repeat":
-                        self.assertTrue(state.repeat_one)
-                        self.assertEqual(order, ["defer", "clicked", "canonical"])
-                    elif action == "shuffle":
-                        self.assertEqual(list(state.queue), list(reversed(queued)))
-                        self.assertEqual(
-                            order,
-                            ["defer", "shuffle", "clicked", "canonical"],
-                        )
-                    else:
-                        self.assertTrue(state.autoplay_enabled)
-                        self.assertEqual(
-                            order,
-                            ["defer", "persist", "refill", "clicked", "canonical"],
-                        )
-                        persist_mock.assert_called_once_with(guild_id, True)
-                        refill_mock.assert_called_once_with(guild_id)
-                        cancel_mock.assert_not_called()
-                    if action != "shuffle":
-                        shuffle_mock.assert_not_called()
-
-            for guild_id, action in failure_cases:
-                with self.subTest(action=action, outcome="defer failure"):
-                    state = bot.get_state(guild_id)
-                    state.current = make_track(f"failure-{action}")
-                    original_queue = state.queue
-                    original_queue.extend(make_track(str(index)) for index in range(2))
-                    original_tracks = list(original_queue)
-                    state.control_message = MagicMock()
-                    state.control_message.edit = AsyncMock()
-                    view = await get_nowplaying_view(guild_id)
-                    response = MagicMock(status=500, reason="Internal Server Error")
-                    defer_error = bot.discord.DiscordServerError(
-                        response,
-                        f"<html>{action} defer failure</html>",
-                    )
-                    interaction = MagicMock()
-                    interaction.response.defer = AsyncMock(side_effect=defer_error)
-                    interaction.edit_original_response = AsyncMock()
-
-                    with patch.object(bot.random, "shuffle") as shuffle_mock:
-                        with self.assertRaises(
-                            bot.discord.DiscordServerError
-                        ) as raised:
-                            await getattr(view, action).callback(interaction)
-
-                    self.assertIs(raised.exception, defer_error)
-                    self.assertFalse(state.repeat_one)
-                    self.assertIs(state.queue, original_queue)
-                    self.assertEqual(list(state.queue), original_tracks)
-                    shuffle_mock.assert_not_called()
-                    interaction.response.defer.assert_awaited_once_with()
-                    interaction.edit_original_response.assert_not_awaited()
-                    state.control_message.edit.assert_not_awaited()
-        finally:
-            for guild_id in guild_ids:
-                state = bot.music_states.get(guild_id)
-                if state is None:
-                    continue
-                bot.cancel_autoplay_refill(state)
-                bot.cancel_empty_channel_disconnect(state)
-                bot.music_states.pop(guild_id, None)
 
     async def test_state_buttons_revalidate_voice_after_defer(self) -> None:
         changed_message = (
@@ -4296,7 +3628,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             canonical.edit = AsyncMock()
             state.control_message = canonical
             state.announcement_channel = panel_channel
-            view = bot.MusicControlView(guild_id, timeout=180)
+            state.control_view = bot.MusicControlView(guild_id)
+            view = bot.MusicControlView(guild_id)
             custom_id = (
                 bot.AUTOPLAY_BUTTON_CUSTOM_ID
                 if action == "autoplay"
@@ -4536,10 +3869,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             interaction.response.is_done.return_value = False
             interaction.response.defer = AsyncMock()
             interaction.edit_original_response = AsyncMock()
-            view = bot.MusicControlView(
-                guild_id,
-                timeout=None if same_id else 180,
-            )
+            view = bot.MusicControlView(guild_id)
             if same_id:
                 state.control_view = view
             return state, channel, canonical, interaction, view
@@ -4768,12 +4098,11 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                             "clicked"
                         )
                     )
-                    view = bot.MusicControlView(
-                        guild_id,
-                        timeout=None if clicked_is_canonical else 180,
-                    )
+                    view = bot.MusicControlView(guild_id)
                     if clicked_is_canonical:
                         state.control_view = view
+                    else:
+                        state.control_view = bot.MusicControlView(guild_id)
                     button = next(
                         item
                         for item in view.children
@@ -10434,288 +9763,7 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(voice.channel, new_channel)
         self.assertIsNone(state.empty_channel_task)
 
-    async def test_slash_stop_ack_failures_and_revalidation_are_non_mutating(
-        self,
-    ) -> None:
-        changed_message = "재생 상태가 변경되어 조작이 취소됐어요. 다시 시도해 주세요."
-        channel_message = "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
-        outcomes = (
-            "defer-error",
-            "defer-cancel",
-            "voice",
-            "generation",
-            "member",
-            "disconnected",
-            "current",
-            "success",
-            "final-cancel",
-        )
-        for offset, outcome in enumerate(outcomes):
-            with self.subTest(outcome=outcome):
-                guild_id = 830 + offset
-                state = bot.get_state(guild_id)
-                current = make_track(f"current-{outcome}")
-                queued = make_track(f"queued-{outcome}")
-                state.current = current
-                state.queue.append(queued)
-                generation = state.playback_generation
-                channel = MagicMock(id=1300 + guild_id)
-                connected = {"value": True}
-                voice = MagicMock(channel=channel)
-                voice.is_connected.side_effect = lambda: connected["value"]
-                voice.is_playing.return_value = True
-                voice.is_paused.return_value = False
-                state.voice = voice
-                member = MagicMock()
-                member.voice = type("MemberVoice", (), {"channel": channel})()
-                interaction = MagicMock(guild_id=guild_id, user=member)
-                interaction.response.is_done.return_value = False
-                interaction.response.send_message = AsyncMock()
-                interaction.edit_original_response = AsyncMock()
-                response_error = bot.discord.DiscordServerError(
-                    MagicMock(status=500, reason="Internal Server Error"),
-                    f"<html>stop {outcome}</html>",
-                )
-                operation_started = asyncio.Event()
-                release_operation = asyncio.Event()
-                replacement_voice = None
 
-                async def defer_response() -> None:
-                    nonlocal replacement_voice
-                    self.assertIs(state.current, current)
-                    self.assertEqual(list(state.queue), [queued])
-                    voice.stop.assert_not_called()
-                    if outcome == "defer-error":
-                        raise response_error
-                    if outcome == "defer-cancel":
-                        operation_started.set()
-                        await release_operation.wait()
-                    elif outcome == "voice":
-                        replacement_voice = MagicMock()
-                        state.voice = replacement_voice
-                        connected["value"] = False
-                    elif outcome == "generation":
-                        state.playback_generation += 1
-                    elif outcome == "member":
-                        interaction.user.voice.channel = None
-                    elif outcome == "disconnected":
-                        connected["value"] = False
-                    elif outcome == "current":
-                        state.current = make_track("replacement-current")
-
-                async def edit_response(**_kwargs: object) -> None:
-                    if outcome == "final-cancel":
-                        operation_started.set()
-                        await release_operation.wait()
-
-                interaction.response.defer = AsyncMock(
-                    side_effect=defer_response
-                )
-                interaction.edit_original_response.side_effect = edit_response
-                show_idle_panel = AsyncMock()
-                stop_task = asyncio.create_task(bot.stop.callback(interaction))
-                try:
-                    with patch.object(bot, "show_idle_panel", show_idle_panel):
-                        if outcome in {"defer-cancel", "final-cancel"}:
-                            await asyncio.wait_for(operation_started.wait(), timeout=1)
-                            stop_task.cancel()
-                            with self.assertRaises(asyncio.CancelledError):
-                                await asyncio.wait_for(stop_task, timeout=1)
-                            self.assertTrue(stop_task.cancelled())
-                        elif outcome == "defer-error":
-                            with self.assertRaises(
-                                bot.discord.DiscordServerError
-                            ) as raised:
-                                await asyncio.wait_for(stop_task, timeout=1)
-                            self.assertIs(raised.exception, response_error)
-                        else:
-                            await asyncio.wait_for(stop_task, timeout=1)
-
-                    interaction.response.defer.assert_awaited_once_with()
-                    interaction.response.send_message.assert_not_awaited()
-                    if outcome in {"current", "success", "final-cancel"}:
-                        self.assertIsNone(state.current)
-                        self.assertFalse(state.queue)
-                        self.assertEqual(state.playback_generation, generation + 1)
-                        voice.stop.assert_called_once_with()
-                        interaction.edit_original_response.assert_awaited_once_with(
-                            content="재생을 멈추고 대기열을 비웠어요."
-                        )
-                        show_idle_panel.assert_awaited_once_with(guild_id, state)
-                    else:
-                        self.assertIs(state.current, current)
-                        self.assertEqual(list(state.queue), [queued])
-                        self.assertFalse(state.stop_requested)
-                        self.assertEqual(
-                            state.playback_generation,
-                            generation + (outcome == "generation"),
-                        )
-                        voice.stop.assert_not_called()
-                        show_idle_panel.assert_not_awaited()
-                        if outcome in {"voice", "generation", "member", "disconnected"}:
-                            interaction.edit_original_response.assert_awaited_once_with(
-                                content=(
-                                    changed_message
-                                    if outcome in {"voice", "generation"}
-                                    else channel_message
-                                )
-                            )
-                        else:
-                            interaction.edit_original_response.assert_not_awaited()
-                        if replacement_voice is not None:
-                            replacement_voice.stop.assert_not_called()
-                finally:
-                    release_operation.set()
-                    if not stop_task.done():
-                        stop_task.cancel()
-                    await asyncio.gather(stop_task, return_exceptions=True)
-                    bot.cancel_empty_channel_disconnect(state)
-                    bot.music_states.pop(guild_id, None)
-
-    async def test_slash_stop_defers_before_mutation_and_converges_after_response_failure(
-        self,
-    ) -> None:
-        guild_id = 821
-        response_attempted = asyncio.Event()
-
-        class Channel:
-            id = 1102
-
-            def __init__(self) -> None:
-                self.send = AsyncMock()
-
-        channel = Channel()
-
-        class Message:
-            id = 1202
-
-            def __init__(self) -> None:
-                self.channel = channel
-                self.edit = AsyncMock()
-
-        message = Message()
-
-        class Voice:
-            def __init__(self) -> None:
-                self.channel = channel
-                self.playing = True
-                self.stop_calls = 0
-
-            def is_connected(self) -> bool:
-                return True
-
-            def is_playing(self) -> bool:
-                return self.playing
-
-            def is_paused(self) -> bool:
-                return False
-
-            def stop(self) -> None:
-                self.stop_calls += 1
-                self.playing = False
-
-        voice = Voice()
-
-        class User:
-            voice = type("MemberVoice", (), {"channel": channel})()
-
-        response = MagicMock(status=500, reason="Internal Server Error")
-        response_error = bot.discord.DiscordServerError(
-            response,
-            "<html>temporary failure</html>",
-        )
-
-        async def fail_response(*_args: object, **_kwargs: object) -> None:
-            response_attempted.set()
-            raise response_error
-
-        interaction = MagicMock()
-        interaction.guild_id = guild_id
-        interaction.user = User()
-        interaction.response.defer = AsyncMock()
-        interaction.response.send_message = AsyncMock()
-        interaction.edit_original_response = AsyncMock(side_effect=fail_response)
-        interaction.response.is_done.return_value = False
-
-        state = bot.get_state(guild_id)
-        state.voice = voice
-        state.current = make_track("current")
-        state.queue.append(make_track("queued"))
-        state.control_message = message
-        state.announcement_channel = channel
-        original_generation = state.playback_generation
-
-        async def defer_response() -> None:
-            self.assertIsNotNone(state.current)
-            self.assertTrue(state.queue)
-            self.assertEqual(state.playback_generation, original_generation)
-            self.assertEqual(voice.stop_calls, 0)
-
-        interaction.response.defer.side_effect = defer_response
-        stop_task = None
-        test_holds_lock = False
-
-        with patch.object(bot, "get_music_channel_id", return_value=None):
-            try:
-                await asyncio.wait_for(state.control_panel_lock.acquire(), timeout=1)
-                test_holds_lock = True
-                stop_task = asyncio.create_task(bot.stop.callback(interaction))
-                await asyncio.wait_for(response_attempted.wait(), timeout=1)
-
-                interaction.response.defer.assert_awaited_once_with()
-                interaction.edit_original_response.assert_awaited_once_with(
-                    content="재생을 멈추고 대기열을 비웠어요."
-                )
-                interaction.response.send_message.assert_not_awaited()
-                self.assertFalse(stop_task.done())
-                message.edit.assert_not_awaited()
-                self.assertIsNone(state.current)
-                self.assertFalse(state.queue)
-                self.assertEqual(
-                    state.playback_generation,
-                    original_generation + 1,
-                )
-                self.assertEqual(voice.stop_calls, 1)
-                self.assertFalse(voice.is_playing())
-
-                state.control_panel_lock.release()
-                test_holds_lock = False
-                with self.assertRaises(bot.discord.DiscordServerError) as raised:
-                    await asyncio.wait_for(stop_task, timeout=1)
-                self.assertIs(raised.exception, response_error)
-            finally:
-                if test_holds_lock:
-                    state.control_panel_lock.release()
-                if stop_task is not None and not stop_task.done():
-                    stop_task.cancel()
-                if stop_task is not None:
-                    await asyncio.wait_for(
-                        asyncio.gather(stop_task, return_exceptions=True),
-                        timeout=1,
-                    )
-                empty_timer = state.empty_channel_task
-                bot.cancel_empty_channel_disconnect(state)
-                if empty_timer is not None:
-                    await asyncio.wait_for(
-                        asyncio.gather(empty_timer, return_exceptions=True),
-                        timeout=1,
-                    )
-                bot.music_states.pop(guild_id, None)
-
-        message.edit.assert_awaited_once()
-        edit_kwargs = message.edit.await_args.kwargs
-        self.assertIsNone(edit_kwargs["content"])
-        self.assertEqual(edit_kwargs["embed"].title, bot.IDLE_PANEL_TITLE)
-        idle_view = edit_kwargs["view"]
-        self.assertIsInstance(idle_view, bot.MusicControlView)
-        self.assertTrue(
-            all(
-                item.disabled
-                for item in idle_view.children
-                if item.custom_id != bot.AUTOPLAY_BUTTON_CUSTOM_ID
-            )
-        )
-        channel.send.assert_not_awaited()
 
     async def test_leave_disconnects_before_accepting_request_during_panel_update(
         self,
