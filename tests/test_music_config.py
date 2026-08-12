@@ -14,7 +14,6 @@ MOVED_NAMES = (
     "AUTOPLAY_REFILL_CANDIDATES",
     "AUTOPLAY_START_DELAY_SECONDS",
     "CONTROL_PANEL_HISTORY_LIMIT",
-    "DEFAULT_AUTO_TRACKS",
     "DEV_GUILD_ID",
     "DISCORD_TOKEN",
     "EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS",
@@ -100,6 +99,10 @@ class MusicConfigTests(unittest.TestCase):
                     getattr(bot, name) is getattr(music_config, name),
                     f"{name} is not re-exported from music_config",
                 )
+
+    def test_retired_default_auto_track_setting_is_not_exported(self) -> None:
+        self.assertFalse(hasattr(music_config, "DEFAULT_AUTO_TRACKS"))
+        self.assertFalse(hasattr(bot, "DEFAULT_AUTO_TRACKS"))
 
     def test_module_has_only_the_expected_import_dependencies(self) -> None:
         source = Path(music_config.__file__).read_text(encoding="utf-8")

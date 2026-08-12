@@ -185,9 +185,9 @@ from music_request_parsing import (
     clamp_auto_count as clamp_auto_count_with_limit,
     get_playlist_result_url,
     is_bulk_youtube_url,
+    is_legacy_auto_request,
     is_playlist_search_url,
     is_youtube_search_query,
-    parse_auto_request as parse_auto_request_with_policy,
     parse_music_request,
 )
 from music_search_scoring import (
@@ -248,7 +248,6 @@ from music_config import (
     AUTOPLAY_REFILL_CANDIDATES,
     AUTOPLAY_START_DELAY_SECONDS,
     CONTROL_PANEL_HISTORY_LIMIT,
-    DEFAULT_AUTO_TRACKS,
     DEV_GUILD_ID,
     DISCORD_TOKEN,
     EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS,
@@ -2666,14 +2665,6 @@ def clamp_auto_count(count: int) -> int:
     return clamp_auto_count_with_limit(count, MAX_AUTO_TRACKS)
 
 
-def parse_auto_request(query: str) -> tuple[str, int] | None:
-    return parse_auto_request_with_policy(
-        query,
-        default_count=DEFAULT_AUTO_TRACKS,
-        clamp_count=clamp_auto_count,
-    )
-
-
 async def resolve_track_stream(track: Track) -> None:
     stream_age = (
         time.monotonic() - track.stream_resolved_at
@@ -3661,12 +3652,7 @@ async def enqueue_tracks(
         return False
 
     try:
-        auto_request = parse_auto_request(query)
-        if auto_request:
-            query, parsed_auto_count = auto_request
-            auto_count = auto_count or parsed_auto_count
-            bulk = True
-        else:
+        if auto_count is None:
             query, parsed_search_kind, parsed_bulk = parse_music_request(query)
             search_kind = search_kind or parsed_search_kind
             bulk = parsed_bulk if bulk is None else bulk
@@ -4415,6 +4401,18 @@ async def on_message(message: discord.Message) -> None:
     if not isinstance(message.author, discord.Member):
         return
 
+    if is_legacy_auto_request(query):
+        guidance_message = await send_music_request_reply(
+            message,
+            "자동 추천 신청은 `/auto n:<곡 수> 곡명:<곡명>` 슬래시 명령을 사용해 주세요.",
+        )
+        if guidance_message is not None:
+            create_housekeeping_task(
+                delete_message_later(guidance_message, MUSIC_FEEDBACK_DELETE_SECONDS)
+            )
+        await delete_music_request_message(message)
+        return
+
     state = get_state(message.guild.id)
     ok, error = await ensure_voice_for_member(message.author, state)
     if not ok:
@@ -4498,6 +4496,58 @@ async def on_voice_state_update(
         return
 
     update_empty_channel_disconnect(state, member.guild.id)
+
+
+@bot.tree.command(name="auto", description="Add a song and related tracks to the queue.")
+@app_commands.rename(query="곡명")
+@app_commands.describe(
+    n=f"Total tracks including the requested song (1-{MAX_AUTO_TRACKS})",
+    query="Song title, artist, or YouTube URL",
+)
+@app_commands.guild_only()
+async def queue_auto_tracks(
+    interaction: discord.Interaction,
+    n: app_commands.Range[int, 1, MAX_AUTO_TRACKS],
+    query: str,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    if interaction.guild is None or interaction.guild_id is None:
+        await interaction.edit_original_response(content=guild_only_error())
+        return
+
+    guild_id = interaction.guild_id
+    music_channel_id = get_music_channel_id(guild_id)
+    if music_channel_id is None:
+        await interaction.edit_original_response(
+            content="먼저 `/setupmusic`으로 음악 신청 채널을 설정해 주세요."
+        )
+        return
+
+    music_channel = interaction.guild.get_channel(music_channel_id)
+    if music_channel is None or not hasattr(music_channel, "send"):
+        await interaction.edit_original_response(
+            content="설정된 음악 신청 채널을 찾을 수 없어요. `/setupmusic`으로 다시 설정해 주세요."
+        )
+        return
+
+    state = get_state(guild_id)
+    state.announcement_channel = music_channel
+    ok, error = await ensure_voice_for_member(interaction.user, state)
+    if not ok:
+        await interaction.edit_original_response(content=error)
+        return
+
+    request_generation = state.playback_generation
+    loading_message = await interaction.edit_original_response(content="곡을 찾고 있어요...")
+    await enqueue_tracks(
+        guild_id,
+        music_channel,
+        interaction.user,
+        query,
+        initial_response=loading_message,
+        auto_count=n,
+        request_generation=request_generation,
+    )
 
 
 @bot.tree.command(
