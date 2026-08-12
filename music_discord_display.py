@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import io
 
 import discord
 
+from music_config import (
+    MAX_BULK_TRACKS,
+    MUSIC_CHANNEL_DELETE_REQUESTS,
+    MUSIC_CHANNEL_SILENT,
+    get_music_channel_id,
+    logger,
+)
 from music_models import GuildMusicState, Track
 
 
@@ -12,6 +20,107 @@ PLAYING_PANEL_TITLE = "💿 지금 재생 중"
 IDLE_PANEL_TITLE = "🎵 재생 대기 중"
 CONTROL_PANEL_TITLES = frozenset({PLAYING_PANEL_TITLE, IDLE_PANEL_TITLE})
 LYRICS_INLINE_LIMIT = 3900
+
+
+def is_silent_music_channel(channel: discord.abc.Messageable | None) -> bool:
+    if not MUSIC_CHANNEL_SILENT or channel is None:
+        return False
+
+    guild = getattr(channel, "guild", None)
+    channel_id = getattr(channel, "id", None)
+    if guild is None or channel_id is None:
+        return False
+
+    return get_music_channel_id(guild.id) == channel_id
+
+
+def log_discord_http_error(action: str, error: discord.HTTPException) -> None:
+    logger.warning(
+        "Discord API failed while %s: HTTP %s (code %s)",
+        action,
+        getattr(error, "status", "unknown"),
+        getattr(error, "code", "unknown"),
+    )
+
+
+async def send_music_request_reply(
+    message: discord.Message,
+    content: str,
+) -> discord.Message | None:
+    try:
+        return await message.reply(
+            content,
+            mention_author=False,
+            silent=is_silent_music_channel(message.channel),
+        )
+    except discord.HTTPException as error:
+        log_discord_http_error("sending a music request reply", error)
+        return None
+
+
+async def delete_music_request_message(message: discord.Message) -> None:
+    if not MUSIC_CHANNEL_DELETE_REQUESTS:
+        return
+
+    try:
+        await message.delete()
+    except discord.NotFound:
+        pass
+    except discord.HTTPException as error:
+        log_discord_http_error("deleting a music request", error)
+
+
+async def delete_message_later(
+    message: discord.Message,
+    delay_seconds: float,
+) -> None:
+    await asyncio.sleep(delay_seconds)
+    try:
+        await message.delete()
+    except discord.NotFound:
+        pass
+    except discord.HTTPException as error:
+        log_discord_http_error("deleting temporary music feedback", error)
+
+
+async def delete_interaction_response_later(
+    interaction: discord.Interaction,
+    delay_seconds: float,
+) -> None:
+    await asyncio.sleep(delay_seconds)
+    try:
+        await interaction.delete_original_response()
+    except discord.NotFound:
+        pass
+    except discord.HTTPException as error:
+        log_discord_http_error(
+            "deleting a temporary interaction response",
+            error,
+        )
+
+
+async def notify_playback_error(state: GuildMusicState, content: str) -> None:
+    if not state.announcement_channel:
+        return
+
+    try:
+        await state.announcement_channel.send(
+            content,
+            silent=is_silent_music_channel(state.announcement_channel),
+        )
+    except discord.HTTPException as error:
+        log_discord_http_error("sending a playback error message", error)
+
+
+async def delete_private_interaction_message(
+    message: discord.WebhookMessage | discord.InteractionMessage,
+) -> None:
+    try:
+        await message.delete()
+    except discord.NotFound:
+        pass
+    except discord.HTTPException as error:
+        log_discord_http_error("deleting a private interaction message", error)
 
 
 def format_duration(seconds: int | None) -> str:
@@ -135,6 +244,21 @@ def make_queue_embed(state: GuildMusicState) -> discord.Embed:
     elif not state.current:
         embed.description = "대기열이 비어 있어요."
 
+    return embed
+
+
+def make_bulk_embed(tracks: list[Track], title: str) -> discord.Embed:
+    embed = discord.Embed(title=title)
+    preview = [
+        f"{index}. {make_track_link(track, DISCORD_EMBED_FIELD_LIMIT - 8)}"
+        for index, track in enumerate(tracks[:10], start=1)
+    ]
+    if len(tracks) > 10:
+        preview.append(f"...and {len(tracks) - 10} more")
+
+    embed.description = "\n".join(preview)
+    embed.add_field(name="Added", value=str(len(tracks)), inline=True)
+    embed.add_field(name="Limit", value=str(MAX_BULK_TRACKS), inline=True)
     return embed
 
 

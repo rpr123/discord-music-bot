@@ -1,6 +1,7 @@
 import ast
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import bot
 import music_discord_display
@@ -12,9 +13,18 @@ MOVED_NAMES = (
     "DISCORD_EMBED_FIELD_LIMIT",
     "IDLE_PANEL_TITLE",
     "LYRICS_INLINE_LIMIT",
+    "MUSIC_CHANNEL_DELETE_REQUESTS",
+    "MUSIC_CHANNEL_SILENT",
     "PLAYING_PANEL_TITLE",
+    "delete_interaction_response_later",
+    "delete_message_later",
+    "delete_music_request_message",
+    "delete_private_interaction_message",
     "describe_queue_selection",
     "format_duration",
+    "is_silent_music_channel",
+    "log_discord_http_error",
+    "make_bulk_embed",
     "make_idle_player_embed",
     "make_lyrics_embed",
     "make_lyrics_file",
@@ -24,7 +34,9 @@ MOVED_NAMES = (
     "make_queue_line",
     "make_track_embed",
     "make_track_link",
+    "notify_playback_error",
     "requester_label",
+    "send_music_request_reply",
     "single_line",
     "truncate_option_text",
     "truncate_text",
@@ -96,7 +108,14 @@ class MusicDiscordDisplayTests(unittest.TestCase):
 
         self.assertEqual(
             imported_modules,
-            {"__future__", "discord", "io", "music_models"},
+            {
+                "__future__",
+                "asyncio",
+                "discord",
+                "io",
+                "music_config",
+                "music_models",
+            },
         )
 
     def test_player_and_queue_embeds_preserve_visible_state(self) -> None:
@@ -113,6 +132,11 @@ class MusicDiscordDisplayTests(unittest.TestCase):
         player_fields = {field.name: field.value for field in player.fields}
         queue = music_discord_display.make_queue_embed(state)
         queue_fields = {field.name: field.value for field in queue.fields}
+        bulk = music_discord_display.make_bulk_embed(
+            [current, queued],
+            "Added playlist to queue",
+        )
+        bulk_fields = {field.name: field.value for field in bulk.fields}
 
         self.assertEqual(player.title, music_discord_display.PLAYING_PANEL_TITLE)
         self.assertIn("<@123>", player.description)
@@ -122,6 +146,13 @@ class MusicDiscordDisplayTests(unittest.TestCase):
         self.assertIn("queued", player_fields["다음 곡"])
         self.assertIn("current", queue_fields["지금 재생 중"])
         self.assertIn("queued", queue_fields["다음 곡"])
+        self.assertIn("current", bulk.description)
+        self.assertIn("queued", bulk.description)
+        self.assertEqual(bulk_fields["Added"], "2")
+        self.assertEqual(
+            bulk_fields["Limit"],
+            str(music_discord_display.MAX_BULK_TRACKS),
+        )
 
     def test_idle_and_queue_selection_contract(self) -> None:
         first = make_player_track("first")
@@ -220,3 +251,46 @@ class MusicDiscordDisplayTests(unittest.TestCase):
             self.assertEqual(attachment.fp.read(), lyrics.encode("utf-8"))
         finally:
             attachment.close()
+
+
+class MusicDiscordMessageTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def make_server_error() -> bot.discord.DiscordServerError:
+        response = MagicMock(status=500, reason="Internal Server Error")
+        return bot.discord.DiscordServerError(
+            response,
+            "<html>temporary failure</html>",
+        )
+
+    async def test_music_reply_ignores_transient_discord_500(self) -> None:
+        message = MagicMock()
+        message.reply = AsyncMock(side_effect=self.make_server_error())
+
+        with (
+            patch.object(music_discord_display, "MUSIC_CHANNEL_SILENT", False),
+            self.assertLogs("music-bot", level="WARNING") as logs,
+        ):
+            result = await music_discord_display.send_music_request_reply(
+                message,
+                "곡을 찾고 있어요...",
+            )
+
+        self.assertIsNone(result)
+        self.assertIn("HTTP 500", "\n".join(logs.output))
+        self.assertNotIn("<html>", "\n".join(logs.output))
+
+    async def test_request_delete_ignores_transient_discord_500(self) -> None:
+        message = MagicMock()
+        message.delete = AsyncMock(side_effect=self.make_server_error())
+
+        with (
+            patch.object(
+                music_discord_display,
+                "MUSIC_CHANNEL_DELETE_REQUESTS",
+                True,
+            ),
+            self.assertLogs("music-bot", level="WARNING") as logs,
+        ):
+            await music_discord_display.delete_music_request_message(message)
+
+        self.assertIn("HTTP 500", "\n".join(logs.output))

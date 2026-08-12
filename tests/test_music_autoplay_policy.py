@@ -22,7 +22,14 @@ MOVED_NAMES = (
 )
 
 
-def make_track(title: str, *, video_id: str | None = None) -> Track:
+def make_track(
+    title: str,
+    *,
+    video_id: str | None = None,
+    artist: str | None = None,
+    song_name: str | None = None,
+    uploader: str | None = None,
+) -> Track:
     video_id = video_id or f"{title:0<11}"[:11]
     url = f"https://www.youtube.com/watch?v={video_id}"
     return Track(
@@ -30,6 +37,9 @@ def make_track(title: str, *, video_id: str | None = None) -> Track:
         webpage_url=url,
         requester="tester",
         source_url=url,
+        artist=artist,
+        song_name=song_name,
+        uploader=uploader,
     )
 
 
@@ -159,6 +169,76 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
                 candidates,
                 all_excluded,
             )
+        )
+
+    def test_autoplay_skips_an_audio_duplicate_of_the_current_mv(self) -> None:
+        current_mv = make_track(
+            "Artist - Same Song (Official MV)",
+            video_id="kkkkkkkkkkk",
+        )
+        duplicate_audio = make_track(
+            "Artist - Same Song (Official Audio)",
+            video_id="lllllllllll",
+        )
+        fresh = make_track(
+            "Artist - Next Song (Official Audio)",
+            video_id="mmmmmmmmmmm",
+        )
+        state = GuildMusicState(current=current_mv)
+
+        self.assertIs(
+            music_autoplay_policy.select_autoplay_candidate(
+                state,
+                [duplicate_audio, fresh],
+            ),
+            fresh,
+        )
+
+    def test_autoplay_skips_recent_videos_when_metadata_changes(self) -> None:
+        played_first = make_track(
+            "First Artist - First Song",
+            video_id="aaaaaaaaaaa",
+            artist="First Artist",
+            song_name="First Song",
+        )
+        played_second = make_track(
+            "Second Artist - Second Song",
+            video_id="bbbbbbbbbbb",
+            artist="Second Artist",
+            song_name="Second Song",
+        )
+        rediscovered_first = make_track(
+            "First Song (Official Audio)",
+            video_id="aaaaaaaaaaa",
+            uploader="Archive Channel",
+        )
+        rediscovered_second = make_track(
+            "Second Song (Official Audio)",
+            video_id="bbbbbbbbbbb",
+            uploader="Another Channel",
+        )
+        fresh = make_track(
+            "Third Artist - Third Song",
+            video_id="ccccccccccc",
+        )
+        state = GuildMusicState()
+        music_autoplay_policy.remember_autoplay_track(state, played_first)
+        music_autoplay_policy.remember_autoplay_track(state, played_second)
+
+        self.assertNotEqual(
+            music_track_metadata.normalize_track_key(played_first),
+            music_track_metadata.normalize_track_key(rediscovered_first),
+        )
+        self.assertNotEqual(
+            music_track_metadata.normalize_track_key(played_second),
+            music_track_metadata.normalize_track_key(rediscovered_second),
+        )
+        self.assertIs(
+            music_autoplay_policy.select_autoplay_candidate(
+                state,
+                [rediscovered_first, rediscovered_second, fresh],
+            ),
+            fresh,
         )
 
     def test_autoplay_seed_prefers_queue_tail_then_current(self) -> None:

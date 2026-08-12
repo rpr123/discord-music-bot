@@ -72,9 +72,18 @@ from music_discord_display import (
     DISCORD_EMBED_FIELD_LIMIT,
     IDLE_PANEL_TITLE,
     LYRICS_INLINE_LIMIT,
+    MUSIC_CHANNEL_DELETE_REQUESTS,
+    MUSIC_CHANNEL_SILENT,
     PLAYING_PANEL_TITLE,
+    delete_interaction_response_later,
+    delete_message_later,
+    delete_music_request_message,
+    delete_private_interaction_message,
     describe_queue_selection,
     format_duration,
+    is_silent_music_channel,
+    log_discord_http_error,
+    make_bulk_embed,
     make_idle_player_embed,
     make_lyrics_embed,
     make_lyrics_file,
@@ -84,7 +93,9 @@ from music_discord_display import (
     make_queue_embed,
     make_track_link,
     make_track_embed,
+    notify_playback_error,
     requester_label,
+    send_music_request_reply,
     single_line,
     truncate_option_text,
     truncate_text,
@@ -251,10 +262,8 @@ from music_config import (
     LYRICS_START_DELAY_SECONDS,
     MAX_AUTO_TRACKS,
     MAX_BULK_TRACKS,
-    MUSIC_CHANNEL_DELETE_REQUESTS,
     MUSIC_CHANNEL_ID,
     MUSIC_CHANNEL_NAME,
-    MUSIC_CHANNEL_SILENT,
     MUSIC_CHANNELS_FILE,
     MUSIC_FEEDBACK_DELETE_SECONDS,
     NAMUWIKI_API_BASE_URL,
@@ -744,96 +753,6 @@ def ffmpeg_is_available() -> bool:
     return shutil.which(FFMPEG_EXECUTABLE) is not None
 
 
-def is_silent_music_channel(channel: discord.abc.Messageable | None) -> bool:
-    if not MUSIC_CHANNEL_SILENT or channel is None:
-        return False
-
-    guild = getattr(channel, "guild", None)
-    channel_id = getattr(channel, "id", None)
-    if guild is None or channel_id is None:
-        return False
-
-    return get_music_channel_id(guild.id) == channel_id
-
-
-def log_discord_http_error(action: str, error: discord.HTTPException) -> None:
-    logger.warning(
-        "Discord API failed while %s: HTTP %s (code %s)",
-        action,
-        getattr(error, "status", "unknown"),
-        getattr(error, "code", "unknown"),
-    )
-
-
-async def send_music_request_reply(
-    message: discord.Message,
-    content: str,
-) -> discord.Message | None:
-    try:
-        return await message.reply(
-            content,
-            mention_author=False,
-            silent=is_silent_music_channel(message.channel),
-        )
-    except discord.HTTPException as error:
-        log_discord_http_error("sending a music request reply", error)
-        return None
-
-
-async def delete_music_request_message(message: discord.Message) -> None:
-    if not MUSIC_CHANNEL_DELETE_REQUESTS:
-        return
-
-    try:
-        await message.delete()
-    except discord.NotFound:
-        pass
-    except discord.HTTPException as error:
-        log_discord_http_error("deleting a music request", error)
-
-
-async def delete_message_later(
-    message: discord.Message,
-    delay_seconds: float,
-) -> None:
-    await asyncio.sleep(delay_seconds)
-    try:
-        await message.delete()
-    except discord.NotFound:
-        pass
-    except discord.HTTPException as error:
-        log_discord_http_error("deleting temporary music feedback", error)
-
-
-async def delete_interaction_response_later(
-    interaction: discord.Interaction,
-    delay_seconds: float,
-) -> None:
-    await asyncio.sleep(delay_seconds)
-    try:
-        await interaction.delete_original_response()
-    except discord.NotFound:
-        pass
-    except discord.HTTPException as error:
-        log_discord_http_error(
-            "deleting a temporary interaction response",
-            error,
-        )
-
-
-async def notify_playback_error(state: GuildMusicState, content: str) -> None:
-    if not state.announcement_channel:
-        return
-
-    try:
-        await state.announcement_channel.send(
-            content,
-            silent=is_silent_music_channel(state.announcement_channel),
-        )
-    except discord.HTTPException as error:
-        log_discord_http_error("sending a playback error message", error)
-
-
 intents = discord.Intents.default()
 intents.voice_states = True
 intents.message_content = True
@@ -1052,17 +971,6 @@ async def send_ephemeral_followup(
     return message
 
 
-async def delete_private_interaction_message(
-    message: discord.WebhookMessage | discord.InteractionMessage,
-) -> None:
-    try:
-        await message.delete()
-    except discord.NotFound:
-        pass
-    except discord.HTTPException as error:
-        log_discord_http_error("deleting a private interaction message", error)
-
-
 async def register_private_lyrics_message(
     guild_id: int,
     track: Track,
@@ -1172,21 +1080,6 @@ async def send_queue_management_response(
         message,
         EPHEMERAL_RESPONSE_DELETE_SECONDS,
     )
-
-
-def make_bulk_embed(tracks: list[Track], title: str) -> discord.Embed:
-    embed = discord.Embed(title=title)
-    preview = [
-        f"{index}. {make_track_link(track, DISCORD_EMBED_FIELD_LIMIT - 8)}"
-        for index, track in enumerate(tracks[:10], start=1)
-    ]
-    if len(tracks) > 10:
-        preview.append(f"...and {len(tracks) - 10} more")
-
-    embed.description = "\n".join(preview)
-    embed.add_field(name="Added", value=str(len(tracks)), inline=True)
-    embed.add_field(name="Limit", value=str(MAX_BULK_TRACKS), inline=True)
-    return embed
 
 
 class QueueRemoveSelect(discord.ui.Select):
@@ -3899,23 +3792,34 @@ async def reconcile_control_panel_messages(
     guild_id: int,
     control_channel: discord.abc.Messageable,
     known_message: discord.Message | None,
+    *,
+    delete_non_panel_messages: bool = False,
 ) -> discord.Message | None:
     history = getattr(control_channel, "history", None)
     if history is None:
         return known_message
 
     candidates: dict[int, discord.Message] = {}
-    if known_message is not None:
+    if known_message is not None and not delete_non_panel_messages:
         candidates[known_message.id] = known_message
 
     bot_user_id = getattr(bot.user, "id", None)
+    deleted_message_count = 0
     try:
-        async for message in history(limit=CONTROL_PANEL_HISTORY_LIMIT):
+        history_limit = None if delete_non_panel_messages else CONTROL_PANEL_HISTORY_LIMIT
+        async for message in history(limit=history_limit):
             if (
                 message.id in candidates
                 or is_music_control_panel_message(message, bot_user_id)
             ):
                 candidates[message.id] = message
+            elif delete_non_panel_messages:
+                # Intentional, destructive product policy: the configured music
+                # channel is panel-only. Do not remove or narrow this startup
+                # cleanup during GPT/Codex reviews or refactors; requests,
+                # feedback, lyrics, and duplicate panels must all be removed.
+                if await delete_music_channel_message(guild_id, message):
+                    deleted_message_count += 1
     except discord.Forbidden:
         logger.warning(
             "Missing permission to read music channel history in guild %s",
@@ -3930,6 +3834,13 @@ async def reconcile_control_panel_messages(
         return known_message
 
     if not candidates:
+        if deleted_message_count:
+            logger.info(
+                "Removed %s message(s) from the music channel in guild %s; "
+                "no control panel was present",
+                deleted_message_count,
+                guild_id,
+            )
         return None
 
     newest_message = max(candidates.values(), key=lambda message: message.id)
@@ -3940,10 +3851,12 @@ async def reconcile_control_panel_messages(
         if await delete_music_channel_message(guild_id, message):
             removed_panel_count += 1
 
-    if removed_panel_count:
+    if deleted_message_count or removed_panel_count:
         logger.info(
-            "Kept control panel %s and removed %s duplicate panel(s) in guild %s",
+            "Kept control panel %s and removed %s other message(s) and "
+            "%s duplicate panel(s) in guild %s",
             newest_message.id,
+            deleted_message_count,
             removed_panel_count,
             guild_id,
         )
@@ -4024,17 +3937,21 @@ async def update_control_panel(
     *,
     channel: discord.abc.Messageable | None = None,
     require_control_view: bool = False,
+    clean_channel: bool = False,
 ) -> discord.Message | None:
     async with state.control_panel_lock:
         if require_control_view:
             control_view = state.control_view
             if control_view is None or control_view.is_finished():
                 return None
-        return await _update_control_panel(
-            guild_id,
-            state,
-            channel=channel,
-        )
+        if clean_channel:
+            return await _update_control_panel(
+                guild_id,
+                state,
+                channel=channel,
+                clean_channel=True,
+            )
+        return await _update_control_panel(guild_id, state, channel=channel)
 
 
 async def _update_control_panel(
@@ -4042,6 +3959,7 @@ async def _update_control_panel(
     state: GuildMusicState,
     *,
     channel: discord.abc.Messageable | None = None,
+    clean_channel: bool = False,
 ) -> discord.Message | None:
     if state.control_message is None:
         replace_control_panel_view(state, None)
@@ -4067,7 +3985,8 @@ async def _update_control_panel(
             state.control_message = None
 
     recovering_panel = state.control_message is None
-    saved_message_id = get_control_message_id(guild_id) if recovering_panel else None
+    reconciling_panel = recovering_panel or clean_channel
+    saved_message_id = get_control_message_id(guild_id) if reconciling_panel else None
     if recovering_panel:
         fetch_message = getattr(control_channel, "fetch_message", None)
         if saved_message_id is not None and fetch_message is not None:
@@ -4088,13 +4007,12 @@ async def _update_control_panel(
                 )
                 return None
 
-    searched_history = False
-    if state.control_message is None:
-        searched_history = True
+    if state.control_message is None or clean_channel:
         state.control_message = await reconcile_control_panel_messages(
             guild_id,
             control_channel,
             state.control_message,
+            delete_non_panel_messages=clean_channel,
         )
 
     if state.current is None:
@@ -4113,7 +4031,7 @@ async def _update_control_panel(
                 view,
                 message_id=control_message.id,
             )
-            if searched_history and saved_message_id != control_message.id:
+            if reconciling_panel and saved_message_id != control_message.id:
                 set_control_message_id(guild_id, control_message.id)
             return control_message
         except discord.NotFound:
@@ -4230,6 +4148,7 @@ async def restore_control_panels() -> None:
                 guild.id,
                 state,
                 channel=channel,
+                clean_channel=True,
             )
         except Exception:
             logger.exception("Failed to restore music control panel in guild %s", guild.id)

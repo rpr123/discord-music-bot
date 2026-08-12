@@ -201,6 +201,63 @@ class MusicModelTests(unittest.TestCase):
         self.assertIs(state.queue, queue)
         self.assertEqual(list(state.queue), tracks)
 
+    def test_remove_by_id_uses_stable_track_identity(self) -> None:
+        first = self.make_track("first")
+        second = self.make_track("second")
+        third = self.make_track("third")
+        state = music_models.GuildMusicState(queue=deque([third, first, second]))
+
+        removed = music_models.remove_queued_track_by_id(state, second.track_id)
+
+        self.assertIs(removed, second)
+        self.assertEqual(list(state.queue), [third, first])
+
+    def test_remove_range_is_inclusive(self) -> None:
+        tracks = [self.make_track(f"track-{index}") for index in range(1, 21)]
+        state = music_models.GuildMusicState(queue=deque(tracks))
+
+        result = music_models.remove_queued_track_range_by_ids(
+            state,
+            tracks[4].track_id,
+            tracks[12].track_id,
+        )
+
+        self.assertIsNotNone(result)
+        removed, start_index, end_index = result
+        self.assertEqual((start_index, end_index), (4, 12))
+        self.assertEqual(removed, tracks[4:13])
+        self.assertEqual(len(state.queue), 11)
+        self.assertEqual(list(state.queue), tracks[:4] + tracks[13:])
+
+    def test_remove_range_accepts_reversed_boundaries(self) -> None:
+        tracks = [self.make_track(f"track-{index}") for index in range(1, 21)]
+        state = music_models.GuildMusicState(queue=deque(tracks))
+
+        result = music_models.remove_queued_track_range_by_ids(
+            state,
+            tracks[12].track_id,
+            tracks[4].track_id,
+        )
+
+        self.assertIsNotNone(result)
+        removed, start_index, end_index = result
+        self.assertEqual((start_index, end_index), (4, 12))
+        self.assertEqual(removed, tracks[4:13])
+        self.assertEqual(len(state.queue), 11)
+
+    def test_remove_range_keeps_queue_when_endpoint_is_missing(self) -> None:
+        tracks = [self.make_track("first"), self.make_track("second")]
+        state = music_models.GuildMusicState(queue=deque(tracks))
+
+        result = music_models.remove_queued_track_range_by_ids(
+            state,
+            tracks[0].track_id,
+            "missing-track-id",
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(list(state.queue), tracks)
+
     def test_copy_error_requeues_track_with_fresh_transcode_state(self) -> None:
         track = self.make_track("retry")
         track.playback_attempts = 1

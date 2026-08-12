@@ -1,7 +1,7 @@
 import ast
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import bot
 import music_request_parsing
@@ -149,3 +149,29 @@ class MusicRequestParsingTests(unittest.TestCase):
             music_request_parsing.parse_music_request(video),
             (video, None, False),
         )
+
+
+class BotAutoRequestParsingCompatibilityTests(unittest.TestCase):
+    def test_bot_auto_parser_uses_runtime_default_setting(self) -> None:
+        with patch.object(bot, "DEFAULT_AUTO_TRACKS", 7):
+            self.assertEqual(
+                bot.parse_auto_request("auto: back number"),
+                ("back number", 7),
+            )
+
+    def test_bot_auto_parser_uses_runtime_max_setting(self) -> None:
+        with patch.object(bot, "MAX_AUTO_TRACKS", 9):
+            self.assertEqual(bot.clamp_auto_count(999), 9)
+            self.assertEqual(
+                bot.parse_auto_request("auto999: lofi chill"),
+                ("lofi chill", 9),
+            )
+
+    def test_bot_auto_parser_uses_bot_clamp_monkeypatch(self) -> None:
+        with patch.object(bot, "clamp_auto_count", return_value=8) as clamp:
+            self.assertEqual(
+                bot.parse_auto_request("auto999: lofi chill"),
+                ("lofi chill", 8),
+            )
+
+        clamp.assert_called_once_with(999)

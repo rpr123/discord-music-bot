@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from discord.ui.view import ViewStore
 
 import bot
+import music_discord_display
 import music_namuwiki
 import music_ytdl
 from devtools.local_music_bot import LocalMusicMode
@@ -362,20 +363,6 @@ class DiscordHttpResilienceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         bot.music_states.clear()
 
-    async def test_music_reply_ignores_transient_discord_500(self) -> None:
-        message = MagicMock()
-        message.reply = AsyncMock(side_effect=self.make_server_error())
-
-        with (
-            patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
-            self.assertLogs("music-bot", level="WARNING") as logs,
-        ):
-            result = await bot.send_music_request_reply(message, "곡을 찾고 있어요...")
-
-        self.assertIsNone(result)
-        self.assertIn("HTTP 500", "\n".join(logs.output))
-        self.assertNotIn("<html>", "\n".join(logs.output))
-
     async def test_feedback_500_does_not_undo_queued_track(self) -> None:
         class Requester:
             display_name = "tester"
@@ -386,7 +373,7 @@ class DiscordHttpResilienceTests(unittest.IsolatedAsyncioTestCase):
         track = make_track("queued")
 
         with (
-            patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
+            patch.object(music_discord_display, "MUSIC_CHANNEL_SILENT", False),
             patch.object(bot, "extract_track", new=AsyncMock(return_value=track)),
             self.assertLogs("music-bot", level="WARNING"),
         ):
@@ -394,19 +381,6 @@ class DiscordHttpResilienceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result)
         self.assertEqual(list(bot.get_state(987).queue), [track])
-
-    async def test_request_delete_ignores_transient_discord_500(self) -> None:
-        message = MagicMock()
-        message.delete = AsyncMock(side_effect=self.make_server_error())
-
-        with (
-            patch.object(bot, "MUSIC_CHANNEL_DELETE_REQUESTS", True),
-            self.assertLogs("music-bot", level="WARNING") as logs,
-        ):
-            await bot.delete_music_request_message(message)
-
-        self.assertIn("HTTP 500", "\n".join(logs.output))
-
 
 class QueueFeedbackLatencyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
@@ -674,8 +648,12 @@ class QueueFeedbackLatencyTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "bot_shutdown_started", False),
             patch.object(bot.discord, "Member", FakeMember),
             patch.object(bot, "get_music_channel_id", return_value=channel.id),
-            patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
-            patch.object(bot, "MUSIC_CHANNEL_DELETE_REQUESTS", False),
+            patch.object(music_discord_display, "MUSIC_CHANNEL_SILENT", False),
+            patch.object(
+                music_discord_display,
+                "MUSIC_CHANNEL_DELETE_REQUESTS",
+                False,
+            ),
             patch.object(
                 bot,
                 "extract_track",
@@ -732,73 +710,6 @@ class QueueFeedbackLatencyTests(unittest.IsolatedAsyncioTestCase):
         process_commands.assert_awaited_once_with(message)
 
 
-class AutoRequestParsingTests(unittest.TestCase):
-    def test_auto_without_count_uses_default(self) -> None:
-        self.assertEqual(
-            bot.parse_auto_request("auto: back number"),
-            ("back number", bot.DEFAULT_AUTO_TRACKS),
-        )
-
-    def test_count_is_written_between_auto_and_colon(self) -> None:
-        self.assertEqual(
-            bot.parse_auto_request("auto5: back number"),
-            ("back number", 5),
-        )
-        self.assertEqual(
-            bot.parse_auto_request("auto 5: back number"),
-            ("back number", 5),
-        )
-        self.assertEqual(
-            bot.parse_auto_request("AUTO12 : lofi chill"),
-            ("lofi chill", 12),
-        )
-
-    def test_count_is_clamped_to_configured_limit(self) -> None:
-        self.assertEqual(
-            bot.parse_auto_request("auto999: lofi chill"),
-            ("lofi chill", bot.MAX_AUTO_TRACKS),
-        )
-
-    def test_bot_auto_parser_uses_runtime_default_setting(self) -> None:
-        with patch.object(bot, "DEFAULT_AUTO_TRACKS", 7):
-            self.assertEqual(
-                bot.parse_auto_request("auto: back number"),
-                ("back number", 7),
-            )
-
-    def test_bot_auto_parser_uses_runtime_max_setting(self) -> None:
-        with patch.object(bot, "MAX_AUTO_TRACKS", 9):
-            self.assertEqual(bot.clamp_auto_count(999), 9)
-            self.assertEqual(
-                bot.parse_auto_request("auto999: lofi chill"),
-                ("lofi chill", 9),
-            )
-
-    def test_bot_auto_parser_uses_bot_clamp_monkeypatch(self) -> None:
-        with patch.object(bot, "clamp_auto_count", return_value=8) as clamp:
-            self.assertEqual(
-                bot.parse_auto_request("auto999: lofi chill"),
-                ("lofi chill", 8),
-            )
-
-        clamp.assert_called_once_with(999)
-
-    def test_query_is_required(self) -> None:
-        with self.assertRaisesRegex(ValueError, "곡명이나 아티스트"):
-            bot.parse_auto_request("auto:")
-        with self.assertRaisesRegex(ValueError, "곡명이나 아티스트"):
-            bot.parse_auto_request("auto5:")
-        with self.assertRaisesRegex(ValueError, "곡명이나 아티스트"):
-            bot.parse_auto_request("auto 5:")
-
-    def test_old_count_syntax_explains_the_new_format(self) -> None:
-        with self.assertRaisesRegex(ValueError, "auto 5: 곡명"):
-            bot.parse_auto_request("auto:5 back number")
-
-    def test_unrelated_query_is_not_an_auto_request(self) -> None:
-        self.assertIsNone(bot.parse_auto_request("automatic playlist"))
-
-
 class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_auto_count_request_routes_to_auto_extractor_and_enqueues_all_tracks(
         self,
@@ -851,203 +762,6 @@ class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
         extract_track.assert_not_awaited()
         extract_tracks.assert_not_awaited()
         self.assertEqual(list(bot.get_state(guild_id).queue), tracks)
-
-
-class TrackIdentityTests(unittest.TestCase):
-    def make_identity_track(
-        self,
-        title: str,
-        video_id: str,
-        *,
-        artist: str | None = None,
-        song_name: str | None = None,
-        uploader: str | None = None,
-    ) -> bot.Track:
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        return bot.Track(
-            title=title,
-            webpage_url=url,
-            requester="tester",
-            source_url=url,
-            artist=artist,
-            song_name=song_name,
-            uploader=uploader,
-        )
-
-    def test_mv_and_audio_metadata_share_the_same_song_key(self) -> None:
-        mv = self.make_identity_track(
-            "back number - Blue Amber (Official Music Video)",
-            "aaaaaaaaaaa",
-            artist="back number",
-            song_name="Blue Amber",
-        )
-        audio = self.make_identity_track(
-            "Blue Amber (Official Audio)",
-            "bbbbbbbbbbb",
-            artist="back number",
-            song_name="Blue Amber",
-        )
-
-        self.assertNotEqual(mv.webpage_url, audio.webpage_url)
-        self.assertEqual(bot.normalize_track_key(mv), bot.normalize_track_key(audio))
-
-    def test_mv_and_audio_titles_match_without_music_metadata(self) -> None:
-        mv = self.make_identity_track(
-            "Artist - Same Song (Official MV)",
-            "ccccccccccc",
-        )
-        audio = self.make_identity_track(
-            "Artist - Same Song [Official Audio]",
-            "ddddddddddd",
-        )
-
-        self.assertEqual(bot.normalize_track_key(mv), bot.normalize_track_key(audio))
-
-    def test_topic_audio_matches_a_promotional_mv_title(self) -> None:
-        mv = self.make_identity_track(
-            "back number - ブルーアンバー 【ドラマ主題歌】",
-            "nnnnnnnnnnn",
-        )
-        topic_audio = self.make_identity_track(
-            "ブルーアンバー",
-            "ooooooooooo",
-            uploader="back number - Topic",
-        )
-
-        self.assertEqual(
-            bot.normalize_track_key(mv),
-            bot.normalize_track_key(topic_audio),
-        )
-
-    def test_track_creation_preserves_music_identity_metadata(self) -> None:
-        track = bot.make_track_from_info(
-            {
-                "id": "ppppppppppp",
-                "title": "Blue Amber",
-                "webpage_url": "https://www.youtube.com/watch?v=ppppppppppp",
-                "artist": "back number",
-                "track": "Blue Amber",
-                "uploader": "back number - Topic",
-            },
-            "tester",
-            "fallback",
-        )
-
-        self.assertEqual(track.artist, "back number")
-        self.assertEqual(track.song_name, "Blue Amber")
-        self.assertEqual(track.uploader, "back number - Topic")
-
-    def test_live_remix_and_cover_remain_distinct_versions(self) -> None:
-        studio = self.make_identity_track(
-            "Artist - Same Song (Official Audio)",
-            "eeeeeeeeeee",
-        )
-        live = self.make_identity_track(
-            "Artist - Same Song (Official Live Video)",
-            "fffffffffff",
-        )
-        remix = self.make_identity_track(
-            "Artist - Same Song (Remix)",
-            "ggggggggggg",
-        )
-        cover = self.make_identity_track(
-            "Artist - Same Song (Cover)",
-            "hhhhhhhhhhh",
-        )
-
-        keys = {
-            bot.normalize_track_key(studio),
-            bot.normalize_track_key(live),
-            bot.normalize_track_key(remix),
-            bot.normalize_track_key(cover),
-        }
-        self.assertEqual(len(keys), 4)
-
-    def test_same_title_by_different_artists_remains_distinct(self) -> None:
-        first = self.make_identity_track(
-            "Same Song (Official Audio)",
-            "iiiiiiiiiii",
-            artist="First Artist",
-            song_name="Same Song",
-        )
-        second = self.make_identity_track(
-            "Same Song (Official Audio)",
-            "jjjjjjjjjjj",
-            artist="Second Artist",
-            song_name="Same Song",
-        )
-
-        self.assertNotEqual(
-            bot.normalize_track_key(first),
-            bot.normalize_track_key(second),
-        )
-
-    def test_autoplay_skips_an_audio_duplicate_of_the_current_mv(self) -> None:
-        current_mv = self.make_identity_track(
-            "Artist - Same Song (Official MV)",
-            "kkkkkkkkkkk",
-        )
-        duplicate_audio = self.make_identity_track(
-            "Artist - Same Song (Official Audio)",
-            "lllllllllll",
-        )
-        fresh = self.make_identity_track(
-            "Artist - Next Song (Official Audio)",
-            "mmmmmmmmmmm",
-        )
-        state = bot.GuildMusicState(current=current_mv)
-
-        self.assertIs(
-            bot.select_autoplay_candidate(state, [duplicate_audio, fresh]),
-            fresh,
-        )
-
-    def test_autoplay_skips_recent_videos_when_metadata_changes(self) -> None:
-        played_first = self.make_identity_track(
-            "First Artist - First Song",
-            "aaaaaaaaaaa",
-            artist="First Artist",
-            song_name="First Song",
-        )
-        played_second = self.make_identity_track(
-            "Second Artist - Second Song",
-            "bbbbbbbbbbb",
-            artist="Second Artist",
-            song_name="Second Song",
-        )
-        rediscovered_first = self.make_identity_track(
-            "First Song (Official Audio)",
-            "aaaaaaaaaaa",
-            uploader="Archive Channel",
-        )
-        rediscovered_second = self.make_identity_track(
-            "Second Song (Official Audio)",
-            "bbbbbbbbbbb",
-            uploader="Another Channel",
-        )
-        fresh = self.make_identity_track(
-            "Third Artist - Third Song",
-            "ccccccccccc",
-        )
-        state = bot.GuildMusicState()
-        bot.remember_autoplay_track(state, played_first)
-        bot.remember_autoplay_track(state, played_second)
-
-        self.assertNotEqual(
-            bot.normalize_track_key(played_first),
-            bot.normalize_track_key(rediscovered_first),
-        )
-        self.assertNotEqual(
-            bot.normalize_track_key(played_second),
-            bot.normalize_track_key(rediscovered_second),
-        )
-        self.assertIs(
-            bot.select_autoplay_candidate(
-                state,
-                [rediscovered_first, rediscovered_second, fresh],
-            ),
-            fresh,
-        )
 
 
 class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -1904,12 +1618,9 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CommandSurfaceTests(unittest.TestCase):
-    def test_search_commands_are_message_only(self) -> None:
+    def test_registered_commands_match_supported_surface(self) -> None:
         command_names = {command.name for command in bot.bot.tree.get_commands()}
 
-        self.assertTrue(
-            {"play", "playalbum", "playplaylist", "playauto"}.isdisjoint(command_names)
-        )
         self.assertEqual(
             command_names,
             {
@@ -4888,7 +4599,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         bot.music_states[321] = state
 
         with (
-            patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
+            patch.object(music_discord_display, "MUSIC_CHANNEL_SILENT", False),
             patch.object(bot, "get_control_message_id", return_value=None),
             patch.object(bot, "set_control_message_id") as save_message_id,
         ):
@@ -4954,7 +4665,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         state = bot.GuildMusicState()
 
         with (
-            patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
+            patch.object(music_discord_display, "MUSIC_CHANNEL_SILENT", False),
             patch.object(bot, "get_control_message_id", return_value=message.id),
         ):
             result = await bot.update_control_panel(111, state, channel=channel)
@@ -5035,7 +4746,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         state = bot.GuildMusicState()
 
         with (
-            patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
+            patch.object(music_discord_display, "MUSIC_CHANNEL_SILENT", False),
             patch.object(bot, "get_control_message_id", return_value=None),
             patch.object(bot, "set_control_message_id") as save_message_id,
             patch.object(
@@ -5062,6 +4773,168 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         newest.delete.assert_not_awaited()
         newest.edit.assert_awaited_once()
         save_message_id.assert_called_once_with(777, newest.id)
+
+    async def test_startup_cleanup_keeps_latest_panel_and_deletes_everything_else(
+        self,
+    ) -> None:
+        class Channel:
+            id = 888
+
+            def __init__(self) -> None:
+                self.send = AsyncMock()
+                self.messages = []
+                self.history_limit = object()
+
+            def history(self, *, limit: int | None):
+                self.history_limit = limit
+
+                async def messages():
+                    for message in self.messages:
+                        yield message
+
+                return messages()
+
+        class Message:
+            def __init__(
+                self,
+                message_id: int,
+                channel: Channel,
+                *,
+                is_panel: bool,
+            ) -> None:
+                self.id = message_id
+                self.channel = channel
+                self.is_panel = is_panel
+                self.edit = AsyncMock()
+                self.delete = AsyncMock()
+
+        channel = Channel()
+        older_panel = Message(100, channel, is_panel=True)
+        newest_panel = Message(200, channel, is_panel=True)
+        user_request = Message(300, channel, is_panel=False)
+        temporary_feedback = Message(150, channel, is_panel=False)
+        lyrics = Message(125, channel, is_panel=False)
+        channel.messages = [
+            user_request,
+            newest_panel,
+            temporary_feedback,
+            lyrics,
+            older_panel,
+        ]
+        state = bot.GuildMusicState(control_message=older_panel)
+        bot.music_states[777] = state
+
+        with (
+            patch.object(music_discord_display, "MUSIC_CHANNEL_SILENT", False),
+            patch.object(
+                bot,
+                "is_music_control_panel_message",
+                side_effect=lambda message, _: message.is_panel,
+            ),
+            patch.object(
+                bot,
+                "get_control_message_id",
+                return_value=older_panel.id,
+            ),
+            patch.object(bot, "set_control_message_id") as save_message_id,
+        ):
+            result = await bot.update_control_panel(
+                777,
+                state,
+                channel=channel,
+                clean_channel=True,
+            )
+
+        self.assertIs(result, newest_panel)
+        self.assertIsNone(channel.history_limit)
+        self.assertIs(state.control_message, newest_panel)
+        channel.send.assert_not_awaited()
+        older_panel.delete.assert_awaited_once_with()
+        user_request.delete.assert_awaited_once_with()
+        temporary_feedback.delete.assert_awaited_once_with()
+        lyrics.delete.assert_awaited_once_with()
+        newest_panel.delete.assert_not_awaited()
+        newest_panel.edit.assert_awaited_once()
+        save_message_id.assert_called_once_with(777, newest_panel.id)
+
+    async def test_startup_cleanup_without_panel_deletes_every_message(self) -> None:
+        class Channel:
+            id = 889
+
+            def __init__(self) -> None:
+                self.send = AsyncMock()
+                self.messages = []
+                self.history_limit = object()
+
+            def history(self, *, limit: int | None):
+                self.history_limit = limit
+
+                async def messages():
+                    for message in self.messages:
+                        yield message
+
+                return messages()
+
+        first = MagicMock(id=1)
+        first.delete = AsyncMock()
+        second = MagicMock(id=2)
+        second.delete = AsyncMock()
+        channel = Channel()
+        channel.messages = [first, second]
+        state = bot.GuildMusicState()
+        panel = MagicMock(id=333, channel=channel)
+        channel.send.return_value = panel
+        bot.music_states[778] = state
+
+        with (
+            patch.object(music_discord_display, "MUSIC_CHANNEL_SILENT", False),
+            patch.object(
+                bot,
+                "is_music_control_panel_message",
+                return_value=False,
+            ),
+            patch.object(bot, "get_control_message_id", return_value=999),
+            patch.object(bot, "set_control_message_id") as save_message_id,
+        ):
+            result = await bot.update_control_panel(
+                778,
+                state,
+                channel=channel,
+                clean_channel=True,
+            )
+
+        self.assertIs(result, panel)
+        self.assertIs(state.control_message, panel)
+        self.assertIsNone(channel.history_limit)
+        first.delete.assert_awaited_once_with()
+        second.delete.assert_awaited_once_with()
+        channel.send.assert_awaited_once()
+        save_message_id.assert_called_once_with(778, panel.id)
+
+    async def test_startup_cleanup_runs_after_control_panel_restore(self) -> None:
+        channel = MagicMock(id=889)
+        guild = MagicMock(id=779)
+        guild.get_channel.return_value = channel
+        state = bot.GuildMusicState()
+
+        with (
+            patch.object(bot.bot._connection, "_guilds", {guild.id: guild}),
+            patch.object(bot, "get_music_channel_id", return_value=channel.id),
+            patch.object(bot, "get_state", return_value=state),
+            patch.object(
+                bot,
+                "update_control_panel",
+                new=AsyncMock(),
+            ) as update_panel,
+        ):
+            await bot.restore_control_panels()
+
+        update_panel.assert_awaited_once_with(
+            guild.id,
+            state,
+            channel=channel,
+            clean_channel=True,
+        )
 
     async def test_restart_recovers_panel_when_saved_id_is_missing(self) -> None:
         class Guild:
@@ -5107,7 +4980,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         state = bot.GuildMusicState()
 
         with (
-            patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
+            patch.object(music_discord_display, "MUSIC_CHANNEL_SILENT", False),
             patch.object(bot, "get_control_message_id", return_value=None),
             patch.object(bot, "set_control_message_id") as save_message_id,
             patch.object(
@@ -5647,6 +5520,11 @@ class HousekeepingTaskTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot.ytdl_scheduler, "shutdown", new=AsyncMock()),
             patch.object(bot, "shutdown_auxiliary_workers", new=AsyncMock()),
             patch.object(bot, "shutdown_lyrics_executor", new=AsyncMock()),
+            patch.object(
+                bot,
+                "restore_control_panels",
+                new=AsyncMock(),
+            ) as restore_control_panels,
             patch.object(bot.commands.Bot, "close", new=base_close),
         ):
             await bot.MusicBot.close(bot.bot)
@@ -5655,6 +5533,7 @@ class HousekeepingTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(task.cancelled())
         self.assertFalse(bot.housekeeping_tasks)
         self.assertEqual(order, ["housekeeping", "discord"])
+        restore_control_panels.assert_not_awaited()
 
     async def test_housekeeping_exception_is_retrieved(self) -> None:
         async def fail() -> None:
@@ -6626,65 +6505,6 @@ class LocalMusicTestModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bulk), 2)
         self.assertEqual(len(auto), 3)
         self.assertEqual(len({bot.normalize_track_key(track) for track in auto}), 3)
-
-
-class QueueTests(unittest.TestCase):
-    def test_remove_by_id_uses_stable_track_identity(self) -> None:
-        first = make_track("first")
-        second = make_track("second")
-        third = make_track("third")
-        state = bot.GuildMusicState(queue=deque([third, first, second]))
-
-        removed = bot.remove_queued_track_by_id(state, second.track_id)
-
-        self.assertIs(removed, second)
-        self.assertEqual(list(state.queue), [third, first])
-
-    def test_remove_range_is_inclusive(self) -> None:
-        tracks = [make_track(f"track-{index}") for index in range(1, 21)]
-        state = bot.GuildMusicState(queue=deque(tracks))
-
-        result = bot.remove_queued_track_range_by_ids(
-            state,
-            tracks[4].track_id,
-            tracks[12].track_id,
-        )
-
-        self.assertIsNotNone(result)
-        removed, start_index, end_index = result
-        self.assertEqual((start_index, end_index), (4, 12))
-        self.assertEqual(removed, tracks[4:13])
-        self.assertEqual(len(state.queue), 11)
-        self.assertEqual(list(state.queue), tracks[:4] + tracks[13:])
-
-    def test_remove_range_accepts_reversed_boundaries(self) -> None:
-        tracks = [make_track(f"track-{index}") for index in range(1, 21)]
-        state = bot.GuildMusicState(queue=deque(tracks))
-
-        result = bot.remove_queued_track_range_by_ids(
-            state,
-            tracks[12].track_id,
-            tracks[4].track_id,
-        )
-
-        self.assertIsNotNone(result)
-        removed, start_index, end_index = result
-        self.assertEqual((start_index, end_index), (4, 12))
-        self.assertEqual(removed, tracks[4:13])
-        self.assertEqual(len(state.queue), 11)
-
-    def test_remove_range_keeps_queue_when_endpoint_is_missing(self) -> None:
-        tracks = [make_track("first"), make_track("second")]
-        state = bot.GuildMusicState(queue=deque(tracks))
-
-        result = bot.remove_queued_track_range_by_ids(
-            state,
-            tracks[0].track_id,
-            "missing-track-id",
-        )
-
-        self.assertIsNone(result)
-        self.assertEqual(list(state.queue), tracks)
 
 
 class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
@@ -9294,8 +9114,12 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(bot.discord, "Member", Requester),
             patch.object(bot, "get_music_channel_id", return_value=channel.id),
-            patch.object(bot, "MUSIC_CHANNEL_SILENT", False),
-            patch.object(bot, "MUSIC_CHANNEL_DELETE_REQUESTS", False),
+            patch.object(music_discord_display, "MUSIC_CHANNEL_SILENT", False),
+            patch.object(
+                music_discord_display,
+                "MUSIC_CHANNEL_DELETE_REQUESTS",
+                False,
+            ),
             patch.object(bot, "EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS", 60),
             patch.object(bot, "extract_track", side_effect=delayed_extract),
             patch.object(bot, "enqueue_tracks", side_effect=capture_enqueue_result),

@@ -57,6 +57,122 @@ class MusicTrackMetadataTests(unittest.TestCase):
             },
         )
 
+    @staticmethod
+    def make_identity_track(
+        title: str,
+        video_id: str,
+        *,
+        artist: str | None = None,
+        song_name: str | None = None,
+        uploader: str | None = None,
+    ) -> bot.Track:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        return bot.Track(
+            title=title,
+            webpage_url=url,
+            requester="tester",
+            source_url=url,
+            artist=artist,
+            song_name=song_name,
+            uploader=uploader,
+        )
+
+    def test_mv_and_audio_metadata_share_the_same_song_key(self) -> None:
+        mv = self.make_identity_track(
+            "back number - Blue Amber (Official Music Video)",
+            "aaaaaaaaaaa",
+            artist="back number",
+            song_name="Blue Amber",
+        )
+        audio = self.make_identity_track(
+            "Blue Amber (Official Audio)",
+            "bbbbbbbbbbb",
+            artist="back number",
+            song_name="Blue Amber",
+        )
+
+        self.assertNotEqual(mv.webpage_url, audio.webpage_url)
+        self.assertEqual(
+            music_track_metadata.normalize_track_key(mv),
+            music_track_metadata.normalize_track_key(audio),
+        )
+
+    def test_mv_and_audio_titles_match_without_music_metadata(self) -> None:
+        mv = self.make_identity_track(
+            "Artist - Same Song (Official MV)",
+            "ccccccccccc",
+        )
+        audio = self.make_identity_track(
+            "Artist - Same Song [Official Audio]",
+            "ddddddddddd",
+        )
+
+        self.assertEqual(
+            music_track_metadata.normalize_track_key(mv),
+            music_track_metadata.normalize_track_key(audio),
+        )
+
+    def test_topic_audio_matches_a_promotional_mv_title(self) -> None:
+        mv = self.make_identity_track(
+            "back number - ブルーアンバー 【ドラマ主題歌】",
+            "nnnnnnnnnnn",
+        )
+        topic_audio = self.make_identity_track(
+            "ブルーアンバー",
+            "ooooooooooo",
+            uploader="back number - Topic",
+        )
+
+        self.assertEqual(
+            music_track_metadata.normalize_track_key(mv),
+            music_track_metadata.normalize_track_key(topic_audio),
+        )
+
+    def test_live_remix_and_cover_remain_distinct_versions(self) -> None:
+        studio = self.make_identity_track(
+            "Artist - Same Song (Official Audio)",
+            "eeeeeeeeeee",
+        )
+        live = self.make_identity_track(
+            "Artist - Same Song (Official Live Video)",
+            "fffffffffff",
+        )
+        remix = self.make_identity_track(
+            "Artist - Same Song (Remix)",
+            "ggggggggggg",
+        )
+        cover = self.make_identity_track(
+            "Artist - Same Song (Cover)",
+            "hhhhhhhhhhh",
+        )
+
+        keys = {
+            music_track_metadata.normalize_track_key(studio),
+            music_track_metadata.normalize_track_key(live),
+            music_track_metadata.normalize_track_key(remix),
+            music_track_metadata.normalize_track_key(cover),
+        }
+        self.assertEqual(len(keys), 4)
+
+    def test_same_title_by_different_artists_remains_distinct(self) -> None:
+        first = self.make_identity_track(
+            "Same Song (Official Audio)",
+            "iiiiiiiiiii",
+            artist="First Artist",
+            song_name="Same Song",
+        )
+        second = self.make_identity_track(
+            "Same Song (Official Audio)",
+            "jjjjjjjjjjj",
+            artist="Second Artist",
+            song_name="Same Song",
+        )
+
+        self.assertNotEqual(
+            music_track_metadata.normalize_track_key(first),
+            music_track_metadata.normalize_track_key(second),
+        )
+
     def test_make_track_from_info_preserves_extracted_metadata(self) -> None:
         subtitle = {
             "ext": "vtt",
