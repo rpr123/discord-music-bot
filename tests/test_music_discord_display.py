@@ -162,18 +162,6 @@ class MusicDiscordDisplayTests(unittest.TestCase):
         idle = music_discord_display.make_idle_player_embed()
 
         self.assertEqual(idle.title, music_discord_display.IDLE_PANEL_TITLE)
-        self.assertIn(
-            "`/auto n:<개수> 곡명:<검색어>`",
-            idle.description,
-        )
-        self.assertIn("기준 곡을 포함한 총 곡 수", idle.description)
-        self.assertIn(
-            f"최대 {music_discord_display.MAX_AUTO_TRACKS}곡",
-            idle.description,
-        )
-        for legacy_syntax in ("auto:", "auto12:", "auto 12:"):
-            with self.subTest(legacy_syntax=legacy_syntax):
-                self.assertNotIn(legacy_syntax, idle.description)
         self.assertEqual(
             music_discord_display.CONTROL_PANEL_TITLES,
             frozenset(

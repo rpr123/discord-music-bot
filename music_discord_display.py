@@ -6,7 +6,6 @@ import io
 import discord
 
 from music_config import (
-    MAX_AUTO_TRACKS,
     MAX_BULK_TRACKS,
     MUSIC_CHANNEL_DELETE_REQUESTS,
     MUSIC_CHANNEL_SILENT,
@@ -213,13 +212,11 @@ def make_idle_player_embed() -> discord.Embed:
     return discord.Embed(
         title=IDLE_PANEL_TITLE,
         description=(
-            "음성 채널에 들어간 뒤 일반 곡 신청은 아래 형식으로 메시지를 보내 주세요.\n\n"
+            "음성 채널에 들어간 뒤 아래 형식으로 메시지를 보내 주세요.\n\n"
             "`곡명` 또는 `YouTube URL`\n"
             "`album: 앨범명`\n"
-            "`playlist: 플레이리스트명`\n\n"
-            "관련 곡 묶음은 슬래시 명령어 "
-            "`/auto n:<개수> 곡명:<검색어>`를 사용해 주세요.\n"
-            f"`n`은 기준 곡을 포함한 총 곡 수이며 최대 {MAX_AUTO_TRACKS}곡이에요.\n\n"
+            "`playlist: 플레이리스트명`\n"
+            "`auto: 곡명`, `auto12: 곡명` 또는 `auto 12: 곡명`\n\n"
             "자동재생은 아래 버튼으로 켜고 끌 수 있어요."
         ),
         color=discord.Color.blurple(),

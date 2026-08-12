@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import urllib.parse
+from collections.abc import Callable
 
 
 YOUTUBE_HOSTS = {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
@@ -59,14 +60,45 @@ def clamp_auto_count(count: int, max_count: int) -> int:
     return max(1, min(count, max_count))
 
 
-def is_legacy_auto_request(query: str) -> bool:
-    return bool(
-        re.match(
-            r"^auto(?::|\d+\s*:|\s+)",
-            query.strip(),
-            flags=re.IGNORECASE,
-        )
+def parse_auto_request(
+    query: str,
+    *,
+    default_count: int,
+    clamp_count: Callable[[int], int],
+) -> tuple[str, int] | None:
+    query = query.strip()
+    counted_match = re.match(
+        r"^auto\s*(\d+)\s*:\s*(.*)$",
+        query,
+        flags=re.IGNORECASE,
     )
+    if counted_match:
+        count_text = counted_match.group(1)
+        rest = counted_match.group(2).strip()
+        if not rest:
+            raise ValueError(
+                f"auto{count_text}: 또는 auto {count_text}: 뒤에 "
+                "곡명이나 아티스트를 입력해 주세요."
+            )
+        return rest, clamp_count(int(count_text))
+
+    default_match = re.match(r"^auto(?::|\s+)(.*)$", query, flags=re.IGNORECASE)
+    if not default_match:
+        return None
+
+    rest = default_match.group(1).strip()
+    if not rest:
+        raise ValueError("auto: 뒤에 곡명이나 아티스트를 입력해 주세요.")
+
+    old_count_match = re.match(r"^(\d+)(?::|\s+|$)", rest)
+    if old_count_match:
+        count_text = old_count_match.group(1)
+        raise ValueError(
+            f"곡 개수는 `auto{count_text}: 곡명` 또는 `auto {count_text}: 곡명`처럼 "
+            "콜론 앞에 입력해 주세요."
+        )
+
+    return rest, default_count
 
 
 def parse_music_request(query: str) -> tuple[str, str | None, bool]:

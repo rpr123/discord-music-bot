@@ -711,7 +711,7 @@ class QueueFeedbackLatencyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
-    async def test_explicit_auto_count_routes_to_auto_extractor_and_enqueues_all_tracks(
+    async def test_auto_count_request_routes_to_auto_extractor_and_enqueues_all_tracks(
         self,
     ) -> None:
         class Requester:
@@ -748,9 +748,8 @@ class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
                 guild_id,
                 channel,
                 Requester(),
-                "back number",
+                "auto5: back number",
                 initial_response=initial_response,
-                auto_count=5,
             )
 
         self.assertTrue(result)
@@ -763,71 +762,6 @@ class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
         extract_track.assert_not_awaited()
         extract_tracks.assert_not_awaited()
         self.assertEqual(list(bot.get_state(guild_id).queue), tracks)
-
-
-class LegacyAutoMessageTests(unittest.IsolatedAsyncioTestCase):
-    async def test_legacy_auto_message_gives_slash_guidance_without_voice_or_search(
-        self,
-    ) -> None:
-        guild_id = 6542
-
-        class Guild:
-            id = guild_id
-
-        class Channel:
-            id = 7654
-
-        class FakeMember:
-            bot = False
-
-        message = MagicMock()
-        message.author = FakeMember()
-        message.guild = Guild()
-        message.channel = Channel()
-        message.content = "auto5: back number"
-
-        with (
-            patch.object(bot, "bot_shutdown_started", False),
-            patch.object(bot.discord, "Member", FakeMember),
-            patch.object(bot, "get_music_channel_id", return_value=message.channel.id),
-            patch.object(
-                bot,
-                "send_music_request_reply",
-                new=AsyncMock(return_value=None),
-            ) as send_reply,
-            patch.object(
-                bot,
-                "delete_music_request_message",
-                new=AsyncMock(),
-            ) as delete_request,
-            patch.object(bot, "get_state") as get_state,
-            patch.object(
-                bot,
-                "ensure_voice_for_member",
-                new=AsyncMock(),
-            ) as ensure_voice,
-            patch.object(bot, "enqueue_tracks", new=AsyncMock()) as enqueue,
-            patch.object(bot, "extract_track", new=AsyncMock()) as extract_track,
-            patch.object(
-                bot,
-                "extract_auto_tracks",
-                new=AsyncMock(),
-            ) as extract_auto_tracks,
-        ):
-            await bot.on_message(message)
-
-        send_reply.assert_awaited_once()
-        self.assertIs(send_reply.await_args.args[0], message)
-        guidance = send_reply.await_args.args[1]
-        self.assertIn("/auto", guidance)
-        self.assertIn("n:", guidance)
-        self.assertIn("곡명:", guidance)
-        delete_request.assert_awaited_once_with(message)
-        get_state.assert_not_called()
-        ensure_voice.assert_not_awaited()
-        enqueue.assert_not_awaited()
-        extract_track.assert_not_awaited()
-        extract_auto_tracks.assert_not_awaited()
 
 
 class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -1690,150 +1624,11 @@ class CommandSurfaceTests(unittest.TestCase):
         self.assertEqual(
             command_names,
             {
-                "auto",
                 "setupmusic",
                 "remove",
                 "leave",
             },
         )
-
-    def test_auto_command_has_required_count_and_song_options(self) -> None:
-        command = bot.bot.tree.get_command("auto")
-
-        self.assertIs(command, bot.queue_auto_tracks)
-        options = command.to_dict(bot.bot.tree)["options"]
-        self.assertEqual(
-            [option["name"] for option in options],
-            ["n", "곡명"],
-        )
-        count, query = options
-        self.assertTrue(count["required"])
-        self.assertEqual(
-            count["type"], bot.discord.AppCommandOptionType.integer.value
-        )
-        self.assertEqual(count["min_value"], 1)
-        self.assertEqual(count["max_value"], bot.MAX_AUTO_TRACKS)
-        self.assertTrue(query["required"])
-        self.assertEqual(
-            query["type"], bot.discord.AppCommandOptionType.string.value
-        )
-        self.assertNotIn("min_value", query)
-        self.assertNotIn("max_value", query)
-
-
-class AutoSlashCommandTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncTearDown(self) -> None:
-        bot.music_states.clear()
-
-    def make_interaction(self, guild_id: int, channel: object) -> MagicMock:
-        guild = MagicMock()
-        guild.id = guild_id
-        guild.get_channel.return_value = channel
-        interaction = MagicMock()
-        interaction.guild = guild
-        interaction.guild_id = guild_id
-        interaction.user = MagicMock()
-        interaction.response.defer = AsyncMock()
-        interaction.edit_original_response = AsyncMock()
-        return interaction
-
-    async def test_auto_command_defers_privately_and_enqueues_in_configured_channel(
-        self,
-    ) -> None:
-        guild_id = 6543
-        channel_id = 7655
-        channel = MagicMock()
-        channel.send = AsyncMock()
-        interaction = self.make_interaction(guild_id, channel)
-        loading_message = MagicMock()
-        interaction.edit_original_response.return_value = loading_message
-        state = bot.get_state(guild_id)
-        state.playback_generation = 9
-
-        with (
-            patch.object(bot, "get_music_channel_id", return_value=channel_id),
-            patch.object(
-                bot,
-                "ensure_voice_for_member",
-                new=AsyncMock(return_value=(True, None)),
-            ) as ensure_voice,
-            patch.object(
-                bot,
-                "enqueue_tracks",
-                new=AsyncMock(return_value=True),
-            ) as enqueue,
-        ):
-            await bot.queue_auto_tracks.callback(interaction, 5, "back number")
-
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-        interaction.guild.get_channel.assert_called_once_with(channel_id)
-        self.assertIs(state.announcement_channel, channel)
-        ensure_voice.assert_awaited_once_with(interaction.user, state)
-        interaction.edit_original_response.assert_awaited_once_with(
-            content="곡을 찾고 있어요..."
-        )
-        enqueue.assert_awaited_once_with(
-            guild_id,
-            channel,
-            interaction.user,
-            "back number",
-            initial_response=loading_message,
-            auto_count=5,
-            request_generation=9,
-        )
-
-    async def test_auto_command_voice_failure_does_not_enqueue(self) -> None:
-        guild_id = 6544
-        channel_id = 7656
-        channel = MagicMock()
-        channel.send = AsyncMock()
-        interaction = self.make_interaction(guild_id, channel)
-        state = bot.get_state(guild_id)
-        error = "먼저 음성 채널에 들어와 주세요."
-
-        with (
-            patch.object(bot, "get_music_channel_id", return_value=channel_id),
-            patch.object(
-                bot,
-                "ensure_voice_for_member",
-                new=AsyncMock(return_value=(False, error)),
-            ) as ensure_voice,
-            patch.object(bot, "enqueue_tracks", new=AsyncMock()) as enqueue,
-        ):
-            await bot.queue_auto_tracks.callback(interaction, 5, "back number")
-
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-        interaction.guild.get_channel.assert_called_once_with(channel_id)
-        self.assertIs(state.announcement_channel, channel)
-        ensure_voice.assert_awaited_once_with(interaction.user, state)
-        interaction.edit_original_response.assert_awaited_once_with(content=error)
-        enqueue.assert_not_awaited()
-
-    async def test_auto_command_requires_setup_before_voice_or_enqueue(self) -> None:
-        guild_id = 6545
-        channel = MagicMock()
-        interaction = self.make_interaction(guild_id, channel)
-
-        with (
-            patch.object(bot, "get_music_channel_id", return_value=None),
-            patch.object(bot, "get_state") as get_state,
-            patch.object(
-                bot,
-                "ensure_voice_for_member",
-                new=AsyncMock(),
-            ) as ensure_voice,
-            patch.object(bot, "enqueue_tracks", new=AsyncMock()) as enqueue,
-        ):
-            await bot.queue_auto_tracks.callback(interaction, 5, "back number")
-
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-        interaction.edit_original_response.assert_awaited_once_with(
-            content="먼저 `/setupmusic`으로 음악 신청 채널을 설정해 주세요."
-        )
-        interaction.guild.get_channel.assert_not_called()
-        get_state.assert_not_called()
-        ensure_voice.assert_not_awaited()
-        enqueue.assert_not_awaited()
 
 
 class EphemeralResponseTests(unittest.IsolatedAsyncioTestCase):
