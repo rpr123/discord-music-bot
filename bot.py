@@ -29,31 +29,6 @@ from music_autoplay_policy import (
     remember_recent_value,
     select_autoplay_candidate,
 )
-from music_japanese_reading import (
-    EXPLICIT_READING_BRACKETS,
-    HANGUL_RE,
-    JAPANESE_HAN_RE,
-    JAPANESE_KANA_RE,
-    JAPANESE_READING_RE,
-    SUDACHI_TOKENIZER,
-    SUDACHI_TOKENIZER_LOCK,
-    LyricsReadingError,
-    annotate_japanese_reading,
-    annotate_token_reading,
-    find_explicit_reading_base_start,
-    find_explicit_reading_replacements,
-    generate_hiragana_lyrics,
-    get_reading_surface_segment_kind,
-    get_sudachi_tokenizer,
-    katakana_to_hiragana,
-    lyrics_are_japanese,
-    lyrics_are_primarily_korean,
-    normalize_japanese_reading,
-    protect_explicit_readings,
-    replace_explicit_readings,
-    split_reading_surface,
-    sudachi_dictionary,
-)
 from music_models import (
     AUTOPLAY_HISTORY_SIZE,
     MAX_PLAYBACK_ATTEMPTS,
@@ -162,21 +137,18 @@ from music_namuwiki_parsing import (
     clean_namumark_cell,
     extract_interleaved_namuwiki_groups,
     extract_interleaved_namuwiki_lyrics,
-    extract_namuwiki_annotated_reading,
     extract_namuwiki_lyrics_from_html,
     extract_namuwiki_lyrics_from_namumark,
-    extract_namuwiki_original_lyrics,
     extract_namuwiki_lyrics_from_tables,
-    get_hiragana_reading_source_lyrics,
     is_usable_namuwiki_lyrics,
     is_valid_korean_translation,
+    lyrics_are_primarily_korean,
     namuwiki_reading_header_score,
     namuwiki_source_header_score,
     namuwiki_translation_header_score,
     normalize_namuwiki_table_text,
     parse_namumark_tables,
     parse_namuwiki_html_tables,
-    split_namuwiki_lyrics_groups,
 )
 from music_request_parsing import (
     YOUTUBE_HOSTS,
@@ -257,7 +229,6 @@ from music_config import (
     FFMPEG_OPTIONS,
     LOG_LEVEL,
     LYRICS_API_URL,
-    LYRICS_READING_ENABLED,
     LYRICS_REQUEST_TIMEOUT_SECONDS,
     LYRICS_START_DELAY_SECONDS,
     MAX_AUTO_TRACKS,
@@ -2130,21 +2101,6 @@ def get_korean_lyrics_label(track: Track) -> str:
     return "한국어 자막"
 
 
-def can_generate_lyrics_reading(track: Track, lyrics: str) -> bool:
-    if not LYRICS_READING_ENABLED:
-        return False
-    if (
-        track.korean_lyrics
-        and track.korean_lyrics_url
-        and extract_namuwiki_annotated_reading(track.korean_lyrics)
-    ):
-        return True
-    return bool(
-        sudachi_dictionary is not None
-        and get_hiragana_reading_source_lyrics(track, lyrics)
-    )
-
-
 async def get_track_namuwiki_lyrics(track: Track) -> str | None:
     if track.korean_lyrics_loaded:
         return (
@@ -2239,49 +2195,6 @@ async def get_track_korean_lyrics(track: Track) -> str:
         track.korean_lyrics_url = None
         track.korean_lyrics_loaded = True
         return lyrics
-
-
-async def get_track_hiragana_reading(track: Track) -> str:
-    if track.lyrics_reading_loaded and track.lyrics_reading is not None:
-        return track.lyrics_reading
-
-    async with track.lyrics_reading_lock:
-        if track.lyrics_reading_loaded and track.lyrics_reading is not None:
-            return track.lyrics_reading
-
-        if track.korean_lyrics and track.korean_lyrics_url:
-            reading = extract_namuwiki_annotated_reading(track.korean_lyrics)
-            if reading:
-                track.lyrics_reading = reading
-                track.lyrics_reading_loaded = True
-                track.lyrics_reading_source = "나무위키 · 일본어 독음"
-                track.lyrics_reading_url = track.korean_lyrics_url
-                return reading
-
-        source_lyrics = get_hiragana_reading_source_lyrics(
-            track,
-            track.lyrics or "",
-        )
-        if not source_lyrics:
-            raise LyricsReadingError("Japanese source lyrics are not available.")
-        try:
-            reading = await run_lyrics_job(
-                generate_hiragana_lyrics,
-                source_lyrics,
-            )
-        except LyricsReadingError:
-            raise
-        except Exception as error:
-            raise LyricsReadingError(str(error)) from error
-        track.lyrics_reading = reading
-        track.lyrics_reading_loaded = True
-        if track.korean_lyrics_url and source_lyrics != track.lyrics:
-            track.lyrics_reading_source = "나무위키 원문 · Sudachi 자동 독음"
-            track.lyrics_reading_url = track.korean_lyrics_url
-        else:
-            track.lyrics_reading_source = "Sudachi · 자동 독음"
-            track.lyrics_reading_url = None
-        return reading
 
 
 def cancel_lyrics_publish(state: GuildMusicState) -> None:
@@ -2391,15 +2304,6 @@ class LyricsVariantView(discord.ui.View):
             korean_lyrics_button.callback = self.show_korean_lyrics
             self.add_item(korean_lyrics_button)
 
-        if can_generate_lyrics_reading(track, lyrics):
-            reading_button = discord.ui.Button(
-                label="히라가나 독음",
-                style=discord.ButtonStyle.secondary,
-                custom_id=f"lyrics:reading:{track.track_id}",
-            )
-            reading_button.callback = self.show_reading
-            self.add_item(reading_button)
-
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if track_is_current(self.guild_id, self.track):
             return True
@@ -2458,40 +2362,6 @@ class LyricsVariantView(discord.ui.View):
             source_url=self.track.korean_lyrics_url,
             edit_original=True,
         )
-
-    async def show_reading(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            reading = await get_track_hiragana_reading(self.track)
-        except LyricsReadingError as error:
-            logger.warning(
-                "Lyrics reading generation failed for %s: %s",
-                self.track.title,
-                error,
-            )
-            await send_ephemeral_followup(
-                interaction,
-                "히라가나 독음을 만들지 못했어요.",
-            )
-            return
-
-        if not track_is_current(self.guild_id, self.track):
-            await send_ephemeral_followup(
-                interaction,
-                "독음을 만드는 동안 곡이 바뀌었어요.",
-            )
-            return
-        await send_private_lyrics_variant(
-            interaction,
-            self.guild_id,
-            self.track,
-            label="히라가나 독음",
-            text=reading,
-            source=self.track.lyrics_reading_source or "Sudachi · 자동 독음",
-            filename="lyrics-hiragana.txt",
-            source_url=self.track.lyrics_reading_url,
-        )
-
 
 def make_lyrics_variant_view(
     guild_id: int,

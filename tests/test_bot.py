@@ -840,10 +840,7 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
         japanese_track = make_track("Japanese")
         korean_track = make_track("Korean")
 
-        with (
-            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
-            patch.object(bot, "sudachi_dictionary", MagicMock()),
-        ):
+        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True):
             japanese_view = bot.make_lyrics_variant_view(
                 100,
                 japanese_track,
@@ -857,7 +854,7 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             {item.label for item in japanese_view.children},
-            {"나무위키 가사", "히라가나 독음"},
+            {"나무위키 가사"},
         )
         self.assertIsNone(korean_view)
 
@@ -869,10 +866,7 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
             "ko": [{"ext": "json3", "url": "https://example.com/ko"}],
         }
 
-        with (
-            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", False),
-            patch.object(bot, "sudachi_dictionary", None),
-        ):
+        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", False):
             view = bot.make_lyrics_variant_view(
                 100,
                 track,
@@ -890,10 +884,7 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         track = make_track("English")
 
-        with (
-            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", False),
-            patch.object(bot, "sudachi_dictionary", None),
-        ):
+        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", False):
             view = bot.make_lyrics_variant_view(
                 100,
                 track,
@@ -905,10 +896,7 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
     def test_korean_lyrics_button_is_available_for_namuwiki_lookup(self) -> None:
         track = make_track("Foreign song")
 
-        with (
-            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
-            patch.object(bot, "sudachi_dictionary", None),
-        ):
+        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True):
             view = bot.make_lyrics_variant_view(
                 100,
                 track,
@@ -936,10 +924,7 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
         track = make_track("泥濘鳴鳴")
         track.subtitle_language = "ja"
 
-        with (
-            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
-            patch.object(bot, "sudachi_dictionary", None),
-        ):
+        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True):
             view = bot.make_lyrics_variant_view(100, track, "")
 
         self.assertIsNotNone(view)
@@ -948,63 +933,10 @@ class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
             {"나무위키 가사"},
         )
 
-    def test_namuwiki_reading_adds_hiragana_button_without_original_lyrics(
-        self,
-    ) -> None:
-        track = make_track("泥濘鳴鳴")
-        track.korean_lyrics = (
-            "泥濘 鳴鳴\n"
-            "でいねい めいめい\n"
-            "진창에서 울리는 노랫소리\n\n"
-            "礼を持って\n"
-            "れいをもって\n"
-            "예를 갖추어 다시 걸어가"
-        )
-        track.korean_lyrics_loaded = True
-        track.korean_lyrics_url = "https://namu.wiki/w/example"
-
-        with patch.object(bot, "sudachi_dictionary", None):
-            view = bot.make_lyrics_variant_view(100, track, "")
-
-        self.assertIsNotNone(view)
-        self.assertEqual(
-            {item.label for item in view.children},
-            {"나무위키 가사", "히라가나 독음"},
-        )
-
-    async def test_namuwiki_hiragana_reading_is_used_without_sudachi(
-        self,
-    ) -> None:
-        track = make_track("泥濘鳴鳴")
-        track.korean_lyrics = (
-            "泥濘 鳴鳴\n"
-            "デイネイ メイメイ\n"
-            "진창에서 울리는 노랫소리\n\n"
-            "礼を持って\n"
-            "れいをもって\n"
-            "예를 갖추어 다시 걸어가"
-        )
-        track.korean_lyrics_url = "https://namu.wiki/w/example"
-        namuwiki_lyrics = track.korean_lyrics
-
-        with patch.object(bot, "sudachi_dictionary", None):
-            reading = await bot.get_track_hiragana_reading(track)
-
-        self.assertEqual(
-            reading,
-            "泥濘(でいねい) 鳴鳴(めいめい)\n礼(れい)を持(も)って",
-        )
-        self.assertEqual(track.korean_lyrics, namuwiki_lyrics)
-        self.assertEqual(track.lyrics_reading_source, "나무위키 · 일본어 독음")
-        self.assertEqual(track.lyrics_reading_url, track.korean_lyrics_url)
-
     def test_missing_korean_lyrics_do_not_offer_korean_variant(self) -> None:
         track = make_track("한국 노래")
 
-        with (
-            patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True),
-            patch.object(bot, "sudachi_dictionary", None),
-        ):
+        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True):
             view = bot.make_lyrics_variant_view(100, track, "")
 
         self.assertIsNone(view)

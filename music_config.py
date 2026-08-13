@@ -163,12 +163,6 @@ NAMUWIKI_REQUEST_INTERVAL_SECONDS = parse_nonnegative_float_env(
     "NAMUWIKI_REQUEST_INTERVAL_SECONDS", 1.1
 )
 NAMUWIKI_DOCUMENT_OVERRIDES = parse_string_map_env("NAMUWIKI_DOCUMENT_OVERRIDES")
-LYRICS_READING_ENABLED = os.getenv("LYRICS_READING_ENABLED", "true").lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
 YTDL_EXTRACT_TIMEOUT_SECONDS = parse_positive_int_env("YTDL_EXTRACT_TIMEOUT_SECONDS", 45)
 YTDL_MAX_CONCURRENT_EXTRACTIONS = parse_positive_int_env(
     "YTDL_MAX_CONCURRENT_EXTRACTIONS", 1

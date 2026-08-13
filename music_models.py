@@ -38,15 +38,7 @@ class Track:
     korean_lyrics_source: str | None = None
     korean_lyrics_url: str | None = None
     namuwiki_lyrics_checked: bool = False
-    lyrics_reading: str | None = None
-    lyrics_reading_loaded: bool = False
-    lyrics_reading_source: str | None = None
-    lyrics_reading_url: str | None = None
     korean_lyrics_lock: asyncio.Lock = field(
-        default_factory=asyncio.Lock,
-        repr=False,
-    )
-    lyrics_reading_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock,
         repr=False,
     )
