@@ -87,8 +87,12 @@ class MusicModelTests(unittest.TestCase):
         track = self.make_track("queued")
 
         first.queue.append(track)
-        first.recent_track_keys.append("track")
-        first.recent_video_ids.append("video")
+        first.recent_track_keys.append(
+            music_models.AutoplayHistoryEntry("track", expires_at=1.0)
+        )
+        first.recent_video_ids.append(
+            music_models.AutoplayHistoryEntry("video", expires_at=1.0)
+        )
         first.private_lyrics_messages[track.track_id] = []
         first.queue_cleanup_tasks[1] = object()
         track.manual_subtitles["ko"] = []

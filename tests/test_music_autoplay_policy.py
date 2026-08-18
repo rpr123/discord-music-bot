@@ -73,6 +73,7 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             imported_modules,
             {
                 "__future__",
+                "music_config",
                 "music_models",
                 "music_track_metadata",
                 "typing",
@@ -80,25 +81,166 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
         )
 
     def test_remember_recent_value_moves_duplicates_to_the_end(self) -> None:
-        values = deque(("first", "second", "third"), maxlen=3)
+        values = deque(maxlen=3)
+        for value in ("first", "second", "third"):
+            music_autoplay_policy.remember_recent_value(
+                values,
+                value,
+                now=0.0,
+            )
 
-        music_autoplay_policy.remember_recent_value(values, "first")
+        music_autoplay_policy.remember_recent_value(values, "first", now=0.0)
 
-        self.assertEqual(list(values), ["second", "third", "first"])
+        self.assertEqual(
+            [entry.value for entry in values],
+            ["second", "third", "first"],
+        )
 
     def test_remember_autoplay_track_records_key_and_video_history(self) -> None:
         state = GuildMusicState()
         track = make_track("played")
+        now = 100.0
 
-        music_autoplay_policy.remember_autoplay_track(state, track)
+        music_autoplay_policy.remember_autoplay_track(state, track, now=now)
 
         self.assertEqual(
-            list(state.recent_track_keys),
+            [entry.value for entry in state.recent_track_keys],
             [music_track_metadata.normalize_track_key(track)],
         )
         self.assertEqual(
-            list(state.recent_video_ids),
+            [entry.value for entry in state.recent_video_ids],
             [music_track_metadata.get_track_video_id(track)],
+        )
+        expected_expiry = now + music_autoplay_policy.AUTOPLAY_HISTORY_TTL_SECONDS
+        self.assertEqual(state.recent_track_keys[0].expires_at, expected_expiry)
+        self.assertEqual(state.recent_video_ids[0].expires_at, expected_expiry)
+
+    def test_autoplay_history_expires_at_configured_ttl(self) -> None:
+        state = GuildMusicState()
+        track = make_track("played")
+        played_at = 100.0
+        track_keys = music_track_metadata.get_track_identity_keys(track)
+        ttl = music_autoplay_policy.AUTOPLAY_HISTORY_TTL_SECONDS
+        music_autoplay_policy.remember_autoplay_track(
+            state,
+            track,
+            now=played_at,
+        )
+
+        before_expiry = music_autoplay_policy.get_autoplay_excluded_keys(
+            state,
+            now=played_at + ttl - 0.001,
+        )
+        self.assertTrue(track_keys.issubset(before_expiry))
+
+        at_expiry = music_autoplay_policy.get_autoplay_excluded_keys(
+            state,
+            now=played_at + ttl,
+        )
+        self.assertTrue(track_keys.isdisjoint(at_expiry))
+        self.assertFalse(state.recent_track_keys)
+        self.assertFalse(state.recent_video_ids)
+
+    def test_autoplay_history_prunes_only_expired_front_entries(self) -> None:
+        state = GuildMusicState()
+        old = make_track("old", video_id="aaaaaaaaaaa")
+        fresh = make_track("fresh", video_id="bbbbbbbbbbb")
+        ttl = music_autoplay_policy.AUTOPLAY_HISTORY_TTL_SECONDS
+        music_autoplay_policy.remember_autoplay_track(state, old, now=0.0)
+        music_autoplay_policy.remember_autoplay_track(state, fresh, now=ttl * 0.5)
+
+        excluded = music_autoplay_policy.get_autoplay_excluded_keys(
+            state,
+            now=ttl * 1.25,
+        )
+
+        self.assertTrue(
+            music_track_metadata.get_track_identity_keys(old).isdisjoint(excluded)
+        )
+        self.assertTrue(
+            music_track_metadata.get_track_identity_keys(fresh).issubset(excluded)
+        )
+        self.assertEqual(
+            [entry.value for entry in state.recent_track_keys],
+            [music_track_metadata.normalize_track_key(fresh)],
+        )
+        self.assertEqual(
+            [entry.value for entry in state.recent_video_ids],
+            [music_track_metadata.get_track_video_id(fresh)],
+        )
+
+    def test_replaying_track_refreshes_expiry_and_order(self) -> None:
+        state = GuildMusicState()
+        first = make_track("first", video_id="aaaaaaaaaaa")
+        second = make_track("second", video_id="bbbbbbbbbbb")
+        ttl = music_autoplay_policy.AUTOPLAY_HISTORY_TTL_SECONDS
+        music_autoplay_policy.remember_autoplay_track(state, first, now=0.0)
+        music_autoplay_policy.remember_autoplay_track(state, second, now=ttl * 0.1)
+        music_autoplay_policy.remember_autoplay_track(state, first, now=ttl * 0.2)
+
+        self.assertEqual(
+            [entry.value for entry in state.recent_track_keys],
+            [
+                music_track_metadata.normalize_track_key(second),
+                music_track_metadata.normalize_track_key(first),
+            ],
+        )
+
+        excluded = music_autoplay_policy.get_autoplay_excluded_keys(
+            state,
+            now=ttl * 1.15,
+        )
+        self.assertTrue(
+            music_track_metadata.get_track_identity_keys(second).isdisjoint(excluded)
+        )
+        self.assertTrue(
+            music_track_metadata.get_track_identity_keys(first).issubset(excluded)
+        )
+
+    def test_autoplay_history_keeps_only_fifty_most_recent_tracks(self) -> None:
+        state = GuildMusicState()
+        tracks = [
+            make_track(f"track {index}", video_id=f"{index:011d}")
+            for index in range(51)
+        ]
+
+        for track in tracks:
+            music_autoplay_policy.remember_autoplay_track(
+                state,
+                track,
+                now=0.0,
+            )
+
+        self.assertEqual(len(state.recent_track_keys), 50)
+        self.assertEqual(len(state.recent_video_ids), 50)
+        excluded = music_autoplay_policy.get_autoplay_excluded_keys(state, now=0.0)
+        self.assertTrue(
+            music_track_metadata.get_track_identity_keys(tracks[0]).isdisjoint(excluded)
+        )
+        self.assertTrue(
+            music_track_metadata.get_track_identity_keys(tracks[-1]).issubset(excluded)
+        )
+
+    def test_expired_history_still_excludes_current_and_queued_tracks(self) -> None:
+        current = make_track("current", video_id="aaaaaaaaaaa")
+        queued = make_track("queued", video_id="bbbbbbbbbbb")
+        state = GuildMusicState(current=current)
+        state.queue.append(queued)
+        music_autoplay_policy.remember_autoplay_track(state, current, now=0.0)
+        music_autoplay_policy.remember_autoplay_track(state, queued, now=0.0)
+
+        excluded = music_autoplay_policy.get_autoplay_excluded_keys(
+            state,
+            now=music_autoplay_policy.AUTOPLAY_HISTORY_TTL_SECONDS,
+        )
+
+        self.assertFalse(state.recent_track_keys)
+        self.assertFalse(state.recent_video_ids)
+        self.assertTrue(
+            music_track_metadata.get_track_identity_keys(current).issubset(excluded)
+        )
+        self.assertTrue(
+            music_track_metadata.get_track_identity_keys(queued).issubset(excluded)
         )
 
     def test_autoplay_excluded_keys_include_recent_current_and_queue(self) -> None:
@@ -106,10 +248,18 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
         queued = make_track("queued")
         state = GuildMusicState(current=current)
         state.queue.append(queued)
-        state.recent_track_keys.append("song:recent")
-        state.recent_video_ids.append("abcdefghijk")
+        music_autoplay_policy.remember_recent_value(
+            state.recent_track_keys,
+            "song:recent",
+            now=0.0,
+        )
+        music_autoplay_policy.remember_recent_value(
+            state.recent_video_ids,
+            "abcdefghijk",
+            now=0.0,
+        )
 
-        excluded = music_autoplay_policy.get_autoplay_excluded_keys(state)
+        excluded = music_autoplay_policy.get_autoplay_excluded_keys(state, now=0.0)
 
         self.assertIn("song:recent", excluded)
         self.assertIn("video:abcdefghijk", excluded)
@@ -132,10 +282,16 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
         second_valid = make_track("second valid")
         state = GuildMusicState(current=current)
         state.queue.append(queued)
-        state.recent_track_keys.append(
-            music_track_metadata.normalize_track_key(recent_key)
+        music_autoplay_policy.remember_recent_value(
+            state.recent_track_keys,
+            music_track_metadata.normalize_track_key(recent_key),
+            now=0.0,
         )
-        state.recent_video_ids.append("vvvvvvvvvvv")
+        music_autoplay_policy.remember_recent_value(
+            state.recent_video_ids,
+            "vvvvvvvvvvv",
+            now=0.0,
+        )
         extra_excluded = music_track_metadata.get_track_identity_keys(extra)
         candidates = [
             recent_key,
@@ -152,6 +308,7 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
                 state,
                 candidates,
                 extra_excluded,
+                now=0.0,
             ),
             first_valid,
         )
@@ -168,6 +325,7 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
                 state,
                 candidates,
                 all_excluded,
+                now=0.0,
             )
         )
 

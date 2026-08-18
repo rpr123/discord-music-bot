@@ -4723,7 +4723,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         state.current = seed
         state.queue.append(queued)
         state.autoplay_enabled = True
-        state.recent_track_keys.append(bot.normalize_track_key(recent))
+        bot.remember_autoplay_track(state, recent)
 
         with (
             patch.object(
@@ -9546,7 +9546,10 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(voice.play_calls, 1)
         self.assertIs(state.current, first)
         self.assertEqual(list(state.queue), [second])
-        self.assertIn(bot.normalize_track_key(first), state.recent_track_keys)
+        self.assertIn(
+            bot.normalize_track_key(first),
+            {entry.value for entry in state.recent_track_keys},
+        )
         ffmpeg_opus.assert_called_once()
         self.assertEqual(ffmpeg_opus.call_args.kwargs["codec"], "copy")
         self.assertEqual(ffmpeg_opus.call_args.kwargs["bitrate"], 128)

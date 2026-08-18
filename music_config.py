@@ -118,6 +118,9 @@ QUEUE_DELETE_RESPONSE_DELETE_SECONDS = parse_positive_int_env(
 )
 DEFAULT_AUTO_TRACKS = parse_positive_int_env("DEFAULT_AUTO_TRACKS", 8)
 MAX_AUTO_TRACKS = parse_positive_int_env("MAX_AUTO_TRACKS", 25)
+AUTOPLAY_HISTORY_TTL_SECONDS = parse_positive_int_env(
+    "AUTOPLAY_HISTORY_TTL_SECONDS", 12 * 60 * 60
+)
 AUTOPLAY_REFILL_CANDIDATES = min(
     parse_positive_int_env("AUTOPLAY_REFILL_CANDIDATES", 5),
     MAX_AUTO_TRACKS,

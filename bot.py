@@ -217,6 +217,7 @@ from ytmusicapi.auth.oauth import OAuthCredentials
 
 from music_config import (
     AUTOPLAY_BUTTON_CUSTOM_ID,
+    AUTOPLAY_HISTORY_TTL_SECONDS,
     AUTOPLAY_REFILL_CANDIDATES,
     AUTOPLAY_START_DELAY_SECONDS,
     CONTROL_PANEL_HISTORY_LIMIT,

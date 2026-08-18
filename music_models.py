@@ -13,6 +13,12 @@ AUTOPLAY_HISTORY_SIZE = 50
 MAX_PLAYBACK_ATTEMPTS = 2
 
 
+@dataclass(frozen=True)
+class AutoplayHistoryEntry:
+    value: str
+    expires_at: float
+
+
 @dataclass
 class Track:
     title: str
@@ -57,10 +63,10 @@ class GuildMusicState:
     control_view: discord.ui.View | None = None
     repeat_one: bool = False
     autoplay_enabled: bool = False
-    recent_track_keys: Deque[str] = field(
+    recent_track_keys: Deque[AutoplayHistoryEntry] = field(
         default_factory=lambda: deque(maxlen=AUTOPLAY_HISTORY_SIZE)
     )
-    recent_video_ids: Deque[str] = field(
+    recent_video_ids: Deque[AutoplayHistoryEntry] = field(
         default_factory=lambda: deque(maxlen=AUTOPLAY_HISTORY_SIZE)
     )
     skip_requested: bool = False

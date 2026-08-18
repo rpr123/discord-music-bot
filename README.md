@@ -121,6 +121,7 @@ MAX_BULK_TRACKS=50
 DEFAULT_AUTO_TRACKS=8
 MAX_AUTO_TRACKS=25
 AUTOPLAY_REFILL_CANDIDATES=5
+AUTOPLAY_HISTORY_TTL_SECONDS=43200
 ```
 
 `MUSIC_CHANNEL_SILENT=true`이면 음악 신청 전용 채널에서 봇이 보내는 검색/대기열/Now playing 메시지를 조용한 메시지로 보냅니다. 사용자가 직접 보낸 곡 신청 메시지의 알림이나 각자의 채널 음소거 상태는 디스코드 클라이언트 설정 영역이라 봇이 강제로 바꿀 수 없습니다.
@@ -153,7 +154,7 @@ GCP 같은 클라우드 서버에서 `Sign in to confirm you're not a bot` 오�
 
 `MAX_BULK_TRACKS`는 앨범이나 재생목록을 한 번에 추가할 때 최대 몇 곡까지 대기열에 넣을지 정합니다.
 
-`DEFAULT_AUTO_TRACKS`와 `MAX_AUTO_TRACKS`는 전용 채널의 `auto:` 요청으로 관련 곡을 추가할 때의 기본/최대 개수입니다. `AUTOPLAY_REFILL_CANDIDATES`는 재생 중 백그라운드 보충이 한 번에 확인할 후보 수이며 기본값은 5입니다. 사용자가 직접 입력한 `auto25:` 같은 요청에는 이 제한을 적용하지 않습니다.
+`DEFAULT_AUTO_TRACKS`와 `MAX_AUTO_TRACKS`는 전용 채널의 `auto:` 요청으로 관련 곡을 추가할 때의 기본/최대 개수입니다. `AUTOPLAY_REFILL_CANDIDATES`는 재생 중 백그라운드 보충이 한 번에 확인할 후보 수이며 기본값은 5입니다. 사용자가 직접 입력한 `auto25:` 같은 요청에는 이 제한을 적용하지 않습니다. 자동재생 중복 방지는 최근 최대 50곡을 기억하며, 각 기록은 `AUTOPLAY_HISTORY_TTL_SECONDS`(기본 43200초, 12시간)가 지나거나 50곡 한도에서 먼저 밀려나면 다음 후보 검사 때 만료됩니다.
 
 재생은 Opus 형식을 우선 선택하고 가능한 경우 재인코딩 없이 Discord로 전달합니다. 공용 `BOT_VOLUME` 처리는 CPU 절약을 위해 제거했으며, 음량은 각 사용자가 Discord에서 봇을 우클릭해 사용자 음량으로 조절합니다.
 
