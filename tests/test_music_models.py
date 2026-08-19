@@ -14,6 +14,7 @@ PUBLIC_IDENTITY_NAMES = (
     "remove_queued_track",
     "remove_queued_track_by_id",
     "remove_queued_track_range_by_ids",
+    "remove_queued_tracks_before_id",
     "MAX_PLAYBACK_ATTEMPTS",
     "invalidate_track_stream",
     "requeue_track_after_playback_error",
@@ -210,6 +211,34 @@ class MusicModelTests(unittest.TestCase):
 
         self.assertIs(removed, second)
         self.assertEqual(list(state.queue), [third, first])
+
+    def test_remove_before_id_preserves_target_and_later_tracks(self) -> None:
+        first = self.make_track("first")
+        second = self.make_track("second")
+        target = self.make_track("target")
+        later = self.make_track("later")
+        queue = deque([first, second, target, later])
+        state = music_models.GuildMusicState(queue=queue)
+
+        removed = music_models.remove_queued_tracks_before_id(
+            state,
+            target.track_id,
+        )
+
+        self.assertEqual(removed, [first, second])
+        self.assertIs(state.queue, queue)
+        self.assertEqual(list(state.queue), [target, later])
+
+    def test_remove_before_missing_id_keeps_queue_unchanged(self) -> None:
+        tracks = [self.make_track("first"), self.make_track("second")]
+        queue = deque(tracks)
+        state = music_models.GuildMusicState(queue=queue)
+
+        removed = music_models.remove_queued_tracks_before_id(state, "missing")
+
+        self.assertIsNone(removed)
+        self.assertIs(state.queue, queue)
+        self.assertEqual(list(state.queue), tracks)
 
     def test_remove_range_is_inclusive(self) -> None:
         tracks = [self.make_track(f"track-{index}") for index in range(1, 21)]

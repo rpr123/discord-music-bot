@@ -65,20 +65,44 @@ def remember_autoplay_track(
         )
 
 
+def _get_recent_expiry_by_key(
+    state: GuildMusicState,
+    now: float,
+) -> dict[str, float]:
+    _prune_expired_recent_values(state.recent_track_keys, now)
+    _prune_expired_recent_values(state.recent_video_ids, now)
+    expiry_by_key: dict[str, float] = {}
+    for entry in state.recent_track_keys:
+        expiry_by_key[entry.value] = max(
+            expiry_by_key.get(entry.value, entry.expires_at),
+            entry.expires_at,
+        )
+    for entry in state.recent_video_ids:
+        key = f"video:{entry.value}"
+        expiry_by_key[key] = max(
+            expiry_by_key.get(key, entry.expires_at),
+            entry.expires_at,
+        )
+    return expiry_by_key
+
+
+def _get_active_track_keys(state: GuildMusicState) -> set[str]:
+    keys: set[str] = set()
+    if state.current is not None:
+        keys.update(get_track_identity_keys(state.current))
+    for track in state.queue:
+        keys.update(get_track_identity_keys(track))
+    return keys
+
+
 def get_autoplay_excluded_keys(
     state: GuildMusicState,
     *,
     now: float | None = None,
 ) -> set[str]:
     current_time = time.monotonic() if now is None else now
-    _prune_expired_recent_values(state.recent_track_keys, current_time)
-    _prune_expired_recent_values(state.recent_video_ids, current_time)
-    keys = {entry.value for entry in state.recent_track_keys}
-    keys.update(f"video:{entry.value}" for entry in state.recent_video_ids)
-    if state.current is not None:
-        keys.update(get_track_identity_keys(state.current))
-    for track in state.queue:
-        keys.update(get_track_identity_keys(track))
+    keys = set(_get_recent_expiry_by_key(state, current_time))
+    keys.update(_get_active_track_keys(state))
     return keys
 
 
@@ -87,15 +111,42 @@ def select_autoplay_candidate(
     candidates: list[Track],
     extra_excluded_keys: set[str] | None = None,
     *,
+    allow_recent_fallback: bool = False,
     now: float | None = None,
 ) -> Track | None:
-    excluded_keys = get_autoplay_excluded_keys(state, now=now)
+    current_time = time.monotonic() if now is None else now
+    recent_expiry_by_key = _get_recent_expiry_by_key(state, current_time)
+    hard_excluded_keys = _get_active_track_keys(state)
     if extra_excluded_keys:
-        excluded_keys.update(extra_excluded_keys)
+        hard_excluded_keys.update(extra_excluded_keys)
+
+    oldest_recent_candidate: Track | None = None
+    oldest_recent_expiry: float | None = None
     for candidate in candidates:
-        if get_track_identity_keys(candidate).isdisjoint(excluded_keys):
+        identity_keys = get_track_identity_keys(candidate)
+        if not identity_keys.isdisjoint(hard_excluded_keys):
+            continue
+
+        recent_expiries = [
+            recent_expiry_by_key[key]
+            for key in identity_keys
+            if key in recent_expiry_by_key
+        ]
+        if not recent_expiries:
             return candidate
-    return None
+
+        candidate_expiry = max(recent_expiries)
+        if (
+            allow_recent_fallback
+            and (
+                oldest_recent_expiry is None
+                or candidate_expiry < oldest_recent_expiry
+            )
+        ):
+            oldest_recent_candidate = candidate
+            oldest_recent_expiry = candidate_expiry
+
+    return oldest_recent_candidate
 
 
 def get_autoplay_seed(state: GuildMusicState) -> Track | None:

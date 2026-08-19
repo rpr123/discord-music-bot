@@ -329,6 +329,114 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             )
         )
 
+    def test_recent_fallback_prefers_fresh_candidate(self) -> None:
+        recent = make_track("recent", video_id="aaaaaaaaaaa")
+        fresh = make_track("fresh", video_id="bbbbbbbbbbb")
+        state = GuildMusicState()
+        music_autoplay_policy.remember_autoplay_track(state, recent, now=0.0)
+
+        selected = music_autoplay_policy.select_autoplay_candidate(
+            state,
+            [recent, fresh],
+            allow_recent_fallback=True,
+            now=1.0,
+        )
+
+        self.assertIs(selected, fresh)
+
+    def test_recent_fallback_uses_latest_matching_identity_expiry(self) -> None:
+        first = make_track("first", video_id="aaaaaaaaaaa")
+        second = make_track("second", video_id="bbbbbbbbbbb")
+        state = GuildMusicState()
+        music_autoplay_policy.remember_recent_value(
+            state.recent_track_keys,
+            music_track_metadata.normalize_track_key(first),
+            now=0.0,
+        )
+        music_autoplay_policy.remember_autoplay_track(state, second, now=50.0)
+        music_autoplay_policy.remember_recent_value(
+            state.recent_video_ids,
+            "aaaaaaaaaaa",
+            now=100.0,
+        )
+        track_history_before = tuple(state.recent_track_keys)
+        video_history_before = tuple(state.recent_video_ids)
+
+        selected = music_autoplay_policy.select_autoplay_candidate(
+            state,
+            [first, second],
+            allow_recent_fallback=True,
+            now=101.0,
+        )
+
+        self.assertIs(selected, second)
+        self.assertEqual(tuple(state.recent_track_keys), track_history_before)
+        self.assertEqual(tuple(state.recent_video_ids), video_history_before)
+
+    def test_recent_fallback_never_relaxes_current_queue_or_seed(self) -> None:
+        current = make_track("current", video_id="aaaaaaaaaaa")
+        queued = make_track("queued", video_id="bbbbbbbbbbb")
+        seed = make_track("seed", video_id="ccccccccccc")
+        allowed_recent = make_track("allowed", video_id="ddddddddddd")
+        state = GuildMusicState(current=current)
+        state.queue.append(queued)
+        for track in (current, queued, seed, allowed_recent):
+            music_autoplay_policy.remember_autoplay_track(state, track, now=0.0)
+        seed_keys = music_track_metadata.get_track_identity_keys(seed)
+
+        self.assertIs(
+            music_autoplay_policy.select_autoplay_candidate(
+                state,
+                [current, queued, seed, allowed_recent],
+                seed_keys,
+                allow_recent_fallback=True,
+                now=1.0,
+            ),
+            allowed_recent,
+        )
+        self.assertIsNone(
+            music_autoplay_policy.select_autoplay_candidate(
+                state,
+                [current, queued, seed],
+                seed_keys,
+                allow_recent_fallback=True,
+                now=1.0,
+            )
+        )
+
+    def test_recent_fallback_preserves_source_order_for_equal_expiry(self) -> None:
+        first = make_track("first", video_id="aaaaaaaaaaa")
+        second = make_track("second", video_id="bbbbbbbbbbb")
+        state = GuildMusicState()
+        music_autoplay_policy.remember_autoplay_track(state, first, now=0.0)
+        music_autoplay_policy.remember_autoplay_track(state, second, now=0.0)
+
+        selected = music_autoplay_policy.select_autoplay_candidate(
+            state,
+            [second, first],
+            allow_recent_fallback=True,
+            now=1.0,
+        )
+
+        self.assertIs(selected, second)
+
+    def test_recent_fallback_allows_two_song_catalog_to_alternate(self) -> None:
+        first = make_track("first", video_id="aaaaaaaaaaa")
+        second = make_track("second", video_id="bbbbbbbbbbb")
+        state = GuildMusicState(current=second)
+        music_autoplay_policy.remember_autoplay_track(state, first, now=0.0)
+        music_autoplay_policy.remember_autoplay_track(state, second, now=1.0)
+
+        selected = music_autoplay_policy.select_autoplay_candidate(
+            state,
+            [second, first],
+            music_track_metadata.get_track_identity_keys(second),
+            allow_recent_fallback=True,
+            now=2.0,
+        )
+
+        self.assertIs(selected, first)
+
     def test_autoplay_skips_an_audio_duplicate_of_the_current_mv(self) -> None:
         current_mv = make_track(
             "Artist - Same Song (Official MV)",

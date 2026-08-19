@@ -38,6 +38,7 @@ from music_models import (
     remove_queued_track,
     remove_queued_track_by_id,
     remove_queued_track_range_by_ids,
+    remove_queued_tracks_before_id,
     requeue_track_after_playback_error,
     reset_track_playback_attempts,
     reset_track_playback_state,
@@ -308,6 +309,7 @@ from music_ytdl import (
 )
 
 T = TypeVar("T")
+AUTOPLAY_SEED_CHANGE_POLL_SECONDS = 5.0
 
 youtube_music_client: YTMusic | None = None
 youtube_music_client_lock = threading.Lock()
@@ -1580,6 +1582,92 @@ class MusicControlView(discord.ui.View):
         await send_ephemeral_followup(interaction, "다음 곡으로 넘어갈게요.")
 
     @discord.ui.button(
+        label="마지막 곡 재생",
+        emoji="⏩",
+        style=discord.ButtonStyle.primary,
+        custom_id="music:skip_to_last",
+        row=0,
+    )
+    async def skip_to_last(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        state = self.get_state()
+        voice = state.voice
+        current_track = state.current
+        generation = state.playback_generation
+        if (
+            voice is None
+            or current_track is None
+            or not (voice.is_playing() or voice.is_paused())
+        ):
+            await send_ephemeral_response(interaction, "스킵할 곡이 없어요.")
+            return
+
+        target_track = next(
+            (
+                track
+                for track in reversed(state.queue)
+                if track.requester_id is not None
+            ),
+            state.queue[-1] if state.queue else None,
+        )
+        if target_track is None:
+            await send_ephemeral_response(interaction, "넘어갈 대기 곡이 없어요.")
+            return
+
+        await interaction.response.defer()
+        error_message: str | None = None
+        skipped_count = 0
+        async with state.lock:
+            if (
+                state.voice is not voice
+                or state.current is not current_track
+                or state.playback_generation != generation
+            ):
+                error_message = (
+                    "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요."
+                )
+            else:
+                member_channel = getattr(
+                    getattr(interaction.user, "voice", None),
+                    "channel",
+                    None,
+                )
+                if not voice.is_connected() or member_channel != voice.channel:
+                    error_message = (
+                        "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
+                    )
+                elif not (voice.is_playing() or voice.is_paused()):
+                    error_message = "스킵할 곡이 없어요."
+                else:
+                    removed_tracks = remove_queued_tracks_before_id(
+                        state,
+                        target_track.track_id,
+                    )
+                    if removed_tracks is None:
+                        error_message = (
+                            "대기열 상태가 변경되어 조작을 취소했어요. "
+                            "다시 시도해 주세요."
+                        )
+                    else:
+                        for removed_track in removed_tracks:
+                            if removed_track.requester_id is None:
+                                remember_autoplay_track(state, removed_track)
+                        state.skip_requested = True
+                        skipped_count = len(removed_tracks) + 1
+                        voice.stop()
+
+        if error_message is not None:
+            await send_ephemeral_followup(interaction, error_message)
+            return
+        await send_ephemeral_followup(
+            interaction,
+            f"마지막 곡으로 바로 넘어갈게요. {skipped_count}곡을 건너뛰었어요.",
+        )
+
+    @discord.ui.button(
         label="정지",
         emoji="⏹️",
         style=discord.ButtonStyle.danger,
@@ -2724,7 +2812,11 @@ async def extract_auto_tracks_from_seed(
         if len(tracks) >= auto_count:
             break
 
-    if len(tracks) < auto_count and fallback_url.startswith("https://www.youtube.com/watch"):
+    if (
+        job_kind != YtdlJobKind.AUTOPLAY
+        and len(tracks) < auto_count
+        and fallback_url.startswith("https://www.youtube.com/watch")
+    ):
         search_query = f"ytsearch{search_limit}:{seed_track.title} radio mix"
         info = await extract_ytdl_info(
             YTDL_SEARCH_OPTIONS,
@@ -2808,7 +2900,6 @@ async def refill_autoplay_queue(
     state = get_state(guild_id)
     current_task = asyncio.current_task()
     starting_track_id = state.current.track_id if state.current else None
-    initial_seed_keys = get_track_identity_keys(fallback_seed)
     added_track = False
     failure_count = 0
     candidate_count = clamp_auto_count(AUTOPLAY_REFILL_CANDIDATES)
@@ -2843,47 +2934,95 @@ async def refill_autoplay_queue(
             if not autoplay_can_refill(state, generation):
                 return
 
-            candidate = select_autoplay_candidate(
-                state,
-                candidates,
-                initial_seed_keys | get_track_identity_keys(seed),
-            )
+            hard_excluded_keys = get_track_identity_keys(seed)
+            candidate: Track | None = None
+            reused_recent_candidate = False
+            deferred_refill_context: tuple[str | None, tuple[str, ...]] | None = None
+            should_start = False
+            async with state.lock:
+                if not autoplay_can_refill(state, generation):
+                    return
+                selection_time = time.monotonic()
+                candidate = select_autoplay_candidate(
+                    state,
+                    candidates,
+                    hard_excluded_keys,
+                    now=selection_time,
+                )
+                if candidate is None:
+                    candidate = select_autoplay_candidate(
+                        state,
+                        candidates,
+                        hard_excluded_keys,
+                        allow_recent_fallback=True,
+                        now=selection_time,
+                    )
+                    reused_recent_candidate = candidate is not None
+
+                if candidate is None:
+                    if state.queue:
+                        deferred_refill_context = (
+                            state.current.track_id if state.current else None,
+                            tuple(track.track_id for track in state.queue),
+                        )
+                else:
+                    state.queue.append(candidate)
+                    added_track = True
+                    failure_count = 0
+                    voice = state.voice
+                    should_start = (
+                        state.current is None
+                        and voice is not None
+                        and voice.is_connected()
+                        and not voice.is_playing()
+                        and not voice.is_paused()
+                    )
+
             if candidate is None:
+                if deferred_refill_context is not None:
+                    logger.info(
+                        "Autoplay waiting without a new search in guild %s "
+                        "until the playback seed changes",
+                        guild_id,
+                    )
+                    while autoplay_can_refill(state, generation):
+                        await asyncio.sleep(AUTOPLAY_SEED_CHANGE_POLL_SECONDS)
+                        current_context = (
+                            state.current.track_id if state.current else None,
+                            tuple(track.track_id for track in state.queue),
+                        )
+                        if current_context == deferred_refill_context:
+                            continue
+                        if not autoplay_can_refill(state, generation):
+                            return
+                        await asyncio.sleep(AUTOPLAY_START_DELAY_SECONDS)
+                        break
+                    else:
+                        return
+                    continue
                 retry_delay = get_autoplay_retry_delay(failure_count)
                 failure_count += 1
                 logger.warning(
-                    "Autoplay found no new candidate in guild %s; retrying in %s seconds",
+                    "Autoplay found no eligible candidate in guild %s; "
+                    "retrying in %s seconds",
                     guild_id,
                     retry_delay,
                 )
                 await asyncio.sleep(retry_delay)
                 continue
 
-            should_start = False
-            async with state.lock:
-                if not autoplay_can_refill(state, generation):
-                    return
-                if not get_track_identity_keys(candidate).isdisjoint(
-                    get_autoplay_excluded_keys(state)
-                ):
-                    continue
-
-                state.queue.append(candidate)
-                added_track = True
-                voice = state.voice
-                should_start = (
-                    state.current is None
-                    and voice is not None
-                    and voice.is_connected()
-                    and not voice.is_playing()
-                    and not voice.is_paused()
+            if reused_recent_candidate:
+                logger.info(
+                    "Autoplay reused oldest recent candidate %s in guild %s",
+                    candidate.title,
+                    guild_id,
                 )
-
-            logger.info(
-                "Autoplay queued %s in guild %s",
-                candidate.title,
-                guild_id,
-            )
+            else:
+                logger.info(
+                    "Autoplay queued %s in guild %s",
+                    candidate.title,
+                    guild_id,
+                )
             if state.current is not None:
                 await update_control_panel(guild_id, state)
 

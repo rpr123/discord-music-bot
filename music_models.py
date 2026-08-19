@@ -112,6 +112,18 @@ def remove_queued_track_by_id(
     return None
 
 
+def remove_queued_tracks_before_id(
+    state: GuildMusicState,
+    track_id: str,
+) -> list[Track] | None:
+    for index, track in enumerate(state.queue):
+        if track.track_id != track_id:
+            continue
+
+        return [state.queue.popleft() for _ in range(index)]
+    return None
+
+
 def remove_queued_track_range_by_ids(
     state: GuildMusicState,
     first_track_id: str,
