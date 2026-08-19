@@ -1757,6 +1757,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         for state in bot.music_states.values():
             bot.cancel_autoplay_refill(state)
+            bot.cancel_idle_voice_disconnect(state)
             if state.control_view is not None:
                 bot.discord.ui.View.stop(state.control_view)
         bot.music_states.clear()
@@ -3902,6 +3903,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(state.playback_generation, generation + 1)
                     self.assertFalse(voice.is_playing())
                     voice.stop.assert_called_once_with()
+                    self.assertIsNotNone(state.idle_voice_task)
                     interaction.response.defer.assert_awaited_once_with()
                     interaction.edit_original_response.assert_awaited_once()
                     assert_idle_panel(
@@ -6032,6 +6034,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         state.autoplay_task = asyncio.create_task(wait_forever())
         state.lyrics_task = asyncio.create_task(wait_forever())
         state.empty_channel_task = asyncio.create_task(wait_forever())
+        state.idle_voice_task = asyncio.create_task(wait_forever())
         state.queue_cleanup_tasks[99] = asyncio.create_task(wait_forever())
         await asyncio.sleep(0)
 
@@ -6044,6 +6047,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(state.autoplay_task)
         self.assertIsNone(state.lyrics_task)
         self.assertIsNone(state.empty_channel_task)
+        self.assertIsNone(state.idle_voice_task)
         self.assertFalse(state.queue_cleanup_tasks)
 
     async def test_shutdown_invalidates_generation_before_voice_stop(self) -> None:
@@ -7873,6 +7877,8 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         bot.bot._discord_close_task = None
 
     async def asyncTearDown(self) -> None:
+        for state in bot.music_states.values():
+            bot.cancel_idle_voice_disconnect(state)
         tasks = list(bot.voice_operation_tasks)
         for task in tasks:
             task.cancel()
@@ -9625,6 +9631,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         for state in bot.music_states.values():
             bot.cancel_noncritical_tasks(state)
             bot.cancel_autoplay_refill(state)
+            bot.cancel_idle_voice_disconnect(state)
             bot.cancel_lyrics_publish(state)
             bot.schedule_private_lyrics_cleanup(state)
             bot.cancel_queue_message_cleanups(state)
@@ -10505,6 +10512,265 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
             await blocker
 
         await scheduler.shutdown()
+
+    async def test_empty_queue_schedules_idle_voice_disconnect(self) -> None:
+        guild_id = 787
+        channel = MagicMock(id=997)
+        voice = MagicMock(channel=channel)
+        voice.is_connected.return_value = True
+        voice.is_playing.return_value = False
+        voice.is_paused.return_value = False
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        panel_started = asyncio.Event()
+        release_panel = asyncio.Event()
+
+        async def block_idle_panel(*_args: object, **_kwargs: object) -> None:
+            panel_started.set()
+            await release_panel.wait()
+
+        with (
+            patch.object(bot, "ffmpeg_is_available", return_value=True),
+            patch.object(bot, "clear_lyrics_message", new=AsyncMock()),
+            patch.object(
+                bot,
+                "show_idle_panel",
+                new=AsyncMock(side_effect=block_idle_panel),
+            ) as show_idle,
+            patch.object(bot, "IDLE_VOICE_DISCONNECT_DELAY_SECONDS", 60.0),
+        ):
+            playback_task = asyncio.create_task(
+                bot.play_next(guild_id, announce=False)
+            )
+            await asyncio.wait_for(panel_started.wait(), timeout=1)
+            self.assertIsNotNone(state.idle_voice_task)
+            release_panel.set()
+            await asyncio.wait_for(playback_task, timeout=1)
+
+        self.assertIsNotNone(state.idle_voice_task)
+        show_idle.assert_awaited_once_with(guild_id, state)
+
+    async def test_zero_idle_delay_disables_and_cancels_timer(self) -> None:
+        guild_id = 786
+        voice = MagicMock(channel=MagicMock(id=996))
+        voice.is_connected.return_value = True
+        voice.is_playing.return_value = False
+        voice.is_paused.return_value = False
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        gate = asyncio.Event()
+        idle_task = asyncio.create_task(gate.wait())
+        state.idle_voice_task = idle_task
+
+        with patch.object(bot, "IDLE_VOICE_DISCONNECT_DELAY_SECONDS", 0.0):
+            bot.update_idle_voice_disconnect(state, guild_id)
+            await asyncio.gather(idle_task, return_exceptions=True)
+
+        self.assertTrue(idle_task.cancelled())
+        self.assertIsNone(state.idle_voice_task)
+
+    async def test_idle_voice_timeout_disconnects_with_humans_present(self) -> None:
+        class Member:
+            bot = False
+
+        class Channel:
+            id = 998
+            members = [Member()]
+
+        class Voice:
+            channel = Channel()
+
+            def __init__(self) -> None:
+                self.connected = True
+                self.disconnect_calls = 0
+
+            def is_connected(self) -> bool:
+                return self.connected
+
+            def is_playing(self) -> bool:
+                return False
+
+            def is_paused(self) -> bool:
+                return False
+
+            async def disconnect(self) -> None:
+                self.disconnect_calls += 1
+                self.connected = False
+
+        guild_id = 788
+        voice = Voice()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        generation = state.playback_generation
+
+        with (
+            patch.object(bot, "IDLE_VOICE_DISCONNECT_DELAY_SECONDS", 1.0),
+            patch.object(bot.asyncio, "sleep", new=AsyncMock()),
+        ):
+            bot.update_idle_voice_disconnect(state, guild_id)
+            task = state.idle_voice_task
+            self.assertIsNotNone(task)
+            await task
+
+        self.assertEqual(voice.disconnect_calls, 1)
+        self.assertIsNone(state.voice)
+        self.assertIsNone(state.idle_voice_task)
+        self.assertEqual(state.playback_generation, generation + 1)
+
+    async def test_idle_voice_timeout_keeps_connection_when_queue_changes(
+        self,
+    ) -> None:
+        guild_id = 790
+        channel = MagicMock(id=1000)
+        voice = MagicMock(channel=channel)
+        voice.is_connected.return_value = True
+        voice.is_playing.return_value = False
+        voice.is_paused.return_value = False
+        voice.disconnect = AsyncMock()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        sleep_started = asyncio.Event()
+        release_sleep = asyncio.Event()
+
+        async def wait_for_release(_delay: float) -> None:
+            sleep_started.set()
+            await release_sleep.wait()
+
+        with (
+            patch.object(bot, "IDLE_VOICE_DISCONNECT_DELAY_SECONDS", 60.0),
+            patch.object(bot.asyncio, "sleep", side_effect=wait_for_release),
+        ):
+            bot.update_idle_voice_disconnect(state, guild_id)
+            task = state.idle_voice_task
+            self.assertIsNotNone(task)
+            await asyncio.wait_for(sleep_started.wait(), timeout=1)
+            state.queue.append(make_track("new request"))
+            release_sleep.set()
+            await asyncio.wait_for(task, timeout=1)
+
+        voice.disconnect.assert_not_awaited()
+        self.assertIs(state.voice, voice)
+        self.assertIsNone(state.idle_voice_task)
+
+    async def test_idle_voice_timeout_ignores_replacement_voice(self) -> None:
+        guild_id = 792
+        channel = MagicMock(id=1001)
+        old_voice = MagicMock(channel=channel)
+        old_voice.is_connected.return_value = True
+        old_voice.is_playing.return_value = False
+        old_voice.is_paused.return_value = False
+        old_voice.disconnect = AsyncMock()
+        replacement = MagicMock(channel=MagicMock(id=1002))
+        replacement.is_connected.return_value = True
+        replacement.is_playing.return_value = False
+        replacement.is_paused.return_value = False
+        state = bot.get_state(guild_id)
+        state.voice = old_voice
+        sleep_started = asyncio.Event()
+        release_sleep = asyncio.Event()
+
+        async def wait_for_release(_delay: float) -> None:
+            sleep_started.set()
+            await release_sleep.wait()
+
+        with (
+            patch.object(bot, "IDLE_VOICE_DISCONNECT_DELAY_SECONDS", 60.0),
+            patch.object(bot.asyncio, "sleep", side_effect=wait_for_release),
+        ):
+            bot.update_idle_voice_disconnect(state, guild_id)
+            task = state.idle_voice_task
+            self.assertIsNotNone(task)
+            await asyncio.wait_for(sleep_started.wait(), timeout=1)
+            state.voice = replacement
+            release_sleep.set()
+            await asyncio.wait_for(task, timeout=1)
+
+        old_voice.disconnect.assert_not_awaited()
+        self.assertIs(state.voice, replacement)
+        self.assertIsNone(state.idle_voice_task)
+
+    async def test_idle_disconnect_failure_schedules_one_retry(self) -> None:
+        guild_id = 793
+        voice = MagicMock(channel=MagicMock(id=1003))
+        voice.is_connected.return_value = True
+        voice.is_playing.return_value = False
+        voice.is_paused.return_value = False
+        voice.disconnect = AsyncMock(side_effect=asyncio.TimeoutError)
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        retry_sleep_started = asyncio.Event()
+        hold_retry = asyncio.Event()
+        sleep_calls = 0
+
+        async def first_sleep_then_hold(_delay: float) -> None:
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls == 1:
+                return
+            retry_sleep_started.set()
+            await hold_retry.wait()
+
+        with (
+            patch.object(bot, "IDLE_VOICE_DISCONNECT_DELAY_SECONDS", 60.0),
+            patch.object(bot.asyncio, "sleep", side_effect=first_sleep_then_hold),
+        ):
+            bot.update_idle_voice_disconnect(state, guild_id)
+            first_task = state.idle_voice_task
+            self.assertIsNotNone(first_task)
+            await asyncio.wait_for(first_task, timeout=1)
+            await asyncio.wait_for(retry_sleep_started.wait(), timeout=1)
+            retry_task = state.idle_voice_task
+
+        self.assertIsNotNone(retry_task)
+        self.assertIsNot(retry_task, first_task)
+        self.assertFalse(retry_task.done())
+        voice.disconnect.assert_awaited_once_with()
+        bot.cancel_idle_voice_disconnect(state)
+        await asyncio.gather(retry_task, return_exceptions=True)
+
+    async def test_starting_playback_cancels_idle_voice_timer(self) -> None:
+        class Voice:
+            def __init__(self) -> None:
+                self.connected = True
+                self.playing = False
+
+            def is_connected(self) -> bool:
+                return self.connected
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            def play(self, _source: object, *, after: object) -> None:
+                self.playing = True
+                self.after = after
+
+        guild_id = 791
+        track = make_track("new playback")
+        voice = Voice()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        state.queue.append(track)
+        idle_gate = asyncio.Event()
+        idle_task = asyncio.create_task(idle_gate.wait())
+        state.idle_voice_task = idle_task
+
+        with (
+            patch.object(bot, "ffmpeg_is_available", return_value=True),
+            patch.object(bot, "resolve_track_stream", new=AsyncMock()),
+            patch.object(bot.discord, "FFmpegOpusAudio", return_value=MagicMock()),
+            patch.object(bot, "update_control_panel", new=AsyncMock()),
+            patch.object(bot, "schedule_noncritical_tasks"),
+        ):
+            await bot.play_next(guild_id, announce=False)
+            await asyncio.gather(idle_task, return_exceptions=True)
+
+        self.assertTrue(idle_task.cancelled())
+        self.assertIsNone(state.idle_voice_task)
+        self.assertIs(state.current, track)
+        self.assertTrue(voice.is_playing())
 
     async def test_empty_channel_stops_and_disconnects(self) -> None:
         class Member:

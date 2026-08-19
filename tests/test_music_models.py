@@ -119,6 +119,7 @@ class MusicModelTests(unittest.TestCase):
             "autoplay_task",
             "lyrics_task",
             "empty_channel_task",
+            "idle_voice_task",
             "lyrics_message",
             "lyrics_view",
         ):
@@ -187,6 +188,7 @@ class MusicModelTests(unittest.TestCase):
                 "private_lyrics_messages",
                 "queue_cleanup_tasks",
                 "empty_channel_task",
+                "idle_voice_task",
                 "playback_generation",
             ),
         )

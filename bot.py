@@ -229,6 +229,7 @@ from music_config import (
     EPHEMERAL_RESPONSE_DELETE_SECONDS,
     FFMPEG_EXECUTABLE,
     FFMPEG_OPTIONS,
+    IDLE_VOICE_DISCONNECT_DELAY_SECONDS,
     LOG_LEVEL,
     LYRICS_API_URL,
     LYRICS_REQUEST_TIMEOUT_SECONDS,
@@ -793,6 +794,7 @@ async def cancel_music_background_tasks_for_shutdown() -> None:
                 "autoplay_task",
                 "lyrics_task",
                 "empty_channel_task",
+                "idle_voice_task",
             ):
                 task = getattr(state, attribute)
                 if task is None:
@@ -1703,6 +1705,7 @@ class MusicControlView(discord.ui.View):
             return
 
         stop_playback(state, self.guild_id)
+        update_idle_voice_disconnect(state, self.guild_id)
         clicked_message_id = getattr(interaction.message, "id", None)
         clicked_panel_updated = False
         try:
@@ -3433,6 +3436,7 @@ async def ensure_same_voice_channel(
 
 
 def stop_playback(state: GuildMusicState, guild_id: int) -> None:
+    cancel_idle_voice_disconnect(state)
     state.playback_generation += 1
     state.stop_requested = True
     state.queue.clear()
@@ -3463,6 +3467,128 @@ def cancel_empty_channel_disconnect(state: GuildMusicState) -> None:
     if task and not task.done():
         task.cancel()
     state.empty_channel_task = None
+
+
+def cancel_idle_voice_disconnect(state: GuildMusicState) -> None:
+    task = state.idle_voice_task
+    if task is None:
+        return
+
+    try:
+        current_task = asyncio.current_task()
+    except RuntimeError:
+        current_task = None
+    if task is current_task:
+        return
+    if not task.done():
+        task.cancel()
+    if state.idle_voice_task is task:
+        state.idle_voice_task = None
+
+
+def voice_is_playback_idle(
+    state: GuildMusicState,
+    voice: discord.VoiceProtocol,
+) -> bool:
+    is_connected = getattr(voice, "is_connected", None)
+    is_playing = getattr(voice, "is_playing", None)
+    is_paused = getattr(voice, "is_paused", None)
+    if not all(callable(check) for check in (is_connected, is_playing, is_paused)):
+        return False
+    return (
+        state.voice is voice
+        and is_connected()
+        and state.current is None
+        and not state.queue
+        and not is_playing()
+        and not is_paused()
+    )
+
+
+async def disconnect_from_idle_voice(
+    guild_id: int,
+    voice: discord.VoiceProtocol,
+    channel_id: int,
+) -> None:
+    state = get_state(guild_id)
+    current_task = asyncio.current_task()
+    retry_disconnect = False
+    try:
+        await asyncio.sleep(IDLE_VOICE_DISCONNECT_DELAY_SECONDS)
+        async with state.voice_connect_lock:
+            current_channel_id = getattr(
+                getattr(voice, "channel", None),
+                "id",
+                None,
+            )
+            if (
+                state.idle_voice_task is not current_task
+                or bot_shutdown_started
+                or not voice_is_playback_idle(state, voice)
+                or current_channel_id != channel_id
+            ):
+                return
+
+            cancel_empty_channel_disconnect(state)
+            stop_playback(state, guild_id)
+            try:
+                await asyncio.wait_for(
+                    voice.disconnect(),
+                    timeout=VOICE_DISCONNECT_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                retry_disconnect = True
+                logger.warning(
+                    "Timed out leaving idle voice channel %s in guild %s",
+                    channel_id,
+                    guild_id,
+                )
+                return
+            except Exception:
+                retry_disconnect = True
+                logger.warning(
+                    "Failed to leave idle voice channel %s in guild %s",
+                    channel_id,
+                    guild_id,
+                    exc_info=True,
+                )
+                return
+            if state.voice is voice:
+                state.voice = None
+
+        logger.info(
+            "Left idle voice channel %s in guild %s after %.1f seconds",
+            channel_id,
+            guild_id,
+            IDLE_VOICE_DISCONNECT_DELAY_SECONDS,
+        )
+    finally:
+        if state.idle_voice_task is current_task:
+            state.idle_voice_task = None
+        if retry_disconnect:
+            update_idle_voice_disconnect(state, guild_id)
+
+
+def update_idle_voice_disconnect(state: GuildMusicState, guild_id: int) -> None:
+    if bot_shutdown_started or IDLE_VOICE_DISCONNECT_DELAY_SECONDS <= 0:
+        cancel_idle_voice_disconnect(state)
+        return
+
+    voice = state.voice
+    if voice is None or not voice_is_playback_idle(state, voice):
+        cancel_idle_voice_disconnect(state)
+        return
+    channel_id = getattr(getattr(voice, "channel", None), "id", None)
+    if channel_id is None:
+        cancel_idle_voice_disconnect(state)
+        return
+
+    if state.idle_voice_task and not state.idle_voice_task.done():
+        return
+
+    state.idle_voice_task = asyncio.create_task(
+        disconnect_from_idle_voice(guild_id, voice, channel_id)
+    )
 
 
 async def disconnect_from_empty_channel(guild_id: int, channel_id: int) -> None:
@@ -3665,6 +3791,7 @@ async def enqueue_tracks(
         return message
 
     if state.playback_generation != request_generation:
+        update_idle_voice_disconnect(state, guild_id)
         await send_feedback(
             content="곡을 찾는 동안 재생이 중지되어 요청을 취소했어요."
         )
@@ -3690,22 +3817,29 @@ async def enqueue_tracks(
                 else [await extract_track(query, requester.display_name, search_kind, requester.id)]
             )
         )
+    except asyncio.CancelledError:
+        update_idle_voice_disconnect(state, guild_id)
+        raise
     except Exception as exc:
         logger.exception("Failed to extract track(s)")
+        update_idle_voice_disconnect(state, guild_id)
         await send_feedback(content=f"곡을 찾지 못했어요: {exc}")
         return False
 
     if not tracks:
+        update_idle_voice_disconnect(state, guild_id)
         await send_feedback(content="추가할 곡을 찾지 못했어요.")
         return False
 
     if state.playback_generation != request_generation:
+        update_idle_voice_disconnect(state, guild_id)
         await send_feedback(
             content="곡을 찾는 동안 재생이 중지되어 요청을 취소했어요."
         )
         return False
 
     state.queue.extend(tracks)
+    cancel_idle_voice_disconnect(state)
     queue_size = len(state.queue)
     if len(tracks) == 1:
         embed = make_track_embed(tracks[0], "Added to queue")
@@ -4176,6 +4310,7 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
             cancel_noncritical_tasks(state)
             cancel_autoplay_refill(state)
             cancel_lyrics_publish(state)
+            update_idle_voice_disconnect(state, guild_id)
             await clear_lyrics_message(guild_id, state)
             await show_idle_panel(guild_id, state)
             await notify_playback_error(
@@ -4203,6 +4338,7 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                     track = None
                 else:
                     track = state.queue.popleft()
+                    cancel_idle_voice_disconnect(state)
                     track.playback_attempts += 1
                     state.current = track
                     state.skip_requested = False
@@ -4212,6 +4348,7 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
             if should_delete_panel:
                 cancel_noncritical_tasks(state)
                 cancel_lyrics_publish(state)
+                update_idle_voice_disconnect(state, guild_id)
                 await clear_lyrics_message(guild_id, state)
                 await show_idle_panel(guild_id, state)
                 return
@@ -4476,8 +4613,10 @@ async def on_voice_state_update(
 
         if before.channel is not None and after.channel is not None:
             if before.channel != after.channel:
+                cancel_idle_voice_disconnect(state)
                 cancel_empty_channel_disconnect(state)
                 update_empty_channel_disconnect(state, member.guild.id)
+                update_idle_voice_disconnect(state, member.guild.id)
             return
 
         if before.channel is not None and after.channel is None:

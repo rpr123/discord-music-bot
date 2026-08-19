@@ -89,6 +89,7 @@ class GuildMusicState:
     ] = field(default_factory=dict)
     queue_cleanup_tasks: dict[int, asyncio.Task[None]] = field(default_factory=dict)
     empty_channel_task: asyncio.Task[None] | None = None
+    idle_voice_task: asyncio.Task[None] | None = None
     playback_generation: int = 0
 
 

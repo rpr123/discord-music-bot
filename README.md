@@ -106,6 +106,7 @@ YTDL_CACHE_TTL_SECONDS=180
 YTDL_CACHE_MAX_ENTRIES=16
 AUTOPLAY_START_DELAY_SECONDS=10
 LYRICS_START_DELAY_SECONDS=3
+IDLE_VOICE_DISCONNECT_DELAY_SECONDS=300
 YOUTUBE_SEARCH_CANDIDATES=10
 YOUTUBE_MUSIC_SEARCH_ENABLED=true
 YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS=1
@@ -129,6 +130,8 @@ AUTOPLAY_HISTORY_TTL_SECONDS=43200
 `MUSIC_CHANNEL_DELETE_REQUESTS=true`이면 전용 채널에서 사용자가 보낸 곡 신청 메시지를 처리 후 삭제합니다. 검색 실패나 음성 채널 미입장처럼 재생을 시작하지 못한 경우에도 요청 메시지는 정리됩니다.
 
 `MUSIC_FEEDBACK_DELETE_SECONDS=10`이면 메시지로 곡을 신청했을 때 나오는 임시 추가 확인 메시지를 10초 뒤 삭제합니다. 슬래시 명령어와 버튼의 일반 개인 응답은 신청자에게만 보이며 `EPHEMERAL_RESPONSE_DELETE_SECONDS=15`초 뒤 정리됩니다. 대기열 관리 메시지는 곡을 삭제할 때마다 만료 시간이 다시 계산되고, 마지막 삭제로부터 `QUEUE_DELETE_RESPONSE_DELETE_SECONDS=30`초 뒤 삭제됩니다.
+
+마지막 곡이 끝나거나 정지 버튼으로 재생을 멈춘 뒤 대기열도 비어 있으면 `IDLE_VOICE_DISCONNECT_DELAY_SECONDS`가 지난 후 봇이 음성 채널에서 자동으로 나갑니다. 기본값은 `300`초(5분)이며, 그 전에 새 곡이 추가되거나 재생되면 기존 타이머를 취소합니다. 일시정지는 재생 중으로 취급해 타이머를 시작하지 않습니다. `0`으로 설정하면 사람이 남아 있는 동안의 유휴 자동 퇴장을 끌 수 있습니다. 사람이 모두 나간 빈 음성 채널에서 3초 뒤 나가는 기존 동작은 이 설정과 별개로 유지됩니다.
 
 곡이 재생된 뒤 `LYRICS_START_DELAY_SECONDS`가 지나면 LRCLIB에서 현재 곡을 찾아 전용 채널에 별도의 원문 가사 메시지를 자동으로 보냅니다. LRCLIB에 결과가 없거나 조회에 실패하면 해당 YouTube 영상에서 제공하는 수동 자막을 한 번 더 확인하며, 자동 생성 자막은 가사로 사용하지 않습니다. 두 출처 모두 결과가 없으면 원문 메시지에는 `미제공`으로 표시합니다. 나무위키는 곡 전환 때 자동 조회하지 않고 `나무위키 가사` 버튼을 누를 때만 확인합니다. 자막 정보는 재생을 위해 이미 조회한 영상 정보에서 재사용하므로 별도의 영상 재검색은 하지 않습니다. 이후 곡이 바뀔 때는 원문 메시지를 수정하고, 재생목록이 완전히 끝나거나 정지·퇴장할 때 메시지를 삭제합니다. 같은 곡의 로마자판과 원문 문자판이 함께 검색되면 원문 문자판을 우선합니다. Discord 메시지 길이 제한을 넘는 가사는 같은 메시지의 UTF-8 텍스트 파일로 전체 원문을 첨부합니다. `LYRICS_REQUEST_TIMEOUT_SECONDS`는 각 가사 조회를 기다리는 최대 시간이며, `YOUTUBE_LYRICS_FALLBACK=false`로 수동 자막 fallback을 끌 수 있습니다.
 
