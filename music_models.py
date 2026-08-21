@@ -10,6 +10,7 @@ import discord
 
 
 AUTOPLAY_HISTORY_SIZE = 50
+AUTOPLAY_CANDIDATE_POOL_CAP = 4
 MAX_PLAYBACK_ATTEMPTS = 2
 
 
@@ -72,6 +73,9 @@ class GuildMusicState:
     control_view: discord.ui.View | None = None
     repeat_one: bool = False
     autoplay_enabled: bool = False
+    autoplay_candidate_pool: Deque[Track] = field(
+        default_factory=lambda: deque(maxlen=AUTOPLAY_CANDIDATE_POOL_CAP)
+    )
     recent_track_keys: Deque[AutoplayHistoryEntry] = field(
         default_factory=lambda: deque(maxlen=AUTOPLAY_HISTORY_SIZE)
     )

@@ -10,9 +10,12 @@ from music_models import GuildMusicState, Track
 
 
 MOVED_NAMES = (
+    "AUTOPLAY_CANDIDATE_POOL_CAP",
     "AUTOPLAY_QUEUE_TARGET",
     "AUTOPLAY_RETRY_DELAYS_SECONDS",
     "autoplay_can_refill",
+    "clear_autoplay_candidate_pool",
+    "consume_autoplay_candidate",
     "get_autoplay_excluded_keys",
     "get_recent_playbacks",
     "get_autoplay_retry_delay",
@@ -20,7 +23,10 @@ MOVED_NAMES = (
     "remember_autoplay_track",
     "remember_recent_playback",
     "remember_recent_value",
+    "reject_autoplay_candidate_pool",
+    "replace_autoplay_candidate_pool",
     "select_autoplay_candidate",
+    "select_autoplay_candidates",
 )
 
 
@@ -598,6 +604,122 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
                 [rediscovered_first, rediscovered_second, fresh],
             ),
             fresh,
+        )
+
+    def test_candidate_batch_prefers_all_fresh_then_oldest_recent(self) -> None:
+        current = make_track("current", video_id="ccccccccccc")
+        hard_excluded = make_track("seed", video_id="sssssssssss")
+        recent_old = make_track("recent old", video_id="aaaaaaaaaaa")
+        recent_new = make_track("recent new", video_id="bbbbbbbbbbb")
+        fresh_first = make_track("fresh first", video_id="ddddddddddd")
+        fresh_second = make_track("fresh second", video_id="eeeeeeeeeee")
+        state = GuildMusicState(current=current)
+        music_autoplay_policy.remember_autoplay_track(state, recent_old, now=0.0)
+        music_autoplay_policy.remember_autoplay_track(state, recent_new, now=10.0)
+
+        selected = music_autoplay_policy.select_autoplay_candidates(
+            state,
+            [
+                recent_new,
+                current,
+                hard_excluded,
+                recent_old,
+                fresh_first,
+                fresh_second,
+            ],
+            music_track_metadata.get_track_identity_keys(hard_excluded),
+            limit=10,
+            now=20.0,
+        )
+
+        self.assertEqual(
+            selected,
+            [fresh_first, fresh_second, recent_old, recent_new],
+        )
+        self.assertEqual(
+            music_autoplay_policy.select_autoplay_candidates(
+                state,
+                [fresh_first],
+                limit=0,
+                now=20.0,
+            ),
+            [],
+        )
+
+    def test_candidate_pool_replace_caps_in_order_and_clear_empties(self) -> None:
+        state = GuildMusicState()
+        candidates = [make_track(f"candidate {index}") for index in range(6)]
+
+        music_autoplay_policy.replace_autoplay_candidate_pool(state, candidates)
+
+        self.assertEqual(
+            list(state.autoplay_candidate_pool),
+            candidates[: music_autoplay_policy.AUTOPLAY_CANDIDATE_POOL_CAP],
+        )
+        music_autoplay_policy.clear_autoplay_candidate_pool(state)
+        self.assertFalse(state.autoplay_candidate_pool)
+
+    def test_consume_pool_revalidates_hard_exclusions_and_prefers_fresh(
+        self,
+    ) -> None:
+        queued = make_track("queued", video_id="qqqqqqqqqqq")
+        seed = make_track("seed", video_id="sssssssssss")
+        recent = make_track("recent", video_id="rrrrrrrrrrr")
+        fresh = make_track("fresh", video_id="fffffffffff")
+        state = GuildMusicState(queue=deque([queued]))
+        music_autoplay_policy.remember_autoplay_track(state, recent, now=0.0)
+        music_autoplay_policy.replace_autoplay_candidate_pool(
+            state,
+            [queued, seed, recent, fresh],
+        )
+
+        selected = music_autoplay_policy.consume_autoplay_candidate(
+            state,
+            music_track_metadata.get_track_identity_keys(seed),
+            now=1.0,
+        )
+
+        self.assertIs(selected, fresh)
+        self.assertEqual(list(state.autoplay_candidate_pool), [recent])
+
+    def test_consume_pool_falls_back_to_oldest_recent_candidate(self) -> None:
+        recent_old = make_track("recent old", video_id="aaaaaaaaaaa")
+        recent_new = make_track("recent new", video_id="bbbbbbbbbbb")
+        state = GuildMusicState()
+        music_autoplay_policy.remember_autoplay_track(state, recent_old, now=0.0)
+        music_autoplay_policy.remember_autoplay_track(state, recent_new, now=10.0)
+        music_autoplay_policy.replace_autoplay_candidate_pool(
+            state,
+            [recent_new, recent_old],
+        )
+
+        selected = music_autoplay_policy.consume_autoplay_candidate(
+            state,
+            now=20.0,
+        )
+
+        self.assertIs(selected, recent_old)
+        self.assertEqual(list(state.autoplay_candidate_pool), [recent_new])
+
+    def test_reject_pool_records_only_autoplay_history_then_clears(self) -> None:
+        first = make_track("first", video_id="aaaaaaaaaaa")
+        second = make_track("second", video_id="bbbbbbbbbbb")
+        state = GuildMusicState()
+        music_autoplay_policy.replace_autoplay_candidate_pool(
+            state,
+            [first, second],
+        )
+
+        music_autoplay_policy.reject_autoplay_candidate_pool(state, now=5.0)
+
+        self.assertFalse(state.autoplay_candidate_pool)
+        self.assertFalse(state.recent_playbacks)
+        excluded = music_autoplay_policy.get_autoplay_excluded_keys(state, now=5.0)
+        self.assertTrue(
+            music_track_metadata.get_track_identity_keys(first).issubset(excluded)
+        )
+        self.assertTrue(
+            music_track_metadata.get_track_identity_keys(second).issubset(excluded)
         )
 
     def test_autoplay_seed_prefers_queue_tail_then_current(self) -> None:

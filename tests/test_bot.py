@@ -754,6 +754,9 @@ class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
 
         guild_id = 6541
         self.addCleanup(bot.music_states.pop, guild_id, None)
+        state = bot.get_state(guild_id)
+        pooled = make_track("pooled")
+        state.autoplay_candidate_pool.append(pooled)
         channel = MagicMock()
         initial_response = MagicMock()
         initial_response.edit = AsyncMock()
@@ -792,7 +795,360 @@ class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
         )
         extract_track.assert_not_awaited()
         extract_tracks.assert_not_awaited()
-        self.assertEqual(list(bot.get_state(guild_id).queue), tracks)
+        self.assertEqual(list(state.queue), tracks)
+        self.assertFalse(state.autoplay_candidate_pool)
+        self.assertIn(
+            bot.normalize_track_key(pooled),
+            {entry.value for entry in state.recent_track_keys},
+        )
+        self.assertFalse(state.recent_playbacks)
+
+    async def test_successful_manual_enqueue_cancels_refill_and_rejects_pool(
+        self,
+    ) -> None:
+        class Requester:
+            display_name = "tester"
+            id = 123
+
+        def discard_housekeeping(coroutine) -> None:
+            coroutine.close()
+
+        guild_id = 6542
+        self.addCleanup(bot.music_states.pop, guild_id, None)
+        state = bot.get_state(guild_id)
+        pooled = make_track("pooled")
+        state.autoplay_candidate_pool.append(pooled)
+        refill_started = asyncio.Event()
+
+        async def wait_for_cancellation() -> None:
+            refill_started.set()
+            await asyncio.Event().wait()
+
+        refill_task = asyncio.create_task(wait_for_cancellation())
+        state.autoplay_task = refill_task
+        await refill_started.wait()
+        track = make_track("requested")
+        initial_response = MagicMock()
+        initial_response.edit = AsyncMock()
+
+        try:
+            with (
+                patch.object(
+                    bot,
+                    "extract_track",
+                    new=AsyncMock(return_value=track),
+                ),
+                patch.object(bot, "schedule_autoplay_refill"),
+                patch.object(
+                    bot,
+                    "create_housekeeping_task",
+                    side_effect=discard_housekeeping,
+                ),
+            ):
+                result = await bot.enqueue_tracks(
+                    guild_id,
+                    MagicMock(),
+                    Requester(),
+                    "requested",
+                    initial_response=initial_response,
+                )
+            await asyncio.sleep(0)
+        finally:
+            if not refill_task.done():
+                refill_task.cancel()
+            await asyncio.gather(refill_task, return_exceptions=True)
+
+        self.assertTrue(result)
+        self.assertEqual(list(state.queue), [track])
+        self.assertFalse(state.autoplay_candidate_pool)
+        self.assertIsNone(state.autoplay_task)
+        self.assertTrue(refill_task.cancelled())
+        self.assertIn(
+            bot.normalize_track_key(pooled),
+            {entry.value for entry in state.recent_track_keys},
+        )
+        self.assertFalse(state.recent_playbacks)
+
+    async def test_failed_manual_enqueue_preserves_pool_and_refill(self) -> None:
+        class Requester:
+            display_name = "tester"
+            id = 123
+
+        def discard_housekeeping(coroutine) -> None:
+            coroutine.close()
+
+        guild_id = 6543
+        self.addCleanup(bot.music_states.pop, guild_id, None)
+        state = bot.get_state(guild_id)
+        pooled = make_track("pooled")
+        state.autoplay_candidate_pool.append(pooled)
+        refill_task = asyncio.create_task(asyncio.Event().wait())
+        state.autoplay_task = refill_task
+        initial_response = MagicMock()
+        initial_response.edit = AsyncMock()
+
+        try:
+            with (
+                patch.object(
+                    bot,
+                    "extract_track",
+                    new=AsyncMock(side_effect=RuntimeError("lookup failed")),
+                ),
+                patch.object(
+                    bot,
+                    "create_housekeeping_task",
+                    side_effect=discard_housekeeping,
+                ),
+                self.assertLogs("music-bot", level="ERROR"),
+            ):
+                result = await bot.enqueue_tracks(
+                    guild_id,
+                    MagicMock(),
+                    Requester(),
+                    "missing",
+                    initial_response=initial_response,
+                )
+
+            self.assertFalse(result)
+            self.assertEqual(list(state.autoplay_candidate_pool), [pooled])
+            self.assertIs(state.autoplay_task, refill_task)
+            self.assertFalse(refill_task.done())
+        finally:
+            bot.cancel_autoplay_refill(state)
+            await asyncio.gather(refill_task, return_exceptions=True)
+
+    async def test_manual_enqueue_cancels_inflight_refill_before_stale_append(
+        self,
+    ) -> None:
+        class Requester:
+            display_name = "tester"
+            id = 123
+
+        class Voice:
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return True
+
+            def is_paused(self) -> bool:
+                return False
+
+        def discard_housekeeping(coroutine) -> None:
+            coroutine.close()
+
+        guild_id = 6544
+        self.addCleanup(bot.music_states.pop, guild_id, None)
+        state = bot.get_state(guild_id)
+        seed = make_track("seed")
+        stale = make_track("stale-autoplay")
+        requested = make_track("requested")
+        state.current = seed
+        state.voice = Voice()
+        state.autoplay_enabled = True
+        search_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+
+        async def delayed_autoplay_extract(
+            *args: object,
+            **kwargs: object,
+        ) -> list[bot.Track]:
+            search_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                raise
+            return [seed, stale]
+
+        refill_task: asyncio.Task[None] | None = None
+        with (
+            patch.object(
+                bot,
+                "extract_auto_tracks_from_seed",
+                side_effect=delayed_autoplay_extract,
+            ),
+            patch.object(bot, "update_control_panel", new=AsyncMock()),
+        ):
+            try:
+                refill_task = asyncio.create_task(
+                    bot.refill_autoplay_queue(
+                        guild_id,
+                        state.playback_generation,
+                        seed,
+                    )
+                )
+                state.autoplay_task = refill_task
+                await asyncio.wait_for(search_started.wait(), timeout=1)
+
+                initial_response = MagicMock()
+                initial_response.edit = AsyncMock()
+                with (
+                    patch.object(
+                        bot,
+                        "extract_track",
+                        new=AsyncMock(return_value=requested),
+                    ),
+                    patch.object(bot, "schedule_autoplay_refill"),
+                    patch.object(
+                        bot,
+                        "create_housekeeping_task",
+                        side_effect=discard_housekeeping,
+                    ),
+                ):
+                    result = await bot.enqueue_tracks(
+                        guild_id,
+                        MagicMock(),
+                        Requester(),
+                        "requested",
+                        initial_response=initial_response,
+                    )
+
+                await asyncio.wait_for(cancellation_seen.wait(), timeout=1)
+                await asyncio.gather(refill_task, return_exceptions=True)
+            finally:
+                if refill_task is not None and not refill_task.done():
+                    refill_task.cancel()
+                if refill_task is not None:
+                    await asyncio.gather(refill_task, return_exceptions=True)
+
+        self.assertTrue(result)
+        self.assertEqual(list(state.queue), [requested])
+        self.assertNotIn(stale, state.queue)
+        self.assertIsNone(state.autoplay_task)
+
+    async def test_manual_enqueue_cancels_refill_waiting_to_commit_after_extract(
+        self,
+    ) -> None:
+        class Requester:
+            display_name = "tester"
+            id = 123
+
+        class Voice:
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return True
+
+            def is_paused(self) -> bool:
+                return False
+
+        manual_waiting = asyncio.Event()
+        refill_waiting = asyncio.Event()
+        refill_acquisitions = 0
+
+        class TrackedLock(asyncio.Lock):
+            async def acquire(self) -> bool:
+                nonlocal refill_acquisitions
+                task = asyncio.current_task()
+                task_name = task.get_name() if task is not None else ""
+                if task_name == "manual-enqueue":
+                    manual_waiting.set()
+                elif task_name == "autoplay-refill":
+                    refill_acquisitions += 1
+                    if refill_acquisitions == 2:
+                        refill_waiting.set()
+                return await super().acquire()
+
+        def discard_housekeeping(coroutine) -> None:
+            coroutine.close()
+
+        guild_id = 6545
+        self.addCleanup(bot.music_states.pop, guild_id, None)
+        state = bot.get_state(guild_id)
+        state.lock = TrackedLock()
+        seed = make_track("seed")
+        stale = make_track("stale-autoplay")
+        requested = make_track("requested")
+        state.current = seed
+        state.voice = Voice()
+        state.autoplay_enabled = True
+        search_started = asyncio.Event()
+        release_search = asyncio.Event()
+
+        async def delayed_autoplay_extract(
+            *args: object,
+            **kwargs: object,
+        ) -> list[bot.Track]:
+            search_started.set()
+            await release_search.wait()
+            return [seed, stale]
+
+        initial_response = MagicMock()
+        initial_response.edit = AsyncMock()
+        refill_task: asyncio.Task[None] | None = None
+        manual_task: asyncio.Task[bool] | None = None
+        lock_held = False
+        with (
+            patch.object(
+                bot,
+                "extract_auto_tracks_from_seed",
+                side_effect=delayed_autoplay_extract,
+            ),
+            patch.object(
+                bot,
+                "extract_track",
+                new=AsyncMock(return_value=requested),
+            ),
+            patch.object(bot, "schedule_autoplay_refill"),
+            patch.object(bot, "update_control_panel", new=AsyncMock()),
+            patch.object(
+                bot,
+                "create_housekeeping_task",
+                side_effect=discard_housekeeping,
+            ),
+        ):
+            try:
+                refill_task = asyncio.create_task(
+                    bot.refill_autoplay_queue(
+                        guild_id,
+                        state.playback_generation,
+                        seed,
+                    ),
+                    name="autoplay-refill",
+                )
+                state.autoplay_task = refill_task
+                await asyncio.wait_for(search_started.wait(), timeout=1)
+
+                await state.lock.acquire()
+                lock_held = True
+                release_search.set()
+                await asyncio.wait_for(refill_waiting.wait(), timeout=1)
+
+                manual_task = asyncio.create_task(
+                    bot.enqueue_tracks(
+                        guild_id,
+                        MagicMock(),
+                        Requester(),
+                        "requested",
+                        initial_response=initial_response,
+                    ),
+                    name="manual-enqueue",
+                )
+                await asyncio.wait_for(manual_waiting.wait(), timeout=1)
+                state.lock.release()
+                lock_held = False
+
+                result = await asyncio.wait_for(manual_task, timeout=1)
+                await asyncio.gather(refill_task, return_exceptions=True)
+            finally:
+                release_search.set()
+                if lock_held:
+                    state.lock.release()
+                for task in (manual_task, refill_task):
+                    if task is not None and not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    *(task for task in (manual_task, refill_task) if task is not None),
+                    return_exceptions=True,
+                )
+
+        self.assertTrue(result)
+        self.assertEqual(list(state.queue), [requested])
+        self.assertNotIn(stale, state.queue)
+        self.assertFalse(state.autoplay_candidate_pool)
+        self.assertIsNone(state.autoplay_task)
 
 
 class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -2931,7 +3287,9 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         requested = make_track("requested")
         requested.requester_id = 42
         later_auto = make_track("later-auto")
+        pooled = make_track("pooled-auto")
         case.state.queue.extend([first_auto, second_auto, requested])
+        case.state.autoplay_candidate_pool.append(pooled)
         case.state.repeat_one = True
         case.flags.update(playing=False, paused=True)
 
@@ -2946,6 +3304,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(case.operations, ["defer", "stop:True"])
         self.assertEqual(list(case.state.queue), [requested, later_auto])
+        self.assertFalse(case.state.autoplay_candidate_pool)
         self.assertTrue(case.state.skip_requested)
         self.assertTrue(case.state.repeat_one)
         case.voice.stop.assert_called_once_with()
@@ -2954,6 +3313,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             {
                 bot.normalize_track_key(first_auto),
                 bot.normalize_track_key(second_auto),
+                bot.normalize_track_key(pooled),
             },
         )
         self.assertFalse(case.state.recent_playbacks)
@@ -3008,8 +3368,10 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         case = self._make_skip_case(366)
         queued = make_track("queued-auto")
         target = make_track("requested")
+        pooled = make_track("pooled-auto")
         target.requester_id = 84
         case.state.queue.extend([queued, target])
+        case.state.autoplay_candidate_pool.append(pooled)
 
         async def defer_and_remove_target() -> None:
             case.acknowledged["done"] = True
@@ -3020,6 +3382,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         await case.view.skip_to_last.callback(case.interaction)
 
         self.assertEqual(list(case.state.queue), [queued])
+        self.assertEqual(list(case.state.autoplay_candidate_pool), [pooled])
         self.assertFalse(case.state.skip_requested)
         self.assertFalse(case.state.recent_track_keys)
         case.voice.stop.assert_not_called()
@@ -3348,6 +3711,51 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+
+    async def test_shuffle_preserves_autoplay_candidate_pool(self) -> None:
+        guild_id = 349
+        state = bot.get_state(guild_id)
+        queued = [make_track(f"queued-{index}") for index in range(3)]
+        pooled = make_track("pooled-shuffle-candidate")
+        state.current = make_track("current")
+        state.queue.extend(queued)
+        state.autoplay_candidate_pool.append(pooled)
+        original_pool = state.autoplay_candidate_pool
+        channel = MagicMock()
+        voice = MagicMock(channel=channel)
+        voice.is_connected.return_value = True
+        state.voice = voice
+        member = MagicMock(voice=MagicMock(channel=channel))
+        interaction = MagicMock(user=member)
+        interaction.response.defer = AsyncMock()
+        view = bot.MusicControlView(guild_id)
+        button = next(
+            item for item in view.children if item.custom_id == "music:shuffle"
+        )
+        edit_panel = AsyncMock()
+
+        try:
+            with (
+                patch.object(
+                    bot.random,
+                    "shuffle",
+                    side_effect=lambda tracks: tracks.reverse(),
+                ) as shuffle,
+                patch.object(view, "edit_panel", new=edit_panel),
+            ):
+                await button.callback(interaction)
+        finally:
+            bot.discord.ui.View.stop(view)
+
+        self.assertEqual(list(state.queue), list(reversed(queued)))
+        self.assertIs(state.autoplay_candidate_pool, original_pool)
+        self.assertEqual(list(state.autoplay_candidate_pool), [pooled])
+        interaction.response.defer.assert_awaited_once_with()
+        shuffle.assert_called_once()
+        edit_panel.assert_awaited_once_with(
+            interaction,
+            refresh_canonical=True,
+        )
 
     async def test_state_buttons_revalidate_voice_after_defer(self) -> None:
         changed_message = (
@@ -4724,6 +5132,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         guild_id = 444
         state = bot.get_state(guild_id)
         state.current = make_track("seed")
+        state.autoplay_candidate_pool.append(make_track("stale-enable"))
         view = bot.MusicControlView(guild_id)
         button = next(
             item
@@ -4743,6 +5152,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             await button.callback(enable_interaction)
 
         self.assertTrue(state.autoplay_enabled)
+        self.assertFalse(state.autoplay_candidate_pool)
         enable_interaction.response.defer.assert_awaited_once_with()
         save_setting.assert_called_once_with(guild_id, True)
         schedule_refill.assert_called_once_with(guild_id)
@@ -4753,6 +5163,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
 
         disable_interaction = MagicMock(user=member)
         disable_interaction.response.defer = AsyncMock()
+        state.autoplay_candidate_pool.append(make_track("stale-disable"))
 
         with (
             patch.object(bot, "set_autoplay_enabled") as save_setting,
@@ -4762,6 +5173,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             await button.callback(disable_interaction)
 
         self.assertFalse(state.autoplay_enabled)
+        self.assertFalse(state.autoplay_candidate_pool)
         disable_interaction.response.defer.assert_awaited_once_with()
         save_setting.assert_called_once_with(guild_id, False)
         cancel_refill.assert_called_once_with(state)
@@ -4974,6 +5386,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(list(state.queue), [queued, fresh])
+        self.assertEqual(list(state.autoplay_candidate_pool), [recent])
         extract.assert_awaited_once()
         self.assertIs(extract.await_args.args[0], queued)
         self.assertEqual(
@@ -5003,12 +5416,13 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         now = bot.time.monotonic()
         bot.remember_autoplay_track(state, older, now=now - 100.0)
         bot.remember_autoplay_track(state, newer, now=now)
+        bot.replace_autoplay_candidate_pool(state, [newer, older])
 
         with (
             patch.object(
                 bot,
                 "extract_auto_tracks_from_seed",
-                new=AsyncMock(return_value=[seed, queued, newer, older]),
+                new=AsyncMock(),
             ) as extract,
             patch.object(bot.asyncio, "sleep", new=AsyncMock()) as sleep,
             patch.object(bot, "update_control_panel", new=AsyncMock()) as update_panel,
@@ -5020,9 +5434,42 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(list(state.queue), [queued, older])
-        extract.assert_awaited_once()
+        self.assertEqual(list(state.autoplay_candidate_pool), [newer])
+        extract.assert_not_awaited()
         sleep.assert_not_awaited()
         update_panel.assert_awaited_once_with(guild_id, state)
+
+    async def test_refill_fetches_immediately_after_pool_hard_miss(self) -> None:
+        guild_id = 565
+        seed = make_track("seed")
+        queued = make_track("queued")
+        fresh = make_track("fresh")
+        state = bot.get_state(guild_id)
+        state.voice = self.Voice()
+        state.current = seed
+        state.queue.append(queued)
+        state.autoplay_enabled = True
+        bot.replace_autoplay_candidate_pool(state, [seed, queued])
+
+        with (
+            patch.object(
+                bot,
+                "extract_auto_tracks_from_seed",
+                new=AsyncMock(return_value=[seed, queued, fresh]),
+            ) as extract,
+            patch.object(bot.asyncio, "sleep", new=AsyncMock()) as sleep,
+            patch.object(bot, "update_control_panel", new=AsyncMock()),
+        ):
+            await bot.refill_autoplay_queue(
+                guild_id,
+                state.playback_generation,
+                seed,
+            )
+
+        self.assertEqual(list(state.queue), [queued, fresh])
+        self.assertFalse(state.autoplay_candidate_pool)
+        extract.assert_awaited_once()
+        sleep.assert_not_awaited()
 
     async def test_refill_does_not_backoff_behind_two_song_queue(self) -> None:
         guild_id = 563
@@ -5134,24 +5581,33 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         state.voice = self.Voice()
         state.current = seed
         state.autoplay_enabled = True
-        extract = AsyncMock(return_value=[seed, raced, fallback])
+        search_started = asyncio.Event()
+        release_search = asyncio.Event()
+
+        async def delayed_extract(*args: object, **kwargs: object) -> list[bot.Track]:
+            search_started.set()
+            await release_search.wait()
+            return [seed, raced, fallback]
+
+        extract = AsyncMock(side_effect=delayed_extract)
 
         with (
             patch.object(bot, "extract_auto_tracks_from_seed", new=extract),
             patch.object(bot, "update_control_panel", new=AsyncMock()),
         ):
+            refill_task = asyncio.create_task(
+                bot.refill_autoplay_queue(
+                    guild_id,
+                    state.playback_generation,
+                    seed,
+                )
+            )
+            await asyncio.wait_for(search_started.wait(), timeout=1)
             await state.lock.acquire()
             try:
-                refill_task = asyncio.create_task(
-                    bot.refill_autoplay_queue(
-                        guild_id,
-                        state.playback_generation,
-                        seed,
-                    )
-                )
-                await asyncio.sleep(0)
-                extract.assert_awaited_once()
                 state.queue.append(raced)
+                release_search.set()
+                await asyncio.sleep(0)
             finally:
                 state.lock.release()
 
@@ -5165,6 +5621,9 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         seed = make_track("seed")
         first = make_track("first")
         second = make_track("second")
+        spare_one = make_track("spare-one")
+        spare_two = make_track("spare-two")
+        after_pool = make_track("after-pool")
         state = bot.get_state(guild_id)
         state.voice = self.Voice()
         state.current = seed
@@ -5176,8 +5635,8 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
                 "extract_auto_tracks_from_seed",
                 new=AsyncMock(
                     side_effect=[
-                        [seed, first],
-                        [first, second],
+                        [seed, first, second, spare_one, spare_two],
+                        [spare_two, after_pool],
                     ]
                 ),
             ) as extract,
@@ -5189,11 +5648,33 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
                 seed,
             )
 
-        self.assertEqual(list(state.queue), [first, second])
+            state.queue.popleft()
+            await bot.refill_autoplay_queue(
+                guild_id,
+                state.playback_generation,
+                seed,
+            )
+
+            state.queue.popleft()
+            await bot.refill_autoplay_queue(
+                guild_id,
+                state.playback_generation,
+                seed,
+            )
+
+            state.queue.popleft()
+            await bot.refill_autoplay_queue(
+                guild_id,
+                state.playback_generation,
+                seed,
+            )
+
+        self.assertEqual(list(state.queue), [spare_two, after_pool])
+        self.assertFalse(state.autoplay_candidate_pool)
         self.assertEqual(extract.await_count, 2)
         self.assertIs(extract.await_args_list[0].args[0], seed)
-        self.assertIs(extract.await_args_list[1].args[0], first)
-        self.assertEqual(update_panel.await_count, 2)
+        self.assertIs(extract.await_args_list[1].args[0], spare_two)
+        self.assertEqual(update_panel.await_count, 5)
 
     async def test_refill_restarts_playback_if_track_ends_during_search(self) -> None:
         guild_id = 556
@@ -5335,16 +5816,82 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
             gate.set()
             await first_task
 
+    async def test_cancelled_refill_finalizer_preserves_replacement_task(
+        self,
+    ) -> None:
+        guild_id = 566
+        seed = make_track("seed")
+        fresh = make_track("fresh")
+        spare = make_track("spare")
+        state = bot.get_state(guild_id)
+        state.voice = self.Voice()
+        state.current = seed
+        state.autoplay_enabled = True
+        update_started = asyncio.Event()
+        replacement_gate = asyncio.Event()
+
+        async def wait_in_update(*args: object, **kwargs: object) -> None:
+            update_started.set()
+            await asyncio.Event().wait()
+
+        old_task: asyncio.Task[None] | None = None
+        replacement_task: asyncio.Task[None] | None = None
+        with (
+            patch.object(
+                bot,
+                "extract_auto_tracks_from_seed",
+                new=AsyncMock(return_value=[seed, fresh, spare]),
+            ),
+            patch.object(
+                bot,
+                "update_control_panel",
+                side_effect=wait_in_update,
+            ),
+            patch.object(bot, "schedule_autoplay_refill") as schedule_refill,
+        ):
+            try:
+                old_task = asyncio.create_task(
+                    bot.refill_autoplay_queue(
+                        guild_id,
+                        state.playback_generation,
+                        seed,
+                    )
+                )
+                state.autoplay_task = old_task
+                await asyncio.wait_for(update_started.wait(), timeout=1)
+
+                state.current = fresh
+                bot.cancel_autoplay_refill(state)
+                replacement_task = asyncio.create_task(replacement_gate.wait())
+                state.autoplay_task = replacement_task
+                await asyncio.gather(old_task, return_exceptions=True)
+
+                self.assertIs(state.autoplay_task, replacement_task)
+                self.assertFalse(replacement_task.done())
+                schedule_refill.assert_not_called()
+            finally:
+                for task in (old_task, replacement_task):
+                    if task is not None and not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    *(task for task in (old_task, replacement_task) if task is not None),
+                    return_exceptions=True,
+                )
+                if state.autoplay_task is replacement_task:
+                    state.autoplay_task = None
+
     async def test_stop_cancels_refill_without_disabling_autoplay(self) -> None:
         state = bot.GuildMusicState(autoplay_enabled=True)
         gate = asyncio.Event()
         state.autoplay_task = asyncio.create_task(gate.wait())
+        state.autoplay_candidate_pool.append(make_track("pooled"))
 
         bot.stop_playback(state, 0)
         await asyncio.sleep(0)
 
         self.assertTrue(state.autoplay_enabled)
         self.assertIsNone(state.autoplay_task)
+        self.assertFalse(state.autoplay_candidate_pool)
 
 
 class HousekeepingTaskTests(unittest.IsolatedAsyncioTestCase):
@@ -5798,6 +6345,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_shutdown_cancels_delayed_noncritical_lyrics_work(self) -> None:
         guild_id = 991
         state = bot.get_state(guild_id)
+        state.autoplay_candidate_pool.append(make_track("pooled"))
         started = asyncio.Event()
         lyrics_job = AsyncMock()
 
@@ -5812,6 +6360,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await bot.cancel_music_background_tasks_for_shutdown()
 
         self.assertIsNone(state.noncritical_task)
+        self.assertFalse(state.autoplay_candidate_pool)
         lyrics_job.assert_not_awaited()
         bot.music_states.pop(guild_id, None)
 
@@ -5976,6 +6525,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_autoplay_finalizer_cannot_reschedule_during_shutdown(self) -> None:
         guild_id = 993
         state = bot.get_state(guild_id)
+        state.autoplay_candidate_pool.append(make_track("pooled"))
         started = asyncio.Event()
         cancellation_seen = asyncio.Event()
         release = asyncio.Event()
@@ -6005,6 +6555,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(results, [(None, False)])
         self.assertIsNone(state.autoplay_task)
+        self.assertFalse(state.autoplay_candidate_pool)
 
     async def test_shutdown_gate_rejects_new_managed_tasks(self) -> None:
         guild_id = 993
@@ -7230,9 +7781,11 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
     async def test_confirm_deletes_inclusive_range(self) -> None:
         guild_id = 988
         tracks = [make_track(f"track-{index}") for index in range(1, 21)]
+        pooled = make_track("pooled-range-candidate")
         state = bot.get_state(guild_id)
         state.current = make_track("current")
         state.queue.extend(tracks)
+        state.autoplay_candidate_pool.append(pooled)
         view = bot.QueueRangeDeleteView(guild_id)
         view.start_track_id = tracks[4].track_id
         view.end_track_id = tracks[12].track_id
@@ -7283,6 +7836,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(state.queue), 11)
         self.assertEqual(list(state.queue), tracks[:4] + tracks[13:])
+        self.assertEqual(list(state.autoplay_candidate_pool), [pooled])
         schedule_refill.assert_called_once_with(guild_id)
         interaction.response.defer.assert_awaited_once_with()
         interaction.edit_original_response.assert_awaited_once()
@@ -7527,8 +8081,10 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
         guild_id = 990
         first = make_track("first")
         second = make_track("second")
+        pooled = make_track("pooled-single-candidate")
         state = bot.get_state(guild_id)
         state.queue.extend([first, second])
+        state.autoplay_candidate_pool.append(pooled)
         select = bot.QueueRemoveSelect(guild_id)
         select._values = [first.track_id]
         interaction = MagicMock()
@@ -7547,6 +8103,7 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
             await select.callback(interaction)
 
         self.assertEqual(list(state.queue), [second])
+        self.assertEqual(list(state.autoplay_candidate_pool), [pooled])
         interaction.response.defer.assert_awaited_once_with()
         interaction.edit_original_response.assert_awaited_once()
         schedule_cleanup.assert_called_once_with(

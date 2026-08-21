@@ -85,6 +85,10 @@ class MusicModelTests(unittest.TestCase):
             state.recent_playbacks.maxlen,
             music_models.AUTOPLAY_HISTORY_SIZE,
         )
+        self.assertEqual(
+            state.autoplay_candidate_pool.maxlen,
+            music_models.AUTOPLAY_CANDIDATE_POOL_CAP,
+        )
 
     def test_music_state_mutable_defaults_are_not_shared(self) -> None:
         first = music_models.GuildMusicState()
@@ -92,6 +96,7 @@ class MusicModelTests(unittest.TestCase):
         track = self.make_track("queued")
 
         first.queue.append(track)
+        first.autoplay_candidate_pool.append(track)
         first.recent_track_keys.append(
             music_models.AutoplayHistoryEntry("track", expires_at=1.0)
         )
@@ -112,6 +117,7 @@ class MusicModelTests(unittest.TestCase):
         track.manual_subtitles["ko"] = []
 
         self.assertFalse(second.queue)
+        self.assertFalse(second.autoplay_candidate_pool)
         self.assertFalse(second.recent_track_keys)
         self.assertFalse(second.recent_video_ids)
         self.assertFalse(second.recent_playbacks)
@@ -196,6 +202,7 @@ class MusicModelTests(unittest.TestCase):
                 "control_view",
                 "repeat_one",
                 "autoplay_enabled",
+                "autoplay_candidate_pool",
                 "recent_track_keys",
                 "recent_video_ids",
                 "recent_playbacks",

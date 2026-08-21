@@ -22,16 +22,22 @@ from music_autoplay_policy import (
     AUTOPLAY_QUEUE_TARGET,
     AUTOPLAY_RETRY_DELAYS_SECONDS,
     autoplay_can_refill,
+    clear_autoplay_candidate_pool,
+    consume_autoplay_candidate,
     get_autoplay_excluded_keys,
     get_recent_playbacks,
     get_autoplay_retry_delay,
     get_autoplay_seed,
+    reject_autoplay_candidate_pool,
     remember_autoplay_track,
     remember_recent_playback,
     remember_recent_value,
+    replace_autoplay_candidate_pool,
     select_autoplay_candidate,
+    select_autoplay_candidates,
 )
 from music_models import (
+    AUTOPLAY_CANDIDATE_POOL_CAP,
     AUTOPLAY_HISTORY_SIZE,
     MAX_PLAYBACK_ATTEMPTS,
     GuildMusicState,
@@ -776,6 +782,7 @@ async def cancel_music_background_tasks_for_shutdown() -> None:
     for state in list(music_states.values()):
         state.playback_generation += 1
         state.stop_requested = True
+        clear_autoplay_candidate_pool(state)
         clear_pending_playback_advance(state)
         voice = state.voice
         if voice and (voice.is_playing() or voice.is_paused()):
@@ -1665,6 +1672,8 @@ class MusicControlView(discord.ui.View):
                         for removed_track in removed_tracks:
                             if removed_track.requester_id is None:
                                 remember_autoplay_track(state, removed_track)
+                        cancel_autoplay_refill(state)
+                        reject_autoplay_candidate_pool(state)
                         state.skip_requested = True
                         skipped_count = len(removed_tracks) + 1
                         voice.stop()
@@ -1915,9 +1924,11 @@ class MusicControlView(discord.ui.View):
         state.autoplay_enabled = not state.autoplay_enabled
         set_autoplay_enabled(self.guild_id, state.autoplay_enabled)
         if state.autoplay_enabled:
+            clear_autoplay_candidate_pool(state)
             schedule_autoplay_refill(self.guild_id)
         else:
             cancel_autoplay_refill(state)
+            clear_autoplay_candidate_pool(state)
         await self.edit_panel(interaction, refresh_canonical=True)
 
     @discord.ui.button(
@@ -2938,64 +2949,21 @@ async def refill_autoplay_queue(
         while autoplay_can_refill(state, generation):
             seed = get_autoplay_seed(state) or fallback_seed
             fallback_seed = seed
-            try:
-                candidates = await extract_auto_tracks_from_seed(
-                    seed,
-                    "자동재생",
-                    candidate_count,
-                    job_kind=YtdlJobKind.AUTOPLAY,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                retry_delay = get_autoplay_retry_delay(failure_count)
-                failure_count += 1
-                if isinstance(exc, YouTubeCircuitOpenError):
-                    retry_delay = max(retry_delay, exc.retry_after_seconds)
-                logger.warning(
-                    "Autoplay search failed in guild %s; retrying in %s seconds: %s",
-                    guild_id,
-                    retry_delay,
-                    exc,
-                )
-                await asyncio.sleep(retry_delay)
-                continue
-
-            if not autoplay_can_refill(state, generation):
-                return
-
             hard_excluded_keys = get_track_identity_keys(seed)
             candidate: Track | None = None
-            reused_recent_candidate = False
+            candidate_from_pool = False
             deferred_refill_context: tuple[str | None, tuple[str, ...]] | None = None
             should_start = False
             async with state.lock:
                 if not autoplay_can_refill(state, generation):
                     return
-                selection_time = time.monotonic()
-                candidate = select_autoplay_candidate(
+                candidate = consume_autoplay_candidate(
                     state,
-                    candidates,
                     hard_excluded_keys,
-                    now=selection_time,
+                    now=time.monotonic(),
                 )
-                if candidate is None:
-                    candidate = select_autoplay_candidate(
-                        state,
-                        candidates,
-                        hard_excluded_keys,
-                        allow_recent_fallback=True,
-                        now=selection_time,
-                    )
-                    reused_recent_candidate = candidate is not None
-
-                if candidate is None:
-                    if state.queue:
-                        deferred_refill_context = (
-                            state.current.track_id if state.current else None,
-                            tuple(track.track_id for track in state.queue),
-                        )
-                else:
+                if candidate is not None:
+                    candidate_from_pool = True
                     state.queue.append(candidate)
                     added_track = True
                     failure_count = 0
@@ -3007,6 +2975,69 @@ async def refill_autoplay_queue(
                         and not voice.is_playing()
                         and not voice.is_paused()
                     )
+
+            if candidate is None:
+                try:
+                    candidates = await extract_auto_tracks_from_seed(
+                        seed,
+                        "자동재생",
+                        candidate_count,
+                        job_kind=YtdlJobKind.AUTOPLAY,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    retry_delay = get_autoplay_retry_delay(failure_count)
+                    failure_count += 1
+                    if isinstance(exc, YouTubeCircuitOpenError):
+                        retry_delay = max(retry_delay, exc.retry_after_seconds)
+                    logger.warning(
+                        "Autoplay search failed in guild %s; "
+                        "retrying in %s seconds: %s",
+                        guild_id,
+                        retry_delay,
+                        exc,
+                    )
+                    await asyncio.sleep(retry_delay)
+                    continue
+
+                if not autoplay_can_refill(state, generation):
+                    return
+
+                async with state.lock:
+                    if not autoplay_can_refill(state, generation):
+                        return
+                    selected_candidates = select_autoplay_candidates(
+                        state,
+                        candidates,
+                        hard_excluded_keys,
+                        limit=AUTOPLAY_CANDIDATE_POOL_CAP + 1,
+                        now=time.monotonic(),
+                    )
+                    if selected_candidates:
+                        candidate = selected_candidates[0]
+                        state.queue.append(candidate)
+                        replace_autoplay_candidate_pool(
+                            state,
+                            selected_candidates[1:],
+                        )
+                        added_track = True
+                        failure_count = 0
+                        voice = state.voice
+                        should_start = (
+                            state.current is None
+                            and voice is not None
+                            and voice.is_connected()
+                            and not voice.is_playing()
+                            and not voice.is_paused()
+                        )
+                    else:
+                        replace_autoplay_candidate_pool(state, [])
+                        if state.queue:
+                            deferred_refill_context = (
+                                state.current.track_id if state.current else None,
+                                tuple(track.track_id for track in state.queue),
+                            )
 
             if candidate is None:
                 if deferred_refill_context is not None:
@@ -3041,9 +3072,9 @@ async def refill_autoplay_queue(
                 await asyncio.sleep(retry_delay)
                 continue
 
-            if reused_recent_candidate:
+            if candidate_from_pool:
                 logger.info(
-                    "Autoplay reused oldest recent candidate %s in guild %s",
+                    "Autoplay queued cached candidate %s in guild %s",
                     candidate.title,
                     guild_id,
                 )
@@ -3467,6 +3498,7 @@ def stop_playback(state: GuildMusicState, guild_id: int) -> None:
     state.playback_generation += 1
     state.stop_requested = True
     state.queue.clear()
+    clear_autoplay_candidate_pool(state)
     schedule_private_lyrics_cleanup(state)
     if state.current is not None:
         reset_track_playback_state(state.current)
@@ -3865,9 +3897,25 @@ async def enqueue_tracks(
         )
         return False
 
-    state.queue.extend(tracks)
+    cancel_autoplay_refill(state)
+    request_was_cancelled = False
+    async with state.lock:
+        if state.playback_generation != request_generation:
+            request_was_cancelled = True
+        else:
+            cancel_autoplay_refill(state)
+            reject_autoplay_candidate_pool(state)
+            state.queue.extend(tracks)
+            queue_size = len(state.queue)
+
+    if request_was_cancelled:
+        update_idle_voice_disconnect(state, guild_id)
+        await send_feedback(
+            content="곡을 찾는 동안 재생이 중지되어 요청을 취소했어요."
+        )
+        return False
+
     cancel_idle_voice_disconnect(state)
-    queue_size = len(state.queue)
     if len(tracks) == 1:
         embed = make_track_embed(tracks[0], "Added to queue")
         embed.add_field(name="Position", value=str(queue_size), inline=True)
@@ -4334,6 +4382,7 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
         if not ffmpeg_is_available():
             state.current = None
             state.queue.clear()
+            clear_autoplay_candidate_pool(state)
             cancel_noncritical_tasks(state)
             cancel_autoplay_refill(state)
             cancel_lyrics_publish(state)

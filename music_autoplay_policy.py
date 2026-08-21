@@ -5,6 +5,7 @@ from typing import Deque
 
 from music_config import AUTOPLAY_HISTORY_TTL_SECONDS
 from music_models import (
+    AUTOPLAY_CANDIDATE_POOL_CAP,
     AutoplayHistoryEntry,
     GuildMusicState,
     RecentPlaybackEntry,
@@ -199,6 +200,96 @@ def select_autoplay_candidate(
             oldest_recent_expiry = candidate_expiry
 
     return oldest_recent_candidate
+
+
+def select_autoplay_candidates(
+    state: GuildMusicState,
+    candidates: list[Track],
+    extra_excluded_keys: set[str] | None = None,
+    *,
+    limit: int,
+    now: float | None = None,
+) -> list[Track]:
+    if limit <= 0:
+        return []
+
+    current_time = time.monotonic() if now is None else now
+    selected: list[Track] = []
+    selected_keys = set(extra_excluded_keys or ())
+    while len(selected) < limit:
+        candidate = select_autoplay_candidate(
+            state,
+            candidates,
+            selected_keys,
+            allow_recent_fallback=True,
+            now=current_time,
+        )
+        if candidate is None:
+            break
+        selected.append(candidate)
+        selected_keys.update(get_track_identity_keys(candidate))
+    return selected
+
+
+def replace_autoplay_candidate_pool(
+    state: GuildMusicState,
+    candidates: list[Track],
+) -> None:
+    pooled_candidates = candidates[:AUTOPLAY_CANDIDATE_POOL_CAP]
+    state.autoplay_candidate_pool.clear()
+    state.autoplay_candidate_pool.extend(pooled_candidates)
+
+
+def clear_autoplay_candidate_pool(state: GuildMusicState) -> None:
+    state.autoplay_candidate_pool.clear()
+
+
+def reject_autoplay_candidate_pool(
+    state: GuildMusicState,
+    *,
+    now: float | None = None,
+) -> None:
+    current_time = time.monotonic() if now is None else now
+    for track in state.autoplay_candidate_pool:
+        remember_autoplay_track(state, track, now=current_time)
+    clear_autoplay_candidate_pool(state)
+
+
+def consume_autoplay_candidate(
+    state: GuildMusicState,
+    extra_excluded_keys: set[str] | None = None,
+    *,
+    now: float | None = None,
+) -> Track | None:
+    current_time = time.monotonic() if now is None else now
+    hard_excluded_keys = _get_active_track_keys(state)
+    if extra_excluded_keys:
+        hard_excluded_keys.update(extra_excluded_keys)
+    usable_candidates = [
+        candidate
+        for candidate in state.autoplay_candidate_pool
+        if get_track_identity_keys(candidate).isdisjoint(hard_excluded_keys)
+    ]
+    replace_autoplay_candidate_pool(state, usable_candidates)
+    selected = select_autoplay_candidate(
+        state,
+        usable_candidates,
+        extra_excluded_keys,
+        allow_recent_fallback=True,
+        now=current_time,
+    )
+    if selected is None:
+        return None
+
+    replace_autoplay_candidate_pool(
+        state,
+        [
+            candidate
+            for candidate in usable_candidates
+            if candidate.track_id != selected.track_id
+        ],
+    )
+    return selected
 
 
 def get_autoplay_seed(state: GuildMusicState) -> Track | None:
