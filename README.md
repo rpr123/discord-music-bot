@@ -2,6 +2,8 @@
 
 Python 기반 디스코드 음악 봇입니다. 음악 신청 전용 채널에서는 곡명이나 YouTube URL만 메시지로 보내도 바로 재생 대기열에 추가되고, 상시 컨트롤 패널에서 재생을 제어할 수 있습니다.
 
+개인 운영용 봇의 현재 구현과 검증 절차를 함께 기록합니다. 모듈 책임, 의존 방향과 상태 소유권은 [ARCHITECTURE.md](ARCHITECTURE.md)에서 확인할 수 있습니다.
+
 ## 기능
 
 - `/setupmusic` 음악 신청 전용 텍스트 채널 생성 또는 지정
@@ -161,9 +163,26 @@ GCP 같은 클라우드 서버에서 `Sign in to confirm you're not a bot` 오�
 
 재생은 Opus 형식을 우선 선택하고 가능한 경우 재인코딩 없이 Discord로 전달합니다. 공용 `BOT_VOLUME` 처리는 CPU 절약을 위해 제거했으며, 음량은 각 사용자가 Discord에서 봇을 우클릭해 사용자 음량으로 조절합니다.
 
-## YouTube 없는 서버 테스트
+## 개발 및 검증
 
-Discord 입장, 음성 재생, 컨트롤 패널, 대기열, 앨범, 자동재생을 시험할 때는 짧은 로컬 음원을 사용하면 YouTube 요청이 전혀 발생하지 않습니다.
+GitHub Actions는 Python 3.11의 clean checkout에서 다음 명령을 실행합니다.
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip check
+python -m compileall -q .
+python -m unittest discover -s tests -q
+```
+
+단위 테스트에는 Discord token이나 YouTube credential이 필요하지 않습니다. Discord, YouTube, LRCLIB, 나무위키와 subprocess 경계를 mock해 parsing, policy, orchestration, cancellation을 검증하며, 실제 외부 서비스와의 호환성을 보증하는 live integration test는 아닙니다.
+
+실제 Discord 연결과 FFmpeg 재생 흐름을 YouTube 검색 대신 로컬 음원으로 점검하려면 바로 다음 개발 하네스를 사용하세요.
+
+## 로컬 음원으로 Discord 흐름 테스트
+
+짧은 로컬 음원을 사용하면 일반 곡, `album:`, `playlist:`와 수동 `autoN:` 신청을 실제 YouTube 추출 대신 로컬 트랙으로 시험할 수 있습니다. 이 하네스는 실제 Discord 연결과 FFmpeg를 사용하므로 봇 token과 테스트 서버가 필요합니다.
+
+지속 자동재생의 radio refill 경로는 로컬 구현으로 교체하지 않습니다. YouTube 요청 없이 점검하려면 컨트롤 패널의 자동재생을 끈 상태로 사용하세요.
 
 ```bash
 ffmpeg -f lavfi -i "sine=frequency=440:duration=15" test-tone.wav
@@ -175,7 +194,7 @@ ffmpeg -f lavfi -i "sine=frequency=440:duration=15" test-tone.wav
 python -m devtools.local_music_bot ./test-tone.wav --bulk-tracks 3
 ```
 
-이 프로세스에서는 전용 채널에 어떤 곡명을 보내도 번호가 붙은 로컬 테스트 트랙이 생성됩니다. 일반 `python bot.py` 실행에는 테스트 코드나 테스트 설정이 적용되지 않습니다.
+이 프로세스에서는 위 신청 경로에 번호가 붙은 로컬 테스트 트랙이 생성됩니다. 일반 `python bot.py` 실행에는 테스트 코드나 테스트 설정이 적용되지 않습니다.
 
 ## 실행
 
