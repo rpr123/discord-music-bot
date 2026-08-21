@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import bot
 import music_discord_display
-from music_models import GuildMusicState, Track
+from music_models import GuildMusicState, RecentPlaybackEntry, Track
 
 
 MOVED_NAMES = (
@@ -32,6 +32,7 @@ MOVED_NAMES = (
     "make_player_embed",
     "make_queue_embed",
     "make_queue_line",
+    "make_recent_playback_embed",
     "make_track_embed",
     "make_track_link",
     "notify_playback_error",
@@ -215,6 +216,61 @@ class MusicDiscordDisplayTests(unittest.TestCase):
             music_discord_display.truncate_option_text("abcd", 3),
             "ab…",
         )
+
+    def test_recent_playback_embed_is_newest_first_and_private_ready(self) -> None:
+        entries = (
+            RecentPlaybackEntry(
+                identity_keys=frozenset({"song:newest"}),
+                title="Newest Song",
+                webpage_url="https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                played_at=1_700_000_100.0,
+                expires_at=200.0,
+            ),
+            RecentPlaybackEntry(
+                identity_keys=frozenset({"song:older"}),
+                title="Older Song",
+                webpage_url="https://www.youtube.com/watch?v=bbbbbbbbbbb",
+                played_at=1_700_000_000.0,
+                expires_at=100.0,
+            ),
+        )
+
+        embed = music_discord_display.make_recent_playback_embed(entries)
+
+        self.assertEqual(embed.title, "🕘 최근 재생곡")
+        self.assertEqual(len(embed.fields), 1)
+        self.assertLess(
+            embed.fields[0].value.index("Newest Song"),
+            embed.fields[0].value.index("Older Song"),
+        )
+        self.assertIn(
+            "[Newest Song](https://www.youtube.com/watch?v=aaaaaaaaaaa)",
+            embed.fields[0].value,
+        )
+        self.assertIn("<t:1700000100:R>", embed.fields[0].value)
+
+    def test_recent_playback_embed_handles_empty_and_fifty_entry_limits(
+        self,
+    ) -> None:
+        empty = music_discord_display.make_recent_playback_embed(())
+        entries = tuple(
+            RecentPlaybackEntry(
+                identity_keys=frozenset({f"song:{index}"}),
+                title=f"{index} " + "긴 제목 " * 20,
+                webpage_url=(
+                    "https://www.youtube.com/watch?v=" + f"{index:011d}"
+                ),
+                played_at=1_700_000_000.0 + index,
+                expires_at=100.0 + index,
+            )
+            for index in range(50)
+        )
+        full = music_discord_display.make_recent_playback_embed(entries)
+
+        self.assertIn("없어요", empty.description)
+        self.assertEqual(len(full.fields), 5)
+        self.assertTrue(all(len(field.value) <= 1024 for field in full.fields))
+        self.assertLessEqual(len(full), 6000)
 
     def test_original_and_variant_embeds_preserve_metadata(self) -> None:
         track = make_lyrics_track()

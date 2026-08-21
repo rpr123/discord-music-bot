@@ -81,6 +81,10 @@ class MusicModelTests(unittest.TestCase):
             state.recent_video_ids.maxlen,
             music_models.AUTOPLAY_HISTORY_SIZE,
         )
+        self.assertEqual(
+            state.recent_playbacks.maxlen,
+            music_models.AUTOPLAY_HISTORY_SIZE,
+        )
 
     def test_music_state_mutable_defaults_are_not_shared(self) -> None:
         first = music_models.GuildMusicState()
@@ -94,6 +98,15 @@ class MusicModelTests(unittest.TestCase):
         first.recent_video_ids.append(
             music_models.AutoplayHistoryEntry("video", expires_at=1.0)
         )
+        first.recent_playbacks.append(
+            music_models.RecentPlaybackEntry(
+                identity_keys=frozenset({"song:track"}),
+                title="Track",
+                webpage_url="https://www.youtube.com/watch?v=abcdefghijk",
+                played_at=1.0,
+                expires_at=2.0,
+            )
+        )
         first.private_lyrics_messages[track.track_id] = []
         first.queue_cleanup_tasks[1] = object()
         track.manual_subtitles["ko"] = []
@@ -101,6 +114,7 @@ class MusicModelTests(unittest.TestCase):
         self.assertFalse(second.queue)
         self.assertFalse(second.recent_track_keys)
         self.assertFalse(second.recent_video_ids)
+        self.assertFalse(second.recent_playbacks)
         self.assertFalse(second.private_lyrics_messages)
         self.assertFalse(second.queue_cleanup_tasks)
         self.assertFalse(self.make_track("other").manual_subtitles)
@@ -126,6 +140,19 @@ class MusicModelTests(unittest.TestCase):
             self.assertIsNone(getattr(first, name))
 
     def test_music_model_field_contract(self) -> None:
+        self.assertEqual(
+            tuple(
+                field.name
+                for field in fields(music_models.RecentPlaybackEntry)
+            ),
+            (
+                "identity_keys",
+                "title",
+                "webpage_url",
+                "played_at",
+                "expires_at",
+            ),
+        )
         self.assertEqual(
             tuple(field.name for field in fields(music_models.Track)),
             (
@@ -171,6 +198,7 @@ class MusicModelTests(unittest.TestCase):
                 "autoplay_enabled",
                 "recent_track_keys",
                 "recent_video_ids",
+                "recent_playbacks",
                 "skip_requested",
                 "stop_requested",
                 "lock",

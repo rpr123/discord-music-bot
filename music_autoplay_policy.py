@@ -4,7 +4,12 @@ import time
 from typing import Deque
 
 from music_config import AUTOPLAY_HISTORY_TTL_SECONDS
-from music_models import AutoplayHistoryEntry, GuildMusicState, Track
+from music_models import (
+    AutoplayHistoryEntry,
+    GuildMusicState,
+    RecentPlaybackEntry,
+    Track,
+)
 from music_track_metadata import (
     get_track_identity_keys,
     get_track_video_id,
@@ -63,6 +68,53 @@ def remember_autoplay_track(
             video_id,
             now=current_time,
         )
+
+
+def _prune_expired_recent_playbacks(
+    state: GuildMusicState,
+    now: float,
+) -> None:
+    while state.recent_playbacks and state.recent_playbacks[0].expires_at <= now:
+        state.recent_playbacks.popleft()
+
+
+def remember_recent_playback(
+    state: GuildMusicState,
+    track: Track,
+    *,
+    now: float | None = None,
+    played_at: float | None = None,
+) -> None:
+    current_time = time.monotonic() if now is None else now
+    playback_time = time.time() if played_at is None else played_at
+    identity_keys = frozenset(get_track_identity_keys(track))
+    _prune_expired_recent_playbacks(state, current_time)
+    duplicates = [
+        entry
+        for entry in state.recent_playbacks
+        if not entry.identity_keys.isdisjoint(identity_keys)
+    ]
+    for entry in duplicates:
+        state.recent_playbacks.remove(entry)
+    state.recent_playbacks.append(
+        RecentPlaybackEntry(
+            identity_keys=identity_keys,
+            title=track.title,
+            webpage_url=track.webpage_url or track.source_url,
+            played_at=playback_time,
+            expires_at=current_time + AUTOPLAY_HISTORY_TTL_SECONDS,
+        )
+    )
+
+
+def get_recent_playbacks(
+    state: GuildMusicState,
+    *,
+    now: float | None = None,
+) -> tuple[RecentPlaybackEntry, ...]:
+    current_time = time.monotonic() if now is None else now
+    _prune_expired_recent_playbacks(state, current_time)
+    return tuple(reversed(state.recent_playbacks))
 
 
 def _get_recent_expiry_by_key(

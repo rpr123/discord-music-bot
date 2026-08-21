@@ -14,9 +14,11 @@ MOVED_NAMES = (
     "AUTOPLAY_RETRY_DELAYS_SECONDS",
     "autoplay_can_refill",
     "get_autoplay_excluded_keys",
+    "get_recent_playbacks",
     "get_autoplay_retry_delay",
     "get_autoplay_seed",
     "remember_autoplay_track",
+    "remember_recent_playback",
     "remember_recent_value",
     "select_autoplay_candidate",
 )
@@ -114,6 +116,97 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
         expected_expiry = now + music_autoplay_policy.AUTOPLAY_HISTORY_TTL_SECONDS
         self.assertEqual(state.recent_track_keys[0].expires_at, expected_expiry)
         self.assertEqual(state.recent_video_ids[0].expires_at, expected_expiry)
+
+    def test_recent_playback_snapshot_is_newest_first_with_display_data(
+        self,
+    ) -> None:
+        state = GuildMusicState()
+        first = make_track("First", video_id="aaaaaaaaaaa")
+        second = make_track("Second", video_id="bbbbbbbbbbb")
+
+        music_autoplay_policy.remember_recent_playback(
+            state,
+            first,
+            now=10.0,
+            played_at=1_700_000_000.0,
+        )
+        music_autoplay_policy.remember_recent_playback(
+            state,
+            second,
+            now=20.0,
+            played_at=1_700_000_100.0,
+        )
+
+        entries = music_autoplay_policy.get_recent_playbacks(state, now=20.0)
+
+        self.assertEqual([entry.title for entry in entries], ["Second", "First"])
+        self.assertEqual(entries[0].webpage_url, second.webpage_url)
+        self.assertEqual(entries[0].played_at, 1_700_000_100.0)
+        self.assertEqual(
+            entries[0].identity_keys,
+            frozenset(music_track_metadata.get_track_identity_keys(second)),
+        )
+        self.assertEqual(
+            entries[0].expires_at,
+            20.0 + music_autoplay_policy.AUTOPLAY_HISTORY_TTL_SECONDS,
+        )
+
+    def test_recent_playback_refresh_removes_every_overlapping_alias(self) -> None:
+        state = GuildMusicState()
+        first = make_track(
+            "First display",
+            video_id="aaaaaaaaaaa",
+            artist="Artist A",
+            song_name="Song A",
+        )
+        second = make_track(
+            "Second display",
+            video_id="bbbbbbbbbbb",
+            artist="Artist B",
+            song_name="Song B",
+        )
+        bridge = make_track(
+            "Bridge display",
+            video_id="bbbbbbbbbbb",
+            artist="Artist A",
+            song_name="Song A",
+        )
+        music_autoplay_policy.remember_recent_playback(state, first, now=1.0)
+        music_autoplay_policy.remember_recent_playback(state, second, now=2.0)
+
+        music_autoplay_policy.remember_recent_playback(state, bridge, now=3.0)
+
+        entries = music_autoplay_policy.get_recent_playbacks(state, now=3.0)
+        self.assertEqual([entry.title for entry in entries], ["Bridge display"])
+
+    def test_recent_playback_history_prunes_expired_entries_and_caps_at_fifty(
+        self,
+    ) -> None:
+        state = GuildMusicState()
+        tracks = [
+            make_track(f"track {index}", video_id=f"{index:011d}")
+            for index in range(51)
+        ]
+        for index, track in enumerate(tracks):
+            music_autoplay_policy.remember_recent_playback(
+                state,
+                track,
+                now=float(index),
+                played_at=1_700_000_000.0 + index,
+            )
+
+        entries = music_autoplay_policy.get_recent_playbacks(state, now=50.0)
+        self.assertEqual(len(entries), 50)
+        self.assertNotIn("track 0", {entry.title for entry in entries})
+
+        entries = music_autoplay_policy.get_recent_playbacks(
+            state,
+            now=music_autoplay_policy.AUTOPLAY_HISTORY_TTL_SECONDS + 25.0,
+        )
+        self.assertEqual(
+            [entry.title for entry in entries],
+            [f"track {index}" for index in range(50, 25, -1)],
+        )
 
     def test_autoplay_history_expires_at_configured_ttl(self) -> None:
         state = GuildMusicState()

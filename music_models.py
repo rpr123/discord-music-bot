@@ -19,6 +19,15 @@ class AutoplayHistoryEntry:
     expires_at: float
 
 
+@dataclass(frozen=True)
+class RecentPlaybackEntry:
+    identity_keys: frozenset[str]
+    title: str
+    webpage_url: str
+    played_at: float
+    expires_at: float
+
+
 @dataclass
 class Track:
     title: str
@@ -67,6 +76,9 @@ class GuildMusicState:
         default_factory=lambda: deque(maxlen=AUTOPLAY_HISTORY_SIZE)
     )
     recent_video_ids: Deque[AutoplayHistoryEntry] = field(
+        default_factory=lambda: deque(maxlen=AUTOPLAY_HISTORY_SIZE)
+    )
+    recent_playbacks: Deque[RecentPlaybackEntry] = field(
         default_factory=lambda: deque(maxlen=AUTOPLAY_HISTORY_SIZE)
     )
     skip_requested: bool = False

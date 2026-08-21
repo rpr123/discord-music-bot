@@ -1776,6 +1776,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             "music:queue",
             "music:queue_range",
             bot.AUTOPLAY_BUTTON_CUSTOM_ID,
+            bot.RECENT_PLAYBACK_BUTTON_CUSTOM_ID,
         }
         views = (
             bot.MusicControlView(guild_id),
@@ -1786,7 +1787,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         try:
             for view in views:
                 custom_ids = [item.custom_id for item in view.children]
-                self.assertEqual(len(custom_ids), 9)
+                self.assertEqual(len(custom_ids), 10)
                 self.assertEqual(set(custom_ids), expected_custom_ids)
                 self.assertIsNone(view.timeout)
                 self.assertTrue(view.is_persistent())
@@ -1818,7 +1819,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                     view_store.add_view(view, message_id)
                     counts.append(len(view_store._views[message_id]))
 
-                self.assertEqual(counts, [9, 9, 9, 9])
+                self.assertEqual(counts, [10, 10, 10, 10])
                 for message_id, view in latest_views.items():
                     dispatch_items = view_store._views[message_id]
                     self.assertIs(view_store._synced_message_views[message_id], view)
@@ -1866,7 +1867,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 first_owner = state.control_view
                 self.assertIsNot(first_owner, previous_view)
                 self.assertTrue(previous_view.is_finished())
-                self.assertEqual(len(view_store._views[message_id]), 9)
+                self.assertEqual(len(view_store._views[message_id]), 10)
                 self.assertIs(view_store._synced_message_views[message_id], first_owner)
                 self.assertTrue(
                     all(
@@ -1880,7 +1881,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 second_owner = state.control_view
                 self.assertIsNot(second_owner, first_owner)
                 self.assertTrue(first_owner.is_finished())
-                self.assertEqual(len(view_store._views[message_id]), 9)
+                self.assertEqual(len(view_store._views[message_id]), 10)
                 self.assertIs(view_store._synced_message_views[message_id], second_owner)
                 self.assertTrue(
                     all(
@@ -2010,10 +2011,14 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 all(
                     child.disabled
                     for child in final_view.children
-                    if child.custom_id != bot.AUTOPLAY_BUTTON_CUSTOM_ID
+                    if child.custom_id
+                    not in {
+                        bot.AUTOPLAY_BUTTON_CUSTOM_ID,
+                        bot.RECENT_PLAYBACK_BUTTON_CUSTOM_ID,
+                    }
                 )
             )
-            self.assertEqual(len(view_store._views[message_id]), 9)
+            self.assertEqual(len(view_store._views[message_id]), 10)
             self.assertTrue(
                 all(
                     item.view is final_view
@@ -2162,7 +2167,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(mismatch_owner.is_finished())
             self.assertNotIn(mismatch_old.id, view_store._views)
             self.assertIs(mismatch_state.control_message, mismatch_new)
-            self.assertEqual(len(view_store._views[mismatch_new.id]), 9)
+            self.assertEqual(len(view_store._views[mismatch_new.id]), 10)
             self.assertTrue(
                 all(
                     item.view is mismatch_state.control_view
@@ -2174,7 +2179,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(missing_owner.is_finished())
             self.assertNotIn(missing_old.id, view_store._views)
             self.assertIs(missing_state.control_message, missing_new)
-            self.assertEqual(len(view_store._views[missing_new.id]), 9)
+            self.assertEqual(len(view_store._views[missing_new.id]), 10)
             self.assertTrue(
                 all(
                     item.view is missing_state.control_view
@@ -2187,7 +2192,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(failure_state.control_view, prior_failure_owner)
             self.assertFalse(prior_failure_owner.is_finished())
             channel_d.send.assert_not_awaited()
-            self.assertEqual(len(view_store._views[failure_old.id]), 9)
+            self.assertEqual(len(view_store._views[failure_old.id]), 10)
             self.assertTrue(
                 all(
                     item.view is prior_failure_owner
@@ -2200,7 +2205,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(cancelled_owner.is_finished())
             self.assertFalse(cancelled_state.control_panel_lock.locked())
             channel_e.send.assert_not_awaited()
-            self.assertEqual(len(view_store._views[cancelled_old.id]), 9)
+            self.assertEqual(len(view_store._views[cancelled_old.id]), 10)
             self.assertTrue(
                 all(
                     item.view is cancelled_owner
@@ -2284,7 +2289,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(state.control_message, message)
             self.assertIs(state.control_view, owner)
             self.assertFalse(owner.is_finished())
-            self.assertEqual(len(view_store._views[message_id]), 9)
+            self.assertEqual(len(view_store._views[message_id]), 10)
         finally:
             bot.discord.ui.View.stop(owner)
             bot.music_states.pop(guild_id, None)
@@ -2345,7 +2350,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(new_owner.is_finished())
             self.assertTrue(old_owner.is_finished())
             self.assertNotIn(old_message_id, view_store._views)
-            self.assertEqual(len(view_store._views[new_message_id]), 9)
+            self.assertEqual(len(view_store._views[new_message_id]), 10)
             self.assertTrue(
                 all(
                     item.view is new_owner
@@ -2572,7 +2577,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(view.is_finished())
                 self.assertFalse(state.control_panel_lock.locked())
                 clear_id.assert_not_called()
-                self.assertEqual(len(view_store._views[message_id]), 9)
+                self.assertEqual(len(view_store._views[message_id]), 10)
                 self.assertTrue(
                     all(
                         item.view is view
@@ -2951,6 +2956,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 bot.normalize_track_key(second_auto),
             },
         )
+        self.assertFalse(case.state.recent_playbacks)
         case.interaction.followup.send.assert_awaited_once_with(
             "마지막 곡으로 바로 넘어갈게요. 3곡을 건너뛰었어요.",
             ephemeral=True,
@@ -3334,7 +3340,11 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             all(
                 item.disabled
                 for item in final_view.children
-                if item.custom_id != bot.AUTOPLAY_BUTTON_CUSTOM_ID
+                if item.custom_id
+                not in {
+                    bot.AUTOPLAY_BUTTON_CUSTOM_ID,
+                    bot.RECENT_PLAYBACK_BUTTON_CUSTOM_ID,
+                }
             )
         )
 
@@ -3802,7 +3812,11 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 all(
                     item.disabled
                     for item in idle_view.children
-                    if item.custom_id != bot.AUTOPLAY_BUTTON_CUSTOM_ID
+                    if item.custom_id
+                    not in {
+                        bot.AUTOPLAY_BUTTON_CUSTOM_ID,
+                        bot.RECENT_PLAYBACK_BUTTON_CUSTOM_ID,
+                    }
                 )
             )
 
@@ -3960,7 +3974,11 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 all(
                     item.disabled
                     for item in idle_view.children
-                    if item.custom_id != bot.AUTOPLAY_BUTTON_CUSTOM_ID
+                    if item.custom_id
+                    not in {
+                        bot.AUTOPLAY_BUTTON_CUSTOM_ID,
+                        bot.RECENT_PLAYBACK_BUTTON_CUSTOM_ID,
+                    }
                 )
             )
 
@@ -4229,12 +4247,22 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 for item in idle_view.children
                 if item.custom_id == bot.AUTOPLAY_BUTTON_CUSTOM_ID
             )
+            recent_button = next(
+                item
+                for item in idle_view.children
+                if item.custom_id == bot.RECENT_PLAYBACK_BUTTON_CUSTOM_ID
+            )
             self.assertFalse(autoplay_button.disabled)
+            self.assertFalse(recent_button.disabled)
             self.assertTrue(
                 all(
                     item.disabled
                     for item in idle_view.children
-                    if item.custom_id != bot.AUTOPLAY_BUTTON_CUSTOM_ID
+                    if item.custom_id
+                    not in {
+                        bot.AUTOPLAY_BUTTON_CUSTOM_ID,
+                        bot.RECENT_PLAYBACK_BUTTON_CUSTOM_ID,
+                    }
                 )
             )
 
@@ -4640,6 +4668,57 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         restore_panels.assert_awaited_once_with()
         ffmpeg_check.assert_called_once_with()
         sync_commands.assert_awaited_once_with()
+
+    async def test_recent_playback_button_is_private_and_needs_no_voice(
+        self,
+    ) -> None:
+        guild_id = 443
+        state = bot.get_state(guild_id)
+        older = make_track("Older Song")
+        newest = make_track("Newest Song")
+        bot.remember_recent_playback(
+            state,
+            older,
+            played_at=1_700_000_000.0,
+        )
+        bot.remember_recent_playback(
+            state,
+            newest,
+            played_at=1_700_000_100.0,
+        )
+        view = bot.MusicControlView(guild_id, disabled=True)
+        button = next(
+            item
+            for item in view.children
+            if item.custom_id == bot.RECENT_PLAYBACK_BUTTON_CUSTOM_ID
+        )
+        interaction = MagicMock(
+            data={"custom_id": bot.RECENT_PLAYBACK_BUTTON_CUSTOM_ID},
+            user=MagicMock(voice=None),
+        )
+        interaction.response.send_message = AsyncMock()
+
+        self.assertFalse(button.disabled)
+        self.assertTrue(await view.interaction_check(interaction))
+        with (
+            patch.object(bot, "extract_ytdl_info", new=AsyncMock()) as extract,
+            patch.object(bot, "search_youtube_music", new=AsyncMock()) as search,
+        ):
+            await button.callback(interaction)
+
+        interaction.response.send_message.assert_awaited_once()
+        content = interaction.response.send_message.await_args.args[0]
+        options = interaction.response.send_message.await_args.kwargs
+        self.assertIsNone(content)
+        self.assertTrue(options["ephemeral"])
+        self.assertEqual(options["embed"].title, "🕘 최근 재생곡")
+        field_value = options["embed"].fields[0].value
+        self.assertLess(
+            field_value.index("Newest Song"),
+            field_value.index("Older Song"),
+        )
+        extract.assert_not_awaited()
+        search.assert_not_awaited()
 
     async def test_autoplay_button_toggles_state_and_schedules_refill(self) -> None:
         guild_id = 444
@@ -9923,6 +10002,10 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             bot.normalize_track_key(first),
             {entry.value for entry in state.recent_track_keys},
+        )
+        self.assertEqual(
+            [entry.title for entry in state.recent_playbacks],
+            [first.title],
         )
         ffmpeg_opus.assert_called_once()
         self.assertEqual(ffmpeg_opus.call_args.kwargs["codec"], "copy")

@@ -23,9 +23,11 @@ from music_autoplay_policy import (
     AUTOPLAY_RETRY_DELAYS_SECONDS,
     autoplay_can_refill,
     get_autoplay_excluded_keys,
+    get_recent_playbacks,
     get_autoplay_retry_delay,
     get_autoplay_seed,
     remember_autoplay_track,
+    remember_recent_playback,
     remember_recent_value,
     select_autoplay_candidate,
 )
@@ -67,6 +69,7 @@ from music_discord_display import (
     make_player_embed,
     make_queue_line,
     make_queue_embed,
+    make_recent_playback_embed,
     make_track_link,
     make_track_embed,
     notify_playback_error,
@@ -311,6 +314,7 @@ from music_ytdl import (
 
 T = TypeVar("T")
 AUTOPLAY_SEED_CHANGE_POLL_SECONDS = 5.0
+RECENT_PLAYBACK_BUTTON_CUSTOM_ID = "music:recent_playback"
 
 youtube_music_client: YTMusic | None = None
 youtube_music_client_lock = threading.Lock()
@@ -1416,6 +1420,8 @@ class MusicControlView(discord.ui.View):
                     else discord.ButtonStyle.secondary
                 )
                 child.disabled = False
+            elif child.custom_id == RECENT_PLAYBACK_BUTTON_CUSTOM_ID:
+                child.disabled = False
             else:
                 child.disabled = disabled
 
@@ -1424,6 +1430,8 @@ class MusicControlView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         custom_id = (interaction.data or {}).get("custom_id")
+        if custom_id == RECENT_PLAYBACK_BUTTON_CUSTOM_ID:
+            return True
         if custom_id == AUTOPLAY_BUTTON_CUSTOM_ID:
             state = self.get_state()
             if state.voice and state.voice.is_connected():
@@ -1911,6 +1919,25 @@ class MusicControlView(discord.ui.View):
         else:
             cancel_autoplay_refill(state)
         await self.edit_panel(interaction, refresh_canonical=True)
+
+    @discord.ui.button(
+        label="최근 재생",
+        emoji="🕘",
+        style=discord.ButtonStyle.secondary,
+        custom_id=RECENT_PLAYBACK_BUTTON_CUSTOM_ID,
+        row=2,
+    )
+    async def recent_playback(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        entries = get_recent_playbacks(self.get_state())
+        await send_ephemeral_response(
+            interaction,
+            embed=make_recent_playback_embed(entries),
+            delete_after=None,
+        )
 
 
 async def extract_first_info(
@@ -4478,7 +4505,9 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                     source.cleanup()
                 raise
 
-            remember_autoplay_track(state, track)
+            history_now = time.monotonic()
+            remember_autoplay_track(state, track, now=history_now)
+            remember_recent_playback(state, track, now=history_now)
             if announce and state.current is track:
                 await update_control_panel(guild_id, state)
             if state.current is track:

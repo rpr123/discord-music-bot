@@ -12,7 +12,7 @@ from music_config import (
     get_music_channel_id,
     logger,
 )
-from music_models import GuildMusicState, Track
+from music_models import GuildMusicState, RecentPlaybackEntry, Track
 
 
 DISCORD_EMBED_FIELD_LIMIT = 1024
@@ -20,6 +20,8 @@ PLAYING_PANEL_TITLE = "💿 지금 재생 중"
 IDLE_PANEL_TITLE = "🎵 재생 대기 중"
 CONTROL_PANEL_TITLES = frozenset({PLAYING_PANEL_TITLE, IDLE_PANEL_TITLE})
 LYRICS_INLINE_LIMIT = 3900
+RECENT_PLAYBACKS_PER_FIELD = 10
+RECENT_PLAYBACK_LINK_LIMIT = 72
 
 
 def is_silent_music_channel(channel: discord.abc.Messageable | None) -> bool:
@@ -165,6 +167,25 @@ def make_queue_line(index: int, track: Track) -> str:
     return f"{index}. {truncate_text(track.title, 72)} - {format_duration(track.duration)}"
 
 
+def make_recent_playback_link(entry: RecentPlaybackEntry) -> str:
+    title = single_line(entry.title) or "알 수 없는 곡"
+    if entry.webpage_url:
+        title_limit = RECENT_PLAYBACK_LINK_LIMIT - len(entry.webpage_url) - 4
+        if title_limit >= 8:
+            return f"[{truncate_text(title, title_limit)}]({entry.webpage_url})"
+    return truncate_text(title, RECENT_PLAYBACK_LINK_LIMIT)
+
+
+def make_recent_playback_line(
+    index: int,
+    entry: RecentPlaybackEntry,
+) -> str:
+    return (
+        f"{index}. {make_recent_playback_link(entry)} · "
+        f"<t:{int(entry.played_at)}:R>"
+    )
+
+
 def truncate_option_text(value: str, limit: int = 100) -> str:
     return truncate_text(value, limit)
 
@@ -244,6 +265,34 @@ def make_queue_embed(state: GuildMusicState) -> discord.Embed:
     elif not state.current:
         embed.description = "대기열이 비어 있어요."
 
+    return embed
+
+
+def make_recent_playback_embed(
+    entries: tuple[RecentPlaybackEntry, ...],
+) -> discord.Embed:
+    embed = discord.Embed(title="🕘 최근 재생곡", color=discord.Color.blurple())
+    if not entries:
+        embed.description = "현재 실행 중 기록된 최근 재생곡이 없어요."
+        return embed
+
+    embed.description = (
+        "자동재생 중복 방지 기간에 실제 재생을 시작한 고유 곡이에요. "
+        "봇을 재시작하면 초기화돼요."
+    )
+    visible_entries = entries[:50]
+    for offset in range(0, len(visible_entries), RECENT_PLAYBACKS_PER_FIELD):
+        group = visible_entries[offset : offset + RECENT_PLAYBACKS_PER_FIELD]
+        first_index = offset + 1
+        last_index = offset + len(group)
+        embed.add_field(
+            name=f"{first_index}–{last_index}",
+            value="\n".join(
+                make_recent_playback_line(index, entry)
+                for index, entry in enumerate(group, start=first_index)
+            ),
+            inline=False,
+        )
     return embed
 
 
