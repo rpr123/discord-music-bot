@@ -90,13 +90,6 @@ def remember_recent_playback(
     playback_time = time.time() if played_at is None else played_at
     identity_keys = frozenset(get_track_identity_keys(track))
     _prune_expired_recent_playbacks(state, current_time)
-    duplicates = [
-        entry
-        for entry in state.recent_playbacks
-        if not entry.identity_keys.isdisjoint(identity_keys)
-    ]
-    for entry in duplicates:
-        state.recent_playbacks.remove(entry)
     state.recent_playbacks.append(
         RecentPlaybackEntry(
             identity_keys=identity_keys,

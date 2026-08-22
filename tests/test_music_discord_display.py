@@ -238,6 +238,7 @@ class MusicDiscordDisplayTests(unittest.TestCase):
         embed = music_discord_display.make_recent_playback_embed(entries)
 
         self.assertEqual(embed.title, "🕘 최근 재생곡")
+        self.assertIn("같은 곡도 재생할 때마다 표시", embed.description)
         self.assertEqual(len(embed.fields), 1)
         self.assertLess(
             embed.fields[0].value.index("Newest Song"),

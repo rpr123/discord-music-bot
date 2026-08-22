@@ -157,7 +157,7 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             20.0 + music_autoplay_policy.AUTOPLAY_HISTORY_TTL_SECONDS,
         )
 
-    def test_recent_playback_refresh_removes_every_overlapping_alias(self) -> None:
+    def test_recent_playback_preserves_repeats_and_overlapping_aliases(self) -> None:
         state = GuildMusicState()
         first = make_track(
             "First display",
@@ -179,11 +179,14 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
         )
         music_autoplay_policy.remember_recent_playback(state, first, now=1.0)
         music_autoplay_policy.remember_recent_playback(state, second, now=2.0)
-
         music_autoplay_policy.remember_recent_playback(state, bridge, now=3.0)
+        music_autoplay_policy.remember_recent_playback(state, first, now=4.0)
 
-        entries = music_autoplay_policy.get_recent_playbacks(state, now=3.0)
-        self.assertEqual([entry.title for entry in entries], ["Bridge display"])
+        entries = music_autoplay_policy.get_recent_playbacks(state, now=4.0)
+        self.assertEqual(
+            [entry.title for entry in entries],
+            ["First display", "Bridge display", "Second display", "First display"],
+        )
 
     def test_recent_playback_history_prunes_expired_entries_and_caps_at_fifty(
         self,

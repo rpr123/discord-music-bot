@@ -277,8 +277,8 @@ def make_recent_playback_embed(
         return embed
 
     embed.description = (
-        "자동재생 중복 방지 기간에 실제 재생을 시작한 고유 곡이에요. "
-        "봇을 재시작하면 초기화돼요."
+        "자동재생 중복 방지 기간에 실제 재생을 시작한 순서예요. "
+        "같은 곡도 재생할 때마다 표시되며, 봇을 재시작하면 초기화돼요."
     )
     visible_entries = entries[:50]
     for offset in range(0, len(visible_entries), RECENT_PLAYBACKS_PER_FIELD):
