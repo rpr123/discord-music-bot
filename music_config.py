@@ -125,6 +125,10 @@ AUTOPLAY_REFILL_CANDIDATES = min(
     parse_positive_int_env("AUTOPLAY_REFILL_CANDIDATES", 10),
     MAX_AUTO_TRACKS,
 )
+AUTOPLAY_MIN_INTERVAL_SECONDS = parse_nonnegative_float_env(
+    "AUTOPLAY_MIN_INTERVAL_SECONDS",
+    15.0,
+)
 QUEUE_SELECT_LIMIT = 25
 LYRICS_API_URL = os.getenv("LYRICS_API_URL", "https://lrclib.net/api/search")
 LYRICS_REQUEST_TIMEOUT_SECONDS = parse_positive_int_env(

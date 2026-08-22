@@ -1,6 +1,7 @@
 import ast
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import bot
 import music_search_scoring
@@ -11,6 +12,7 @@ MOVED_FUNCTION_NAMES = (
     "clean_track_title",
     "clean_track_title_preserving_case",
     "get_search_result_duration",
+    "get_version_style_intents",
     "get_youtube_music_artist_hint",
     "get_youtube_music_artist_names",
     "get_youtube_search_tokens",
@@ -18,7 +20,9 @@ MOVED_FUNCTION_NAMES = (
     "is_likely_official_youtube_upload",
     "normalize_artist_name",
     "normalize_identity_component",
+    "rank_autoplay_candidates",
     "resolve_query",
+    "score_autoplay_candidate",
     "score_youtube_search_result",
     "select_youtube_music_song_result",
     "select_youtube_search_result",
@@ -123,6 +127,332 @@ class MusicSearchScoringTests(unittest.TestCase):
 
         self.assertGreater(plain_full_score, plain_game_score)
         self.assertGreater(explicit_game_score, explicit_full_score)
+
+    def test_autoplay_duration_score_boundaries(self) -> None:
+        expected_scores = {
+            None: 25,
+            44: -110,
+            45: -60,
+            89: -60,
+            90: -20,
+            149: -20,
+            150: 10,
+            179: 10,
+            180: 60,
+            420: 60,
+            421: 40,
+            600: 40,
+            601: 10,
+            900: 10,
+            901: -60,
+        }
+
+        for duration, expected in expected_scores.items():
+            with self.subTest(duration=duration):
+                entry = {"title": "Candidate"}
+                if duration is not None:
+                    entry["duration"] = duration
+                self.assertEqual(
+                    music_search_scoring.score_autoplay_candidate(entry, 0),
+                    expected,
+                )
+
+    def test_autoplay_score_adds_quality_markers_without_query_relevance(
+        self,
+    ) -> None:
+        entries_and_scores = (
+            ({"title": "Song Full Version", "duration": 240}, 95),
+            ({"title": "Song #Shorts", "duration": 240}, -60),
+            ({"title": "Song Game MV", "duration": 200}, -2),
+            ({"title": "Song Game MV", "duration": 210}, 48),
+            ({"title": "Song Cover", "duration": 240}, -20),
+            ({"title": "Song Live", "duration": 240}, -20),
+            ({"title": "Song Remix", "duration": 240}, 15),
+            ({"title": "Song Extended Loop", "duration": 240}, -20),
+            ({"title": "Song Official Audio", "duration": 700}, 24),
+            ({"title": "Song", "duration": 240, "is_live": True}, -140),
+        )
+
+        for entry, expected in entries_and_scores:
+            with self.subTest(entry=entry):
+                self.assertEqual(
+                    music_search_scoring.score_autoplay_candidate(entry, 0),
+                    expected,
+                )
+
+        official_full = {
+            "title": "Artist - Song Full Version Official MV",
+            "duration": 240,
+            "channel": "Artist Official",
+        }
+        self.assertEqual(
+            music_search_scoring.score_autoplay_candidate(official_full, 0),
+            161,
+        )
+
+        for live_entry in (
+            {"title": "Song", "duration": 240, "is_upcoming": True},
+            {"title": "Song", "duration": 240, "live_status": "is_live"},
+            {"title": "Song", "duration": 240, "live_status": "post_live"},
+        ):
+            with self.subTest(live_entry=live_entry):
+                self.assertEqual(
+                    music_search_scoring.score_autoplay_candidate(live_entry, 0),
+                    -140,
+                )
+
+        popularity = {
+            "title": "Candidate",
+            "duration": 240,
+            "view_count": 100_000_000,
+            "like_count": 1_000_000,
+        }
+        self.assertEqual(
+            music_search_scoring.score_autoplay_candidate(popularity, 0),
+            music_search_scoring.score_autoplay_candidate(
+                {"title": "Candidate", "duration": 240},
+                0,
+            ),
+        )
+
+    def test_cover_and_recorded_live_intents_only_neutralize_same_style(
+        self,
+    ) -> None:
+        cover = {"title": "Song Cover", "duration": 240}
+        recorded_live = {"title": "Song Live", "duration": 240}
+        cover_live = {"title": "Song Cover Live", "duration": 240}
+
+        self.assertEqual(
+            music_search_scoring.score_autoplay_candidate(cover, 0),
+            -20,
+        )
+        self.assertEqual(
+            music_search_scoring.score_autoplay_candidate(
+                cover,
+                0,
+                style_intents=frozenset({"cover"}),
+            ),
+            60,
+        )
+        self.assertEqual(
+            music_search_scoring.score_autoplay_candidate(
+                cover,
+                0,
+                style_intents=frozenset({"live"}),
+            ),
+            -20,
+        )
+        self.assertEqual(
+            music_search_scoring.score_autoplay_candidate(
+                recorded_live,
+                0,
+                style_intents=frozenset({"live"}),
+            ),
+            60,
+        )
+        self.assertEqual(
+            music_search_scoring.score_autoplay_candidate(
+                recorded_live,
+                0,
+                style_intents=frozenset({"cover"}),
+            ),
+            -20,
+        )
+        self.assertEqual(
+            music_search_scoring.score_autoplay_candidate(cover_live, 0),
+            -100,
+        )
+        self.assertEqual(
+            music_search_scoring.score_autoplay_candidate(
+                cover_live,
+                0,
+                style_intents=frozenset({"cover", "live"}),
+            ),
+            60,
+        )
+        self.assertEqual(
+            music_search_scoring.score_autoplay_candidate(
+                {"title": "Song Cover Remix", "duration": 240},
+                0,
+                style_intents=frozenset({"cover"}),
+            ),
+            15,
+        )
+        self.assertEqual(
+            music_search_scoring.score_autoplay_candidate(
+                {"title": "Song Cover Live Remix", "duration": 240},
+                0,
+                style_intents=frozenset({"cover", "live"}),
+            ),
+            15,
+        )
+
+    def test_recorded_live_intent_does_not_remove_actual_broadcast_penalty(
+        self,
+    ) -> None:
+        entry = {
+            "title": "Song Live",
+            "duration": 240,
+            "live_status": "post_live",
+        }
+
+        self.assertEqual(
+            music_search_scoring.score_autoplay_candidate(
+                entry,
+                0,
+                style_intents=frozenset({"live"}),
+            ),
+            -140,
+        )
+
+    def test_style_intents_ignore_urls_and_keep_cover_live_separate(self) -> None:
+        self.assertEqual(
+            music_search_scoring.get_version_style_intents(
+                "https://www.youtube.com/live/abcdefghijk"
+            ),
+            frozenset(),
+        )
+        self.assertEqual(
+            music_search_scoring.get_version_style_intents(
+                "Song Cover Live"
+            ),
+            frozenset({"cover", "live"}),
+        )
+        self.assertEqual(
+            music_search_scoring.get_version_style_intents("How to Live"),
+            frozenset(),
+        )
+        self.assertEqual(
+            music_search_scoring.get_version_style_intents("Cover Me"),
+            frozenset(),
+        )
+        self.assertEqual(
+            music_search_scoring.get_version_style_intents(
+                "Song [Cover] (Live)"
+            ),
+            frozenset({"cover", "live"}),
+        )
+        for value in (
+            "Song (Live @ Wembley)",
+            "Song Live Recording",
+            "Song (Live in Tokyo)",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    music_search_scoring.get_version_style_intents(value),
+                    frozenset({"live"}),
+                )
+        for value in ("Song Cover feat. Artist", "Song Cover Lyrics"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    music_search_scoring.get_version_style_intents(value),
+                    frozenset({"cover"}),
+                )
+
+    def test_generic_version_marker_does_not_match_inside_english_words(
+        self,
+    ) -> None:
+        for value in ("Cover", "Discover", "Forever", "Never", "Over"):
+            with self.subTest(value=value):
+                self.assertIsNone(
+                    music_search_scoring.GENERIC_VERSION_SEARCH_RE.search(value)
+                )
+
+        self.assertIsNotNone(
+            music_search_scoring.GENERIC_VERSION_SEARCH_RE.search("斑鳩ルカver")
+        )
+        self.assertTrue(
+            music_search_scoring.should_use_youtube_music_search(
+                "Never Gonna Give You Up"
+            )
+        )
+        self.assertEqual(
+            music_search_scoring.score_autoplay_candidate(
+                {
+                    "title": "Song",
+                    "channel": "Cover Nation",
+                    "duration": 240,
+                },
+                0,
+            ),
+            60,
+        )
+
+    def test_general_search_only_neutralizes_the_requested_style(self) -> None:
+        cover = {"title": "Song Cover", "duration": 240}
+        recorded_live = {"title": "Song Live", "duration": 240}
+
+        with patch.object(
+            music_search_scoring,
+            "get_youtube_search_tokens",
+            return_value=set(),
+        ):
+            self.assertEqual(
+                music_search_scoring.score_youtube_search_result(
+                    cover,
+                    "request cover",
+                    0,
+                ),
+                60,
+            )
+            self.assertEqual(
+                music_search_scoring.score_youtube_search_result(
+                    cover,
+                    "request live",
+                    0,
+                ),
+                -20,
+            )
+            self.assertEqual(
+                music_search_scoring.score_youtube_search_result(
+                    recorded_live,
+                    "request live",
+                    0,
+                ),
+                60,
+            )
+            self.assertEqual(
+                music_search_scoring.score_youtube_search_result(
+                    recorded_live,
+                    "request cover",
+                    0,
+                ),
+                -20,
+            )
+            self.assertEqual(
+                music_search_scoring.score_youtube_search_result(
+                    {"title": "Song Remix", "duration": 240},
+                    "request cover version",
+                    0,
+                ),
+                15,
+            )
+
+    def test_autoplay_ranking_prefers_quality_and_preserves_source_ties(
+        self,
+    ) -> None:
+        entries = [
+            {"id": "short", "title": "Song Short Version", "duration": 80},
+            {"id": "cover", "title": "Song Cover", "duration": 240},
+            {
+                "id": "official",
+                "title": "Artist - Song Full Version Official MV",
+                "duration": 240,
+                "channel": "Artist Official",
+            },
+        ]
+
+        ranked = music_search_scoring.rank_autoplay_candidates(entries)
+
+        self.assertEqual([entry["id"] for entry, _, _ in ranked], ["official", "cover", "short"])
+        with patch.object(
+            music_search_scoring,
+            "score_autoplay_candidate",
+            return_value=10,
+        ):
+            tied = music_search_scoring.rank_autoplay_candidates(entries)
+        self.assertEqual([entry["id"] for entry, _, _ in tied], ["short", "cover", "official"])
+        self.assertEqual([source_index for _, _, source_index in tied], [0, 1, 2])
 
 
 class SearchRoutingTests(unittest.TestCase):

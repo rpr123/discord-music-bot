@@ -73,6 +73,7 @@ class MusicModelTests(unittest.TestCase):
     def test_autoplay_history_deques_have_expected_maxlen(self) -> None:
         state = music_models.GuildMusicState()
 
+        self.assertEqual(music_models.AUTOPLAY_CANDIDATE_POOL_CAP, 6)
         self.assertEqual(
             state.recent_track_keys.maxlen,
             music_models.AUTOPLAY_HISTORY_SIZE,
@@ -89,6 +90,7 @@ class MusicModelTests(unittest.TestCase):
             state.autoplay_candidate_pool.maxlen,
             music_models.AUTOPLAY_CANDIDATE_POOL_CAP,
         )
+        self.assertIsNone(state.autoplay_next_fetch_limit)
 
     def test_music_state_mutable_defaults_are_not_shared(self) -> None:
         first = music_models.GuildMusicState()
@@ -203,6 +205,7 @@ class MusicModelTests(unittest.TestCase):
                 "repeat_one",
                 "autoplay_enabled",
                 "autoplay_candidate_pool",
+                "autoplay_next_fetch_limit",
                 "recent_track_keys",
                 "recent_video_ids",
                 "recent_playbacks",

@@ -25,10 +25,12 @@ from music_autoplay_policy import (
     clear_autoplay_candidate_pool,
     consume_autoplay_candidate,
     get_autoplay_excluded_keys,
+    get_autoplay_recent_overlap_counts,
+    get_autoplay_recent_penalty,
+    get_autoplay_refill_candidate_count,
     get_recent_playbacks,
     get_autoplay_retry_delay,
     get_autoplay_seed,
-    reject_autoplay_candidate_pool,
     remember_autoplay_track,
     remember_recent_playback,
     remember_recent_value,
@@ -194,6 +196,7 @@ from music_search_scoring import (
     clean_track_title,
     clean_track_title_preserving_case,
     get_search_result_duration,
+    get_version_style_intents,
     get_youtube_music_artist_hint,
     get_youtube_music_artist_names,
     get_youtube_search_tokens,
@@ -201,7 +204,9 @@ from music_search_scoring import (
     is_likely_official_youtube_upload,
     normalize_artist_name,
     normalize_identity_component,
+    rank_autoplay_candidates,
     resolve_query,
+    score_autoplay_candidate,
     score_youtube_search_result,
     select_youtube_music_song_result,
     select_youtube_search_result,
@@ -228,6 +233,7 @@ from ytmusicapi.auth.oauth import OAuthCredentials
 from music_config import (
     AUTOPLAY_BUTTON_CUSTOM_ID,
     AUTOPLAY_HISTORY_TTL_SECONDS,
+    AUTOPLAY_MIN_INTERVAL_SECONDS,
     AUTOPLAY_REFILL_CANDIDATES,
     AUTOPLAY_START_DELAY_SECONDS,
     CONTROL_PANEL_HISTORY_LIMIT,
@@ -1673,7 +1679,7 @@ class MusicControlView(discord.ui.View):
                             if removed_track.requester_id is None:
                                 remember_autoplay_track(state, removed_track)
                         cancel_autoplay_refill(state)
-                        reject_autoplay_candidate_pool(state)
+                        clear_autoplay_candidate_pool(state)
                         state.skip_requested = True
                         skipped_count = len(removed_tracks) + 1
                         voice.stop()
@@ -2798,12 +2804,22 @@ async def extract_auto_tracks_from_seed(
     requester_id: int | None = None,
     *,
     job_kind: YtdlJobKind = YtdlJobKind.USER_REQUEST,
+    style_query: str | None = None,
 ) -> list[Track]:
     auto_count = clamp_auto_count(count)
     if auto_count == 1:
         return [seed_track]
 
     search_limit = get_autoplay_search_limit(auto_count, job_kind)
+    autoplay_request_kwargs = (
+        {"minimum_interval_seconds": AUTOPLAY_MIN_INTERVAL_SECONDS}
+        if job_kind == YtdlJobKind.AUTOPLAY
+        else {}
+    )
+    style_intents = set(get_version_style_intents(seed_track.title))
+    if style_query:
+        style_intents.update(get_version_style_intents(style_query))
+    frozen_style_intents = frozenset(style_intents)
 
     entries: list[dict] = []
     fallback_url = seed_track.webpage_url or seed_track.source_url
@@ -2816,12 +2832,15 @@ async def extract_auto_tracks_from_seed(
                 radio_url,
                 "YouTube radio mix",
                 job_kind=job_kind,
+                **autoplay_request_kwargs,
             )
             entries = [entry for entry in radio_info.get("entries", []) if entry]
         except Exception:
             logger.exception("Failed to extract YouTube radio mix for %s", seed_track.title)
+            if job_kind == YtdlJobKind.AUTOPLAY:
+                raise
 
-    if not entries:
+    if not entries and (job_kind != YtdlJobKind.AUTOPLAY or radio_url is None):
         search_query = f"ytsearch{search_limit}:{seed_track.title} radio mix"
         fallback_url = search_query
         info = await extract_ytdl_info(
@@ -2829,29 +2848,48 @@ async def extract_auto_tracks_from_seed(
             search_query,
             "auto fallback search",
             job_kind=job_kind,
+            **autoplay_request_kwargs,
         )
         entries = [entry for entry in info.get("entries", []) if entry]
 
-    tracks: list[Track] = []
-    seen_keys: set[str] = set()
+    entry_batches = [(entries, fallback_url)]
 
-    for track in [seed_track]:
-        seen_keys.update(get_track_identity_keys(track))
-        tracks.append(track)
-        if len(tracks) >= auto_count:
-            return tracks
+    def build_ranked_tracks(
+        batches: list[tuple[list[dict], str]],
+    ) -> tuple[list[Track], list[tuple[Track, int, int]]]:
+        tracks = [seed_track]
+        seen_keys = get_track_identity_keys(seed_track)
+        ranked_entries: list[tuple[dict, int, int, int, str]] = []
+        for batch_index, (candidate_entries, source_url) in enumerate(batches):
+            ranked_entries.extend(
+                (entry, score, source_index, batch_index, source_url)
+                for entry, score, source_index in rank_autoplay_candidates(
+                    candidate_entries,
+                    style_intents=frozen_style_intents,
+                )
+            )
+        ranked_entries.sort(
+            key=lambda candidate: (-candidate[1], candidate[3], candidate[2])
+        )
 
-    for entry in entries:
-        track = make_track_from_info(entry, requester, fallback_url, requester_id)
-        if not get_video_id(entry, track.webpage_url):
-            continue
-        identity_keys = get_track_identity_keys(track)
-        if not seen_keys.isdisjoint(identity_keys):
-            continue
-        seen_keys.update(identity_keys)
-        tracks.append(track)
-        if len(tracks) >= auto_count:
-            break
+        ranked_track_details: list[tuple[Track, int, int]] = []
+        for entry, score, source_index, _, source_url in ranked_entries:
+            track = make_track_from_info(entry, requester, source_url, requester_id)
+            if not get_video_id(entry, track.webpage_url):
+                continue
+            identity_keys = get_track_identity_keys(track)
+            if not seen_keys.isdisjoint(identity_keys):
+                continue
+            seen_keys.update(identity_keys)
+            setattr(track, "_autoplay_score", score)
+            setattr(track, "_autoplay_source_index", source_index)
+            tracks.append(track)
+            ranked_track_details.append((track, score, source_index))
+            if len(tracks) >= auto_count:
+                break
+        return tracks, ranked_track_details
+
+    tracks, ranked_track_details = build_ranked_tracks(entry_batches)
 
     if (
         job_kind != YtdlJobKind.AUTOPLAY
@@ -2865,15 +2903,25 @@ async def extract_auto_tracks_from_seed(
             "auto supplemental search",
             job_kind=job_kind,
         )
-        for entry in [entry for entry in info.get("entries", []) if entry]:
-            track = make_track_from_info(entry, requester, search_query, requester_id)
-            identity_keys = get_track_identity_keys(track)
-            if not seen_keys.isdisjoint(identity_keys):
-                continue
-            seen_keys.update(identity_keys)
-            tracks.append(track)
-            if len(tracks) >= auto_count:
-                break
+        supplemental_entries = [entry for entry in info.get("entries", []) if entry]
+        entry_batches.append((supplemental_entries, search_query))
+        tracks, ranked_track_details = build_ranked_tracks(entry_batches)
+
+    fetched_entry_count = sum(
+        len(candidate_entries) for candidate_entries, _ in entry_batches
+    )
+
+    logger.debug(
+        "Autoplay ranking for %s: styles=%s fetched=%s valid=%s top=%s",
+        seed_track.title,
+        sorted(frozen_style_intents),
+        fetched_entry_count,
+        len(ranked_track_details),
+        [
+            (track.title, score, source_index)
+            for track, score, source_index in ranked_track_details[:5]
+        ],
+    )
 
     if not tracks:
         raise ValueError(f"관련 곡을 찾지 못했어요: {seed_track.title}")
@@ -2896,6 +2944,7 @@ async def extract_auto_tracks(
         count,
         requester_id,
         job_kind=YtdlJobKind.USER_REQUEST,
+        style_query=query,
     )
 
 
@@ -2943,7 +2992,7 @@ async def refill_autoplay_queue(
     starting_track_id = state.current.track_id if state.current else None
     added_track = False
     failure_count = 0
-    candidate_count = clamp_auto_count(AUTOPLAY_REFILL_CANDIDATES)
+    successful_fetch_in_cycle = False
 
     try:
         while autoplay_can_refill(state, generation):
@@ -2952,6 +3001,12 @@ async def refill_autoplay_queue(
             hard_excluded_keys = get_track_identity_keys(seed)
             candidate: Track | None = None
             candidate_from_pool = False
+            requested_candidate_count: int | None = None
+            fetched_considered_count = 0
+            fetched_recent_count = 0
+            fetched_eligible_count: int | None = None
+            fetched_cached_count = 0
+            next_candidate_count = clamp_auto_count(AUTOPLAY_REFILL_CANDIDATES)
             deferred_refill_context: tuple[str | None, tuple[str, ...]] | None = None
             should_start = False
             async with state.lock:
@@ -2975,13 +3030,22 @@ async def refill_autoplay_queue(
                         and not voice.is_playing()
                         and not voice.is_paused()
                     )
+                elif successful_fetch_in_cycle:
+                    return
+                else:
+                    requested_candidate_count = clamp_auto_count(
+                        state.autoplay_next_fetch_limit
+                        or AUTOPLAY_REFILL_CANDIDATES
+                    )
+                    state.autoplay_next_fetch_limit = None
 
             if candidate is None:
                 try:
                     candidates = await extract_auto_tracks_from_seed(
                         seed,
                         "자동재생",
-                        candidate_count,
+                        requested_candidate_count
+                        or clamp_auto_count(AUTOPLAY_REFILL_CANDIDATES),
                         job_kind=YtdlJobKind.AUTOPLAY,
                     )
                 except asyncio.CancelledError:
@@ -3001,19 +3065,51 @@ async def refill_autoplay_queue(
                     await asyncio.sleep(retry_delay)
                     continue
 
+                successful_fetch_in_cycle = True
                 if not autoplay_can_refill(state, generation):
                     return
 
                 async with state.lock:
                     if not autoplay_can_refill(state, generation):
                         return
+                    selection_time = time.monotonic()
+                    (
+                        fetched_recent_count,
+                        fetched_considered_count,
+                    ) = get_autoplay_recent_overlap_counts(
+                        state,
+                        candidates,
+                        hard_excluded_keys,
+                        now=selection_time,
+                    )
+                    recent_penalty = get_autoplay_recent_penalty(
+                        fetched_recent_count,
+                        fetched_considered_count,
+                    )
+                    next_candidate_count = clamp_auto_count(
+                        get_autoplay_refill_candidate_count(
+                            AUTOPLAY_REFILL_CANDIDATES,
+                            fetched_recent_count,
+                            fetched_considered_count,
+                        )
+                    )
+                    base_candidate_count = clamp_auto_count(
+                        AUTOPLAY_REFILL_CANDIDATES
+                    )
+                    state.autoplay_next_fetch_limit = (
+                        next_candidate_count
+                        if next_candidate_count > base_candidate_count
+                        else None
+                    )
                     selected_candidates = select_autoplay_candidates(
                         state,
                         candidates,
                         hard_excluded_keys,
                         limit=AUTOPLAY_CANDIDATE_POOL_CAP + 1,
-                        now=time.monotonic(),
+                        recent_penalty=recent_penalty,
+                        now=selection_time,
                     )
+                    fetched_eligible_count = len(selected_candidates)
                     if selected_candidates:
                         candidate = selected_candidates[0]
                         state.queue.append(candidate)
@@ -3021,6 +3117,7 @@ async def refill_autoplay_queue(
                             state,
                             selected_candidates[1:],
                         )
+                        fetched_cached_count = len(state.autoplay_candidate_pool)
                         added_track = True
                         failure_count = 0
                         voice = state.voice
@@ -3038,6 +3135,32 @@ async def refill_autoplay_queue(
                                 state.current.track_id if state.current else None,
                                 tuple(track.track_id for track in state.queue),
                             )
+
+            if fetched_eligible_count is not None:
+                overlap_ratio = (
+                    fetched_recent_count / fetched_considered_count
+                    if fetched_considered_count
+                    else 0.0
+                )
+                logger.info(
+                    "Autoplay candidate fetch in guild %s for %s: "
+                    "requested=%s considered=%s recent=%s overlap=%.2f "
+                    "next=%s eligible=%s selected=%s score=%s quality=%s "
+                    "source_index=%s cached=%s",
+                    guild_id,
+                    seed.title,
+                    requested_candidate_count,
+                    fetched_considered_count,
+                    fetched_recent_count,
+                    overlap_ratio,
+                    next_candidate_count,
+                    fetched_eligible_count,
+                    candidate.title if candidate is not None else None,
+                    getattr(candidate, "_autoplay_selection_score", None),
+                    getattr(candidate, "_autoplay_score", None),
+                    getattr(candidate, "_autoplay_source_index", None),
+                    fetched_cached_count,
+                )
 
             if candidate is None:
                 if deferred_refill_context is not None:
@@ -3060,6 +3183,7 @@ async def refill_autoplay_queue(
                         break
                     else:
                         return
+                    successful_fetch_in_cycle = False
                     continue
                 retry_delay = get_autoplay_retry_delay(failure_count)
                 failure_count += 1
@@ -3070,19 +3194,19 @@ async def refill_autoplay_queue(
                     retry_delay,
                 )
                 await asyncio.sleep(retry_delay)
+                successful_fetch_in_cycle = False
                 continue
 
             if candidate_from_pool:
-                logger.info(
-                    "Autoplay queued cached candidate %s in guild %s",
+                logger.debug(
+                    "Autoplay queued cached candidate %s in guild %s: "
+                    "score=%s quality=%s source_index=%s cached=%s",
                     candidate.title,
                     guild_id,
-                )
-            else:
-                logger.info(
-                    "Autoplay queued %s in guild %s",
-                    candidate.title,
-                    guild_id,
+                    getattr(candidate, "_autoplay_selection_score", None),
+                    getattr(candidate, "_autoplay_score", None),
+                    getattr(candidate, "_autoplay_source_index", None),
+                    len(state.autoplay_candidate_pool),
                 )
             if state.current is not None:
                 await update_control_panel(guild_id, state)
@@ -3119,6 +3243,7 @@ async def refill_autoplay_queue(
             if (
                 not bot_shutdown_started
                 and added_track
+                and not successful_fetch_in_cycle
                 and current_track_id != starting_track_id
             ):
                 schedule_autoplay_refill(guild_id)
@@ -3904,7 +4029,7 @@ async def enqueue_tracks(
             request_was_cancelled = True
         else:
             cancel_autoplay_refill(state)
-            reject_autoplay_candidate_pool(state)
+            clear_autoplay_candidate_pool(state)
             state.queue.extend(tracks)
             queue_size = len(state.queue)
 

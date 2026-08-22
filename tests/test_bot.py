@@ -223,6 +223,79 @@ class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
             job_kind=bot.YtdlJobKind.USER_REQUEST,
         )
 
+    async def test_auto_style_intent_comes_from_seed_title_without_query_scoring(
+        self,
+    ) -> None:
+        seed = bot.Track(
+            title="Seed Song Cover",
+            webpage_url="https://example.test/seed",
+            requester="tester",
+            source_url="https://example.test/seed",
+        )
+        entries = [
+            {
+                "id": "aaaaaaaaaaa",
+                "title": "Artist A - Candidate Cover",
+                "duration": 240,
+            },
+            {
+                "id": "bbbbbbbbbbb",
+                "title": "Artist B - Plain Candidate",
+                "duration": 240,
+            },
+        ]
+
+        with patch.object(
+            bot,
+            "extract_ytdl_info",
+            new=AsyncMock(return_value={"entries": entries}),
+        ):
+            tracks = await bot.extract_auto_tracks_from_seed(
+                seed,
+                "자동재생",
+                3,
+                job_kind=bot.YtdlJobKind.AUTOPLAY,
+            )
+
+        self.assertEqual(
+            [track.title for track in tracks],
+            [
+                "Seed Song Cover",
+                "Artist A - Candidate Cover",
+                "Artist B - Plain Candidate",
+            ],
+        )
+        self.assertEqual(getattr(tracks[1], "_autoplay_score"), 60)
+
+    async def test_manual_auto_passes_original_query_as_style_context(self) -> None:
+        seed_info = {
+            "id": "abcdefghijk",
+            "title": "Seed Song",
+            "webpage_url": "https://www.youtube.com/watch?v=abcdefghijk",
+        }
+        related_tracks = [make_track("related")]
+
+        with (
+            patch.object(
+                bot,
+                "extract_first_info",
+                new=AsyncMock(return_value=seed_info),
+            ),
+            patch.object(
+                bot,
+                "extract_auto_tracks_from_seed",
+                new=AsyncMock(return_value=related_tracks),
+            ) as related,
+        ):
+            tracks = await bot.extract_auto_tracks(
+                "Seed Song cover",
+                "tester",
+                3,
+            )
+
+        self.assertIs(tracks, related_tracks)
+        self.assertEqual(related.await_args.kwargs["style_query"], "Seed Song cover")
+
     async def test_auto_supplemental_search_uses_flat_options(self) -> None:
         seed = bot.Track(
             title="Seed Song",
@@ -265,6 +338,55 @@ class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
             bot.YtdlJobKind.USER_REQUEST,
         )
 
+    async def test_auto_supplemental_reranks_before_cross_batch_dedup(
+        self,
+    ) -> None:
+        seed = bot.Track(
+            title="Seed Song",
+            webpage_url="https://www.youtube.com/watch?v=abcdefghijk",
+            requester="tester",
+            source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        )
+        radio_short = {
+            "id": "aaaaaaaaaaa",
+            "title": "Artist - Song Short Version",
+            "duration": 80,
+            "artist": "Artist",
+            "track": "Song",
+        }
+        supplemental_official = {
+            "id": "bbbbbbbbbbb",
+            "title": "Artist - Song Full Version Official MV",
+            "duration": 240,
+            "artist": "Artist",
+            "track": "Song",
+            "channel": "Artist Official",
+        }
+        supplemental_other = {
+            "id": "ccccccccccc",
+            "title": "Other Artist - Other Song",
+            "duration": 240,
+        }
+        extract = AsyncMock(
+            side_effect=[
+                {"entries": [radio_short]},
+                {"entries": [supplemental_official, supplemental_other]},
+            ]
+        )
+
+        with patch.object(bot, "extract_ytdl_info", extract):
+            tracks = await bot.extract_auto_tracks_from_seed(seed, "tester", 3)
+
+        self.assertEqual(
+            [track.title for track in tracks],
+            [
+                "Seed Song",
+                "Artist - Song Full Version Official MV",
+                "Other Artist - Other Song",
+            ],
+        )
+        self.assertEqual(extract.await_count, 2)
+
     async def test_background_autoplay_does_not_run_supplemental_search(
         self,
     ) -> None:
@@ -295,6 +417,58 @@ class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
             extract.await_args.kwargs["job_kind"],
             bot.YtdlJobKind.AUTOPLAY,
         )
+        self.assertEqual(
+            extract.await_args.kwargs["minimum_interval_seconds"],
+            bot.AUTOPLAY_MIN_INTERVAL_SECONDS,
+        )
+
+    async def test_background_autoplay_does_not_fallback_after_empty_radio(
+        self,
+    ) -> None:
+        seed = bot.Track(
+            title="Seed Song",
+            webpage_url="https://www.youtube.com/watch?v=abcdefghijk",
+            requester="tester",
+            source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        )
+        extract = AsyncMock(return_value={"entries": []})
+
+        with patch.object(bot, "extract_ytdl_info", extract):
+            tracks = await bot.extract_auto_tracks_from_seed(
+                seed,
+                "자동재생",
+                10,
+                job_kind=bot.YtdlJobKind.AUTOPLAY,
+            )
+
+        self.assertEqual(tracks, [seed])
+        extract.assert_awaited_once()
+        self.assertEqual(extract.await_args.args[2], "YouTube radio mix")
+
+    async def test_background_autoplay_does_not_fallback_after_radio_error(
+        self,
+    ) -> None:
+        seed = bot.Track(
+            title="Seed Song",
+            webpage_url="https://www.youtube.com/watch?v=abcdefghijk",
+            requester="tester",
+            source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        )
+        extract = AsyncMock(side_effect=RuntimeError("radio failed"))
+
+        with (
+            patch.object(bot, "extract_ytdl_info", extract),
+            self.assertRaisesRegex(RuntimeError, "radio failed"),
+        ):
+            await bot.extract_auto_tracks_from_seed(
+                seed,
+                "자동재생",
+                10,
+                job_kind=bot.YtdlJobKind.AUTOPLAY,
+            )
+
+        extract.assert_awaited_once()
+        self.assertEqual(extract.await_args.args[2], "YouTube radio mix")
 
     async def test_user_auto_count_is_not_limited_by_background_refill(self) -> None:
         seed = bot.Track(
@@ -362,6 +536,88 @@ class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
             "ytsearch5:Seed Song radio mix",
             "auto fallback search",
             job_kind=bot.YtdlJobKind.AUTOPLAY,
+            minimum_interval_seconds=bot.AUTOPLAY_MIN_INTERVAL_SECONDS,
+        )
+
+    async def test_manual_auto_ranks_candidates_before_returning_tracks(self) -> None:
+        seed = bot.Track(
+            title="Seed Song",
+            webpage_url="https://example.test/seed",
+            requester="tester",
+            source_url="https://example.test/seed",
+        )
+        entries = [
+            {
+                "id": "aaaaaaaaaaa",
+                "title": "Artist - Song Short Version",
+                "duration": 80,
+            },
+            {
+                "id": "bbbbbbbbbbb",
+                "title": "Artist - Song Full Version Official MV",
+                "duration": 240,
+                "channel": "Artist Official",
+            },
+            {
+                "id": "ccccccccccc",
+                "title": "Other Artist - Other Song Cover",
+                "duration": 240,
+            },
+        ]
+
+        with patch.object(
+            bot,
+            "extract_ytdl_info",
+            new=AsyncMock(return_value={"entries": entries}),
+        ):
+            tracks = await bot.extract_auto_tracks_from_seed(seed, "tester", 4)
+
+        self.assertEqual(
+            [track.title for track in tracks],
+            [
+                "Seed Song",
+                "Artist - Song Full Version Official MV",
+                "Other Artist - Other Song Cover",
+                "Artist - Song Short Version",
+            ],
+        )
+        self.assertEqual(getattr(tracks[1], "_autoplay_score"), 158)
+        self.assertEqual(getattr(tracks[1], "_autoplay_source_index"), 1)
+
+    async def test_auto_ranking_keeps_best_duplicate_before_deduplication(
+        self,
+    ) -> None:
+        seed = bot.Track(
+            title="Seed Song",
+            webpage_url="https://example.test/seed",
+            requester="tester",
+            source_url="https://example.test/seed",
+        )
+        entries = [
+            {
+                "id": "aaaaaaaaaaa",
+                "title": "Artist - Song Official Audio",
+                "duration": 240,
+                "channel": "Artist Official",
+            },
+            {
+                "id": "bbbbbbbbbbb",
+                "title": "Artist - Song Official MV",
+                "duration": 240,
+                "channel": "Artist Official",
+            },
+        ]
+
+        with patch.object(
+            bot,
+            "extract_ytdl_info",
+            new=AsyncMock(return_value={"entries": entries}),
+        ):
+            tracks = await bot.extract_auto_tracks_from_seed(seed, "tester", 3)
+
+        self.assertEqual(
+            [track.title for track in tracks],
+            ["Seed Song", "Artist - Song Official MV"],
         )
 
     async def test_playlist_request_uses_bulk_priority(self) -> None:
@@ -797,13 +1053,13 @@ class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
         extract_tracks.assert_not_awaited()
         self.assertEqual(list(state.queue), tracks)
         self.assertFalse(state.autoplay_candidate_pool)
-        self.assertIn(
+        self.assertNotIn(
             bot.normalize_track_key(pooled),
             {entry.value for entry in state.recent_track_keys},
         )
         self.assertFalse(state.recent_playbacks)
 
-    async def test_successful_manual_enqueue_cancels_refill_and_rejects_pool(
+    async def test_successful_manual_enqueue_clears_pool_without_banning_it(
         self,
     ) -> None:
         class Requester:
@@ -863,7 +1119,7 @@ class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state.autoplay_candidate_pool)
         self.assertIsNone(state.autoplay_task)
         self.assertTrue(refill_task.cancelled())
-        self.assertIn(
+        self.assertNotIn(
             bot.normalize_track_key(pooled),
             {entry.value for entry in state.recent_track_keys},
         )
@@ -3313,7 +3569,6 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             {
                 bot.normalize_track_key(first_auto),
                 bot.normalize_track_key(second_auto),
-                bot.normalize_track_key(pooled),
             },
         )
         self.assertFalse(case.state.recent_playbacks)
@@ -5387,6 +5642,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(list(state.queue), [queued, fresh])
         self.assertEqual(list(state.autoplay_candidate_pool), [recent])
+        self.assertEqual(state.autoplay_next_fetch_limit, 12)
         extract.assert_awaited_once()
         self.assertIs(extract.await_args.args[0], queued)
         self.assertEqual(
@@ -5399,6 +5655,67 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         )
         query_extract.assert_not_awaited()
         update_panel.assert_awaited_once_with(guild_id, state)
+
+    async def test_refill_uses_saved_adaptive_limit_for_only_the_next_fetch(
+        self,
+    ) -> None:
+        guild_id = 567
+        seed = make_track("seed")
+        queued = make_track("queued")
+        fresh = make_track("fresh")
+        state = bot.get_state(guild_id)
+        state.voice = self.Voice()
+        state.current = seed
+        state.queue.append(queued)
+        state.autoplay_enabled = True
+        state.autoplay_next_fetch_limit = 15
+
+        with (
+            patch.object(
+                bot,
+                "extract_auto_tracks_from_seed",
+                new=AsyncMock(return_value=[seed, queued, fresh]),
+            ) as extract,
+            patch.object(bot, "update_control_panel", new=AsyncMock()),
+        ):
+            await bot.refill_autoplay_queue(
+                guild_id,
+                state.playback_generation,
+                seed,
+            )
+
+        extract.assert_awaited_once()
+        self.assertEqual(extract.await_args.args[2], 15)
+        self.assertIsNone(state.autoplay_next_fetch_limit)
+
+    async def test_one_candidate_batch_does_not_trigger_an_immediate_second_fetch(
+        self,
+    ) -> None:
+        guild_id = 568
+        seed = make_track("seed")
+        only_candidate = make_track("only-candidate")
+        state = bot.get_state(guild_id)
+        state.voice = self.Voice()
+        state.current = seed
+        state.autoplay_enabled = True
+
+        with (
+            patch.object(
+                bot,
+                "extract_auto_tracks_from_seed",
+                new=AsyncMock(return_value=[seed, only_candidate]),
+            ) as extract,
+            patch.object(bot, "update_control_panel", new=AsyncMock()),
+        ):
+            await bot.refill_autoplay_queue(
+                guild_id,
+                state.playback_generation,
+                seed,
+            )
+
+        self.assertEqual(list(state.queue), [only_candidate])
+        self.assertFalse(state.autoplay_candidate_pool)
+        extract.assert_awaited_once()
 
     async def test_refill_reuses_oldest_recent_candidate_without_new_search(
         self,
@@ -5471,7 +5788,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         extract.assert_awaited_once()
         sleep.assert_not_awaited()
 
-    async def test_refill_does_not_backoff_behind_two_song_queue(self) -> None:
+    async def test_two_song_catalog_uses_one_fetch_per_scheduled_attempt(self) -> None:
         guild_id = 563
         first = make_track("first")
         second = make_track("second")
@@ -5489,42 +5806,30 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
                     side_effect=[
                         [first, second],
                         [second, first],
-                        [second, first],
-                        [first, second],
                     ]
                 ),
             ) as extract,
-            patch.object(bot, "AUTOPLAY_SEED_CHANGE_POLL_SECONDS", 0.0),
-            patch.object(bot, "AUTOPLAY_START_DELAY_SECONDS", 0.0),
             patch.object(bot, "update_control_panel", new=AsyncMock()),
         ):
-            refill_task, created = bot.schedule_autoplay_refill(guild_id)
+            first_task, created = bot.schedule_autoplay_refill(guild_id)
             self.assertTrue(created)
-            await asyncio.wait_for(
-                self._wait_for_refill_state(state, extract, [second], 2),
-                timeout=1,
-            )
+            await first_task
 
             self.assertEqual(list(state.queue), [second])
-            self.assertIs(state.autoplay_task, refill_task)
-            for _ in range(3):
-                await asyncio.sleep(0)
-            self.assertEqual(extract.await_count, 2)
+            self.assertEqual(extract.await_count, 1)
+            self.assertIsNone(state.autoplay_task)
 
             state.current = state.queue.popleft()
             bot.remember_autoplay_track(state, second)
-            await asyncio.wait_for(
-                self._wait_for_refill_state(state, extract, [first], 4),
-                timeout=1,
-            )
+            second_task, created = bot.schedule_autoplay_refill(guild_id)
+            self.assertTrue(created)
+            await second_task
 
             self.assertEqual(list(state.queue), [first])
-            self.assertIs(state.autoplay_task, refill_task)
-            self.assertEqual(extract.await_count, 4)
-            bot.cancel_autoplay_refill(state)
-            await asyncio.gather(refill_task, return_exceptions=True)
+            self.assertEqual(extract.await_count, 2)
+            self.assertIsNone(state.autoplay_task)
 
-    async def test_refill_recovers_when_waiting_track_is_removed(self) -> None:
+    async def test_new_refill_recovers_when_waiting_track_is_removed(self) -> None:
         guild_id = 564
         seed = make_track("seed")
         waiting = make_track("waiting")
@@ -5541,34 +5846,26 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(
                     side_effect=[
                         [seed, waiting],
-                        [waiting, seed],
                         [seed, replacement],
-                        [replacement, seed],
                     ]
                 ),
             ) as extract,
-            patch.object(bot, "AUTOPLAY_SEED_CHANGE_POLL_SECONDS", 0.0),
-            patch.object(bot, "AUTOPLAY_START_DELAY_SECONDS", 0.0),
             patch.object(bot, "update_control_panel", new=AsyncMock()),
         ):
-            refill_task, created = bot.schedule_autoplay_refill(guild_id)
+            first_task, created = bot.schedule_autoplay_refill(guild_id)
             self.assertTrue(created)
-            await asyncio.wait_for(
-                self._wait_for_refill_state(state, extract, [waiting], 2),
-                timeout=1,
-            )
+            await first_task
 
             self.assertEqual(list(state.queue), [waiting])
+            self.assertEqual(extract.await_count, 1)
             state.queue.clear()
-            await asyncio.wait_for(
-                self._wait_for_refill_state(state, extract, [replacement], 4),
-                timeout=1,
-            )
+            second_task, created = bot.schedule_autoplay_refill(guild_id)
+            self.assertTrue(created)
+            await second_task
 
             self.assertEqual(list(state.queue), [replacement])
-            self.assertIs(state.autoplay_task, refill_task)
-            bot.cancel_autoplay_refill(state)
-            await asyncio.gather(refill_task, return_exceptions=True)
+            self.assertEqual(extract.await_count, 2)
+            self.assertIsNone(state.autoplay_task)
 
     async def test_refill_reselects_from_same_candidates_after_lock_race(
         self,
@@ -5676,6 +5973,57 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(extract.await_args_list[1].args[0], spare_two)
         self.assertEqual(update_panel.await_count, 5)
 
+    async def test_refill_keeps_five_cached_after_filling_empty_queue(self) -> None:
+        guild_id = 566
+        seed = make_track("seed")
+        candidates = [make_track(f"candidate-{index}") for index in range(7)]
+        setattr(candidates[0], "_autoplay_score", 123)
+        setattr(candidates[0], "_autoplay_source_index", 4)
+        state = bot.get_state(guild_id)
+        state.voice = self.Voice()
+        state.current = seed
+        state.autoplay_enabled = True
+
+        with (
+            patch.object(
+                bot,
+                "extract_auto_tracks_from_seed",
+                new=AsyncMock(return_value=[seed, *candidates]),
+            ) as extract,
+            patch.object(bot, "update_control_panel", new=AsyncMock()) as update_panel,
+            patch.object(bot.logger, "info") as info,
+        ):
+            await bot.refill_autoplay_queue(
+                guild_id,
+                state.playback_generation,
+                seed,
+            )
+
+        self.assertEqual(list(state.queue), candidates[:2])
+        self.assertEqual(list(state.autoplay_candidate_pool), candidates[2:])
+        self.assertEqual(len(state.autoplay_candidate_pool), 5)
+        extract.assert_awaited_once()
+        self.assertEqual(update_panel.await_count, 2)
+        info.assert_called_once_with(
+            "Autoplay candidate fetch in guild %s for %s: "
+            "requested=%s considered=%s recent=%s overlap=%.2f "
+            "next=%s eligible=%s selected=%s score=%s quality=%s "
+            "source_index=%s cached=%s",
+            guild_id,
+            seed.title,
+            bot.AUTOPLAY_REFILL_CANDIDATES,
+            7,
+            0,
+            0.0,
+            bot.AUTOPLAY_REFILL_CANDIDATES,
+            7,
+            candidates[0].title,
+            123,
+            123,
+            4,
+            6,
+        )
+
     async def test_refill_restarts_playback_if_track_ends_during_search(self) -> None:
         guild_id = 556
         seed = make_track("seed")
@@ -5699,16 +6047,17 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
                 bot,
                 "extract_auto_tracks_from_seed",
                 side_effect=finish_current_during_search,
-            ),
+            ) as extract,
             patch.object(bot, "schedule_play_next") as schedule_next,
         ):
-            await bot.refill_autoplay_queue(
-                guild_id,
-                state.playback_generation,
-                seed,
-            )
+            refill_task, created = bot.schedule_autoplay_refill(guild_id)
+            self.assertTrue(created)
+            await refill_task
+            await asyncio.sleep(0)
 
         self.assertEqual(list(state.queue), [fresh])
+        extract.assert_awaited_once()
+        self.assertIsNone(state.autoplay_task)
         schedule_next.assert_called_once_with(guild_id)
 
     async def test_refill_retries_after_a_search_failure(self) -> None:
@@ -5721,6 +6070,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         state.current = seed
         state.queue.append(queued)
         state.autoplay_enabled = True
+        state.autoplay_next_fetch_limit = 15
 
         with (
             patch.object(
@@ -5739,6 +6089,10 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(list(state.queue), [queued, fresh])
         self.assertEqual(extract.await_count, 2)
+        self.assertEqual(
+            [await_call.args[2] for await_call in extract.await_args_list],
+            [15, bot.AUTOPLAY_REFILL_CANDIDATES],
+        )
         sleep.assert_awaited_once_with(bot.AUTOPLAY_RETRY_DELAYS_SECONDS[0])
 
     async def test_refill_resets_retry_delay_after_successful_append(self) -> None:
@@ -5772,8 +6126,15 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
                 state.playback_generation,
                 seed,
             )
+            state.current = state.queue.popleft()
+            bot.remember_autoplay_track(state, first)
+            await bot.refill_autoplay_queue(
+                guild_id,
+                state.playback_generation,
+                first,
+            )
 
-        self.assertEqual(list(state.queue), [first, second])
+        self.assertEqual(list(state.queue), [second])
         self.assertEqual(extract.await_count, 4)
         self.assertEqual(
             [await_call.args[0] for await_call in sleep.await_args_list],

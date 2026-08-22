@@ -95,7 +95,7 @@ FULL_VERSION_SEARCH_RE = re.compile(
     flags=re.IGNORECASE,
 )
 SHORT_VERSION_SEARCH_RE = re.compile(
-    r"\b(?:short(?:\s*ver(?:sion)?)?|tv\s*(?:size|ver(?:sion)?)"
+    r"\b(?:short(?:s|\s*ver(?:sion)?)?|tv\s*(?:size|ver(?:sion)?)"
     r"|anime\s*(?:size|ver(?:sion)?)|game\s*(?:size|ver(?:sion)?)"
     r"|preview|teaser|sample|one\s*chorus|1\s*chorus)\b"
     r"|ショート(?:ver\.?)?|TVサイズ|テレビサイズ|アニメサイズ"
@@ -111,13 +111,49 @@ GAME_VIDEO_SEARCH_RE = re.compile(
     r"|오프닝\s*영상|엔딩\s*영상|게임\s*(?:MV|영상)|플레이\s*영상",
     flags=re.IGNORECASE,
 )
-ALTERNATE_VERSION_SEARCH_RE = re.compile(
-    r"\b(?:cover|remix|live|instrumental|karaoke|acoustic|sped\s*up"
+COVER_VERSION_SEARCH_RE = re.compile(
+    r"\bcover\b(?=\s*(?:ver(?:sion)?\b\.?|by\b|official\b"
+    r"|feat(?:uring)?\b\.?|ft\b\.?|lyrics?\b"
+    r"|music\b|video\b|live\b|remix\b|acoustic\b|m\s*/?\s*v\b"
+    r"|[)\]}>】」』）!！?？:：,，/|_-]|$))"
+    r"|カバー|歌ってみた|커버",
+    flags=re.IGNORECASE,
+)
+RECORDED_LIVE_VERSION_SEARCH_RE = re.compile(
+    r"(?<!\bto\s)(?<!\blong\s)\blive\b"
+    r"(?=\s*(?:ver(?:sion)?\b\.?|at\b|in\b|from\b|recording\b"
+    r"|recorded\b|performance\b|session\b|concert\b|clip\b"
+    r"|video\b|official\b|music\b|@"
+    r"|cover\b|remix\b|acoustic\b|m\s*/?\s*v\b|(?:19|20)\d{2}\b"
+    r"|[)\]}>】」』）!！?？:：,，/|_-]|$))"
+    r"|ライブ|라이브",
+    flags=re.IGNORECASE,
+)
+NAMED_ALTERNATE_VERSION_SEARCH_RE = re.compile(
+    r"\b(?:remix|instrumental|karaoke|acoustic|sped\s*up"
     r"|off\s*vocal|slowed(?:\s*down)?|nightcore|solo)\b"
-    r"|ver(?:sion)?\.?(?=\s|[)\]}>】」』）]|$)"
-    r"|カバー|歌ってみた|リミックス|ライブ|インスト|カラオケ"
-    r"|オフボーカル|アコースティック|ソロ"
-    r"|커버|리믹스|라이브|연주|노래방|오프\s*보컬|솔로",
+    r"|リミックス|インスト|カラオケ|オフボーカル|アコースティック|ソロ"
+    r"|리믹스|연주|노래방|오프\s*보컬|솔로",
+    flags=re.IGNORECASE,
+)
+GENERIC_VERSION_SEARCH_RE = re.compile(
+    r"(?<![A-Za-z0-9])ver(?:sion)?\.?(?=\s|[)\]}>】」』）]|$)",
+    flags=re.IGNORECASE,
+)
+OTHER_ALTERNATE_VERSION_SEARCH_RE = re.compile(
+    f"(?:{NAMED_ALTERNATE_VERSION_SEARCH_RE.pattern})"
+    f"|(?:{GENERIC_VERSION_SEARCH_RE.pattern})",
+    flags=re.IGNORECASE,
+)
+ALTERNATE_VERSION_SEARCH_RE = re.compile(
+    "|".join(
+        f"(?:{pattern.pattern})"
+        for pattern in (
+            COVER_VERSION_SEARCH_RE,
+            RECORDED_LIVE_VERSION_SEARCH_RE,
+            OTHER_ALTERNATE_VERSION_SEARCH_RE,
+        )
+    ),
     flags=re.IGNORECASE,
 )
 LONG_FORM_SEARCH_RE = re.compile(
@@ -174,6 +210,19 @@ def should_use_youtube_music_search(query: str) -> bool:
             LONG_FORM_SEARCH_RE,
         )
     )
+
+
+def get_version_style_intents(value: str) -> frozenset[str]:
+    parsed = urllib.parse.urlparse(value.strip())
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return frozenset()
+
+    intents: set[str] = set()
+    if COVER_VERSION_SEARCH_RE.search(value):
+        intents.add("cover")
+    if RECORDED_LIVE_VERSION_SEARCH_RE.search(value):
+        intents.add("live")
+    return frozenset(intents)
 
 
 def get_youtube_music_artist_names(result: dict) -> list[str]:
@@ -399,7 +448,15 @@ def score_youtube_search_result(
 
     query_requests_short = bool(SHORT_VERSION_SEARCH_RE.search(query))
     query_requests_game_video = bool(GAME_VIDEO_SEARCH_RE.search(query))
-    query_requests_alternate = bool(ALTERNATE_VERSION_SEARCH_RE.search(query))
+    query_style_intents = get_version_style_intents(query)
+    query_requests_other_alternate = bool(
+        NAMED_ALTERNATE_VERSION_SEARCH_RE.search(query)
+        or (
+            GENERIC_VERSION_SEARCH_RE.search(query)
+            and not query_style_intents
+            and not FULL_VERSION_SEARCH_RE.search(query)
+        )
+    )
     query_requests_long_form = bool(LONG_FORM_SEARCH_RE.search(query))
     query_requests_official_video = bool(OFFICIAL_VIDEO_SEARCH_RE.search(query))
     query_requests_official_audio = bool(OFFICIAL_AUDIO_SEARCH_RE.search(query))
@@ -436,11 +493,25 @@ def score_youtube_search_result(
             score -= 70
         else:
             score -= 20
-    if (
-        ALTERNATE_VERSION_SEARCH_RE.search(searchable)
+    candidate_has_cover = bool(COVER_VERSION_SEARCH_RE.search(title))
+    candidate_has_recorded_live = bool(
+        RECORDED_LIVE_VERSION_SEARCH_RE.search(title)
+    )
+    if candidate_has_cover:
+        score += 0 if "cover" in query_style_intents else -80
+    if candidate_has_recorded_live:
+        score += 0 if "live" in query_style_intents else -80
+    candidate_has_named_alternate = bool(
+        NAMED_ALTERNATE_VERSION_SEARCH_RE.search(searchable)
+    )
+    candidate_has_generic_version = bool(
+        GENERIC_VERSION_SEARCH_RE.search(searchable)
         and not FULL_VERSION_SEARCH_RE.search(searchable)
-    ):
-        score += 40 if query_requests_alternate else -45
+        and not candidate_has_cover
+        and not candidate_has_recorded_live
+    )
+    if candidate_has_named_alternate or candidate_has_generic_version:
+        score += 40 if query_requests_other_alternate else -45
     if LONG_FORM_SEARCH_RE.search(searchable):
         score += 40 if query_requests_long_form else -80
     if OFFICIAL_MEDIA_SEARCH_RE.search(searchable) and (
@@ -482,13 +553,63 @@ def score_youtube_search_result(
         ):
             score += 25
 
-    if entry.get("is_live") or entry.get("live_status") in {
-        "is_live",
-        "is_upcoming",
-        "post_live",
-    }:
+    if (
+        entry.get("is_live")
+        or entry.get("is_upcoming")
+        or entry.get("live_status") in {"is_live", "is_upcoming", "post_live"}
+    ):
         score -= 200
     return score
+
+
+def score_autoplay_candidate(
+    entry: dict,
+    result_index: int,
+    *,
+    style_intents: frozenset[str] = frozenset(),
+) -> int:
+    score = score_youtube_search_result(entry, "", result_index)
+    title = str(entry.get("title") or "")
+    if "cover" in style_intents and COVER_VERSION_SEARCH_RE.search(title):
+        score += 80
+    if (
+        "live" in style_intents
+        and RECORDED_LIVE_VERSION_SEARCH_RE.search(title)
+    ):
+        score += 80
+    searchable = " ".join(
+        str(entry.get(key) or "")
+        for key in ("title", "artist", "creator", "channel", "uploader")
+    )
+    duration = get_search_result_duration(entry)
+    if (
+        OFFICIAL_MEDIA_SEARCH_RE.search(searchable)
+        and duration is not None
+        and not 150 <= duration <= 600
+    ):
+        score += 8
+    return score
+
+
+def rank_autoplay_candidates(
+    entries: list[dict],
+    *,
+    style_intents: frozenset[str] = frozenset(),
+) -> list[tuple[dict, int, int]]:
+    ranked = [
+        (
+            entry,
+            score_autoplay_candidate(
+                entry,
+                result_index,
+                style_intents=style_intents,
+            ),
+            result_index,
+        )
+        for result_index, entry in enumerate(entries)
+    ]
+    ranked.sort(key=lambda candidate: (-candidate[1], candidate[2]))
+    return ranked
 
 
 def select_youtube_music_song_result(query: str, results: list[dict]) -> dict | None:
