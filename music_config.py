@@ -118,6 +118,14 @@ QUEUE_DELETE_RESPONSE_DELETE_SECONDS = parse_positive_int_env(
 )
 DEFAULT_AUTO_TRACKS = parse_positive_int_env("DEFAULT_AUTO_TRACKS", 8)
 MAX_AUTO_TRACKS = parse_positive_int_env("MAX_AUTO_TRACKS", 25)
+AUTOPLAY_LOG_ENABLED = os.getenv("AUTOPLAY_LOG_ENABLED", "true").lower() not in {
+    "0", "false", "no", "off",
+}
+AUTOPLAY_LOG_FILE = resolve_project_path(
+    os.getenv("AUTOPLAY_LOG_FILE", "logs/autoplay.jsonl")
+)
+AUTOPLAY_LOG_MAX_BYTES = parse_positive_int_env("AUTOPLAY_LOG_MAX_BYTES", 5 * 1024 * 1024)
+AUTOPLAY_LOG_BACKUP_COUNT = parse_positive_int_env("AUTOPLAY_LOG_BACKUP_COUNT", 3)
 AUTOPLAY_HISTORY_TTL_SECONDS = parse_positive_int_env(
     "AUTOPLAY_HISTORY_TTL_SECONDS", 12 * 60 * 60
 )

@@ -83,6 +83,7 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             imported_modules,
             {
                 "__future__",
+                "music_autoplay_logging",
                 "music_config",
                 "music_models",
                 "music_track_metadata",
@@ -704,7 +705,7 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             20,
         )
 
-    def test_quality_can_outweigh_recent_penalty_without_relaxing_hard_keys(
+    def test_freshness_outweighs_quality_without_relaxing_hard_keys(
         self,
     ) -> None:
         recent_official = make_track("official", video_id="aaaaaaaaaaa")
@@ -726,7 +727,7 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             now=1.0,
         )
 
-        self.assertEqual(selected, [recent_official, fresh_cover])
+        self.assertEqual(selected, [fresh_cover, recent_official])
         self.assertEqual(
             getattr(recent_official, "_autoplay_selection_score"),
             81,
@@ -745,6 +746,45 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             )
         )
 
+    def test_scored_selection_orders_fresh_quality_then_recent_age(self) -> None:
+        fresh_low = make_track("fresh low", video_id="aaaaaaaaaaa")
+        fresh_high = make_track("fresh high", video_id="bbbbbbbbbbb")
+        older = make_track("older", video_id="ccccccccccc")
+        newer = make_track("newer", video_id="ddddddddddd")
+        state = GuildMusicState()
+        music_autoplay_policy.remember_autoplay_track(state, older, now=0.0)
+        music_autoplay_policy.remember_autoplay_track(state, newer, now=10.0)
+        for track, score in ((fresh_low, -100), (fresh_high, 20),
+                             (older, -200), (newer, 1000)):
+            setattr(track, "_autoplay_score", score)
+
+        for penalty in (10, 40, 80):
+            for candidates in ([newer, fresh_low, older, fresh_high],
+                               [fresh_high, older, fresh_low, newer]):
+                with self.subTest(penalty=penalty, order=candidates):
+                    selected = music_autoplay_policy.select_autoplay_candidates(
+                        state, candidates, limit=4,
+                        recent_penalty=penalty, now=20.0,
+                    )
+                    self.assertEqual(selected, [fresh_high, fresh_low, older, newer])
+
+    def test_scored_recent_fallback_uses_latest_matching_identity(self) -> None:
+        replayed = make_track("original title", video_id="aaaaaaaaaaa")
+        alias = make_track("renamed title", video_id="aaaaaaaaaaa")
+        older = make_track("older", video_id="bbbbbbbbbbb")
+        state = GuildMusicState()
+        music_autoplay_policy.remember_autoplay_track(state, replayed, now=0.0)
+        music_autoplay_policy.remember_autoplay_track(state, older, now=10.0)
+        music_autoplay_policy.remember_autoplay_track(state, alias, now=20.0)
+        setattr(replayed, "_autoplay_score", 1000)
+        setattr(older, "_autoplay_score", -100)
+
+        selected = music_autoplay_policy.select_autoplay_candidate(
+            state, [replayed, older], allow_recent_fallback=True,
+            recent_penalty=10, now=30.0,
+        )
+        self.assertIs(selected, older)
+
     def test_candidate_pool_replace_caps_in_order_and_clear_empties(self) -> None:
         state = GuildMusicState()
         candidates = [make_track(f"candidate {index}") for index in range(8)]
@@ -760,7 +800,7 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
         self.assertFalse(state.autoplay_candidate_pool)
         self.assertIsNone(state.autoplay_next_fetch_limit)
 
-    def test_consume_pool_preserves_score_aware_recent_order(self) -> None:
+    def test_consume_pool_prefers_fresh_over_higher_quality_recent(self) -> None:
         recent_official = make_track("official", video_id="aaaaaaaaaaa")
         fresh_cover = make_track("cover", video_id="bbbbbbbbbbb")
         state = GuildMusicState()
@@ -783,8 +823,8 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             now=1.0,
         )
 
-        self.assertIs(selected, recent_official)
-        self.assertEqual(list(state.autoplay_candidate_pool), [fresh_cover])
+        self.assertIs(selected, fresh_cover)
+        self.assertEqual(list(state.autoplay_candidate_pool), [recent_official])
 
     def test_consume_pool_revalidates_hard_exclusions_and_prefers_fresh(
         self,
@@ -809,7 +849,7 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
         self.assertIs(selected, fresh)
         self.assertEqual(list(state.autoplay_candidate_pool), [recent])
 
-    def test_consume_pool_falls_back_to_oldest_recent_candidate(self) -> None:
+    def test_consume_recent_only_pool_requires_new_search(self) -> None:
         recent_old = make_track("recent old", video_id="aaaaaaaaaaa")
         recent_new = make_track("recent new", video_id="bbbbbbbbbbb")
         state = GuildMusicState()
@@ -825,8 +865,8 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             now=20.0,
         )
 
-        self.assertIs(selected, recent_old)
-        self.assertEqual(list(state.autoplay_candidate_pool), [recent_new])
+        self.assertIsNone(selected)
+        self.assertEqual(list(state.autoplay_candidate_pool), [recent_new, recent_old])
 
     def test_autoplay_seed_prefers_queue_tail_then_current(self) -> None:
         current = make_track("current")

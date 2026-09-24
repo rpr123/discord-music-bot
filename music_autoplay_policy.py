@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from typing import Deque
 
+from music_autoplay_logging import describe_autoplay_track, log_autoplay_event
 from music_config import AUTOPLAY_HISTORY_TTL_SECONDS
 from music_models import (
     AUTOPLAY_CANDIDATE_POOL_CAP,
@@ -227,8 +228,7 @@ def select_autoplay_candidate(
     oldest_recent_expiry: float | None = None
     best_scored_candidate: Track | None = None
     best_selection_score: int | None = None
-    best_is_fresh = False
-    best_recent_expiry: float | None = None
+    best_selection_rank: tuple[bool, float, int] | None = None
     for candidate in candidates:
         identity_keys = get_track_identity_keys(candidate)
         if not identity_keys.isdisjoint(hard_excluded_keys):
@@ -246,28 +246,17 @@ def select_autoplay_candidate(
                 continue
             quality_score = int(getattr(candidate, "_autoplay_score", 0))
             selection_score = quality_score - (0 if is_fresh else recent_penalty)
-            replace_best = (
-                best_selection_score is None
-                or selection_score > best_selection_score
+            # Prefer fresh tracks; only fall back to the oldest recent track.
+            # Quality breaks ties within those groups, never across them.
+            selection_rank = (
+                is_fresh,
+                -candidate_expiry if candidate_expiry is not None else 0.0,
+                selection_score,
             )
-            if selection_score == best_selection_score:
-                if is_fresh and not best_is_fresh:
-                    replace_best = True
-                elif (
-                    not is_fresh
-                    and not best_is_fresh
-                    and candidate_expiry is not None
-                    and (
-                        best_recent_expiry is None
-                        or candidate_expiry < best_recent_expiry
-                    )
-                ):
-                    replace_best = True
-            if replace_best:
+            if best_selection_rank is None or selection_rank > best_selection_rank:
                 best_scored_candidate = candidate
                 best_selection_score = selection_score
-                best_is_fresh = is_fresh
-                best_recent_expiry = candidate_expiry
+                best_selection_rank = selection_rank
             continue
 
         if is_fresh:
@@ -369,7 +358,8 @@ def consume_autoplay_candidate(
         state,
         usable_candidates,
         extra_excluded_keys,
-        allow_recent_fallback=True,
+        # Search again before reusing recent-only cached candidates.
+        allow_recent_fallback=False,
         recent_penalty=recent_penalty,
         now=current_time,
     )
@@ -407,3 +397,55 @@ def autoplay_can_refill(state: GuildMusicState, generation: int) -> bool:
 def get_autoplay_retry_delay(failure_count: int) -> int:
     index = min(max(0, failure_count), len(AUTOPLAY_RETRY_DELAYS_SECONDS) - 1)
     return AUTOPLAY_RETRY_DELAYS_SECONDS[index]
+
+
+def log_autoplay_selection(
+    state: GuildMusicState,
+    candidates: list[Track],
+    selected: list[Track],
+    *,
+    guild_id: int,
+    seed: Track,
+    source: str,
+    recent_penalty: int | None,
+    now: float,
+) -> None:
+    recent = _get_recent_expiry_by_key(state, now)
+    hard_keys = _get_active_track_keys(state) | get_track_identity_keys(seed)
+    selected_ranks = {track.track_id: index for index, track in enumerate(selected)}
+    records = []
+    for track in candidates:
+        keys = get_track_identity_keys(track)
+        expiries = [recent[key] for key in keys if key in recent]
+        hard_excluded = not keys.isdisjoint(hard_keys)
+        rank = selected_ranks.get(track.track_id)
+        penalty = recent_penalty
+        if penalty is None:
+            penalty = getattr(track, "_autoplay_recent_penalty", None)
+        applied_penalty = (penalty or 0) if expiries else 0
+        quality = getattr(track, "_autoplay_score", None)
+        records.append({
+            **describe_autoplay_track(track),
+            "video_id": get_track_video_id(track),
+            "identity_keys": sorted(keys),
+            "hard_excluded": hard_excluded,
+            "is_recent": bool(expiries),
+            "seconds_since_last_play": (
+                round(now - (max(expiries) - AUTOPLAY_HISTORY_TTL_SECONDS), 3)
+                if expiries else None
+            ),
+            "recent_penalty": applied_penalty,
+            "selection_score": quality - applied_penalty if quality is not None else None,
+            "selected_rank": rank,
+            "status": (
+                "queued" if rank == 0 else "cached" if rank is not None
+                else "hard_excluded" if hard_excluded
+                else "recent_requires_search" if source == "cache" and expiries
+                else "not_selected"
+            ),
+        })
+    log_autoplay_event(
+        "selection", guild_id=guild_id, source=source,
+        seed=describe_autoplay_track(seed), candidates=records,
+        selection_rule="fresh_first_then_oldest_recent_then_quality",
+    )

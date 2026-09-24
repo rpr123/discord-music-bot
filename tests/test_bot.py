@@ -5717,7 +5717,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state.autoplay_candidate_pool)
         extract.assert_awaited_once()
 
-    async def test_refill_reuses_oldest_recent_candidate_without_new_search(
+    async def test_refill_searches_before_reusing_recent_only_pool(
         self,
     ) -> None:
         guild_id = 560
@@ -5725,6 +5725,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         queued = make_track("queued")
         older = make_track("older")
         newer = make_track("newer")
+        fresh = make_track("fresh")
         state = bot.get_state(guild_id)
         state.voice = self.Voice()
         state.current = seed
@@ -5739,7 +5740,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 bot,
                 "extract_auto_tracks_from_seed",
-                new=AsyncMock(),
+                new=AsyncMock(return_value=[queued, newer, older, fresh]),
             ) as extract,
             patch.object(bot.asyncio, "sleep", new=AsyncMock()) as sleep,
             patch.object(bot, "update_control_panel", new=AsyncMock()) as update_panel,
@@ -5750,9 +5751,14 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
                 seed,
             )
 
-        self.assertEqual(list(state.queue), [queued, older])
-        self.assertEqual(list(state.autoplay_candidate_pool), [newer])
-        extract.assert_not_awaited()
+        self.assertEqual(list(state.queue), [queued, fresh])
+        self.assertEqual(list(state.autoplay_candidate_pool), [older, newer])
+        extract.assert_awaited_once_with(
+            queued,
+            "자동재생",
+            bot.AUTOPLAY_REFILL_CANDIDATES,
+            job_kind=bot.YtdlJobKind.AUTOPLAY,
+        )
         sleep.assert_not_awaited()
         update_panel.assert_awaited_once_with(guild_id, state)
 

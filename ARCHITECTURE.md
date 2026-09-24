@@ -35,6 +35,7 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 | `music_ytdl.py` | yt-dlp cache·rate limit·circuit breaker, priority job scheduling, timeout·cancellation과 subprocess 정리 |
 | `ytdl_worker.py` | 격리 subprocess에서 `yt_dlp.YoutubeDL.extract_info`를 실행하고 JSON 결과 또는 오류 반환 |
 | `music_autoplay_policy.py` | 최근곡 TTL/history, current·queue·recent 중복 제외, 후보 선택·pool 관리, seed·refill·retry 정책 |
+| `music_autoplay_logging.py` | 검색·선택 JSONL 기록, 용량 제한 순환 파일과 공개 곡 메타데이터 요약 |
 | `music_lyrics_sources.py` | LRCLIB 조회·선택과 YouTube 수동 subtitle 후보 선택·다운로드·JSON3/VTT 파싱 |
 | `music_namuwiki_parsing.py` | 나무마크·HTML table 파싱과 원문·독음·번역 행 추출 |
 | `music_namuwiki.py` | 나무위키 문서 후보·아티스트 일치·override, API/HTML/preview 조회와 최종 가사 선택 |

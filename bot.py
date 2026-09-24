@@ -10,6 +10,7 @@ import shutil
 import threading
 import time
 import unicodedata
+import uuid
 from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Callable, Coroutine, TypeVar
@@ -18,6 +19,7 @@ import discord
 import requests
 from discord import app_commands
 from discord.ext import commands
+from music_autoplay_logging import describe_autoplay_track, log_autoplay_event
 from music_autoplay_policy import (
     AUTOPLAY_QUEUE_TARGET,
     AUTOPLAY_RETRY_DELAYS_SECONDS,
@@ -31,6 +33,7 @@ from music_autoplay_policy import (
     get_recent_playbacks,
     get_autoplay_retry_delay,
     get_autoplay_seed,
+    log_autoplay_selection,
     remember_autoplay_track,
     remember_recent_playback,
     remember_recent_value,
@@ -2810,6 +2813,8 @@ async def extract_auto_tracks_from_seed(
     if auto_count == 1:
         return [seed_track]
 
+    search_id = uuid.uuid4().hex
+    search_candidates: list[dict] = []
     search_limit = get_autoplay_search_limit(auto_count, job_kind)
     autoplay_request_kwargs = (
         {"minimum_interval_seconds": AUTOPLAY_MIN_INTERVAL_SECONDS}
@@ -2857,6 +2862,7 @@ async def extract_auto_tracks_from_seed(
     def build_ranked_tracks(
         batches: list[tuple[list[dict], str]],
     ) -> tuple[list[Track], list[tuple[Track, int, int]]]:
+        search_candidates.clear()
         tracks = [seed_track]
         seen_keys = get_track_identity_keys(seed_track)
         ranked_entries: list[tuple[dict, int, int, int, str]] = []
@@ -2873,20 +2879,40 @@ async def extract_auto_tracks_from_seed(
         )
 
         ranked_track_details: list[tuple[Track, int, int]] = []
-        for entry, score, source_index, _, source_url in ranked_entries:
+        for entry, score, source_index, batch_index, source_url in ranked_entries:
             track = make_track_from_info(entry, requester, source_url, requester_id)
-            if not get_video_id(entry, track.webpage_url):
-                continue
+            video_id = get_video_id(entry, track.webpage_url)
+            record = {
+                "batch_index": batch_index,
+                "source_index": source_index,
+                "video_id": video_id,
+                "title": track.title,
+                "quality_score": score,
+                "scoring_input": {
+                    key: entry.get(key) for key in (
+                        "title", "artist", "creator", "channel", "uploader",
+                        "duration", "is_live", "is_upcoming", "live_status",
+                    )
+                },
+            }
+            search_candidates.append(record)
             identity_keys = get_track_identity_keys(track)
+            if not video_id:
+                record["status"] = "invalid_video_id"
+                continue
             if not seen_keys.isdisjoint(identity_keys):
+                record["status"] = "seed_or_duplicate"
+                continue
+            if len(tracks) >= auto_count:
+                record["status"] = "candidate_limit"
                 continue
             seen_keys.update(identity_keys)
             setattr(track, "_autoplay_score", score)
             setattr(track, "_autoplay_source_index", source_index)
+            setattr(track, "_autoplay_search_id", search_id)
+            record.update(status="candidate", track_id=track.track_id)
             tracks.append(track)
             ranked_track_details.append((track, score, source_index))
-            if len(tracks) >= auto_count:
-                break
         return tracks, ranked_track_details
 
     tracks, ranked_track_details = build_ranked_tracks(entry_batches)
@@ -2909,6 +2935,17 @@ async def extract_auto_tracks_from_seed(
 
     fetched_entry_count = sum(
         len(candidate_entries) for candidate_entries, _ in entry_batches
+    )
+
+    log_autoplay_event(
+        "search_results",
+        search_id=search_id,
+        job_kind=job_kind.name,
+        seed=describe_autoplay_track(seed_track),
+        requested_count=auto_count,
+        sources=[source for _, source in entry_batches],
+        style_intents=sorted(frozen_style_intents),
+        candidates=search_candidates,
     )
 
     logger.debug(
@@ -3012,11 +3049,18 @@ async def refill_autoplay_queue(
             async with state.lock:
                 if not autoplay_can_refill(state, generation):
                     return
+                cached_candidates = list(state.autoplay_candidate_pool)
                 candidate = consume_autoplay_candidate(
                     state,
                     hard_excluded_keys,
                     now=time.monotonic(),
                 )
+                if cached_candidates:
+                    log_autoplay_selection(
+                        state, cached_candidates, [candidate] if candidate else [],
+                        guild_id=guild_id, seed=seed, source="cache",
+                        recent_penalty=None, now=time.monotonic(),
+                    )
                 if candidate is not None:
                     candidate_from_pool = True
                     state.queue.append(candidate)
@@ -3055,6 +3099,12 @@ async def refill_autoplay_queue(
                     failure_count += 1
                     if isinstance(exc, YouTubeCircuitOpenError):
                         retry_delay = max(retry_delay, exc.retry_after_seconds)
+                    log_autoplay_event(
+                        "search_failed", guild_id=guild_id,
+                        seed=describe_autoplay_track(seed),
+                        error_type=type(exc).__name__,
+                        retry_delay_seconds=retry_delay,
+                    )
                     logger.warning(
                         "Autoplay search failed in guild %s; "
                         "retrying in %s seconds: %s",
@@ -3108,6 +3158,11 @@ async def refill_autoplay_queue(
                         limit=AUTOPLAY_CANDIDATE_POOL_CAP + 1,
                         recent_penalty=recent_penalty,
                         now=selection_time,
+                    )
+                    log_autoplay_selection(
+                        state, candidates, selected_candidates,
+                        guild_id=guild_id, seed=seed, source="search",
+                        recent_penalty=recent_penalty, now=selection_time,
                     )
                     fetched_eligible_count = len(selected_candidates)
                     if selected_candidates:
