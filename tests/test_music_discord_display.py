@@ -19,7 +19,6 @@ MOVED_NAMES = (
     "delete_interaction_response_later",
     "delete_message_later",
     "delete_music_request_message",
-    "delete_private_interaction_message",
     "describe_queue_selection",
     "format_duration",
     "is_silent_music_channel",
@@ -28,7 +27,6 @@ MOVED_NAMES = (
     "make_idle_player_embed",
     "make_lyrics_embed",
     "make_lyrics_file",
-    "make_lyrics_variant_embed",
     "make_player_embed",
     "make_queue_embed",
     "make_queue_line",
@@ -281,29 +279,18 @@ class MusicDiscordDisplayTests(unittest.TestCase):
         self.assertTrue(all(len(field.value) <= 1024 for field in full.fields))
         self.assertLessEqual(len(full), 6000)
 
-    def test_original_and_variant_embeds_preserve_metadata(self) -> None:
+    def test_original_lyrics_embed_preserves_metadata(self) -> None:
         track = make_lyrics_track()
 
         original = music_discord_display.make_lyrics_embed(
             track,
             "original lyrics",
         )
-        variant = music_discord_display.make_lyrics_variant_embed(
-            track,
-            "나무위키 가사",
-            "variant lyrics",
-            "NamuWiki",
-            "https://namu.wiki/w/example",
-        )
 
         self.assertEqual(original.title, "가사 · Song title")
         self.assertEqual(original.description, "original lyrics")
         self.assertEqual(original.author.name, "Artist")
         self.assertEqual(original.footer.text, "LRCLIB · 원문 가사")
-        self.assertEqual(variant.title, "나무위키 가사 · Song title")
-        self.assertEqual(variant.description, "variant lyrics")
-        self.assertEqual(variant.url, "https://namu.wiki/w/example")
-        self.assertEqual(variant.footer.text, "NamuWiki")
 
     def test_lyrics_file_contains_full_utf8_text(self) -> None:
         lyrics = "첫 줄\n第二行"

@@ -15,8 +15,7 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 - `music_track_metadata` → `music_models`, `music_search_scoring`
 - `music_autoplay_policy` → `music_config`, `music_models`, `music_track_metadata`
 - `music_lyrics_sources` → `music_config`, `music_models`, `music_search_scoring`
-- `music_namuwiki` → config, lyrics source, models, parsing, search scoring, track metadata 계층
-- `music_config`, `music_models`, `music_request_parsing`, `music_namuwiki_parsing`은 다른 project module을 import하지 않는 기반 계층
+- `music_config`, `music_models`, `music_request_parsing`은 다른 project module을 import하지 않는 기반 계층
 - `ytdl_worker`는 main bot module과 분리된 subprocess 진입점
 
 `devtools/local_music_bot.py`는 개발 하네스를 설치하기 위해 의도적으로 `bot`을 import하고 런타임 함수를 교체합니다. Production import 규칙의 예외이며 배포 진입점이 아닙니다.
@@ -37,8 +36,6 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 | `music_autoplay_policy.py` | 최근곡 TTL/history, current·queue·recent 중복 제외, 후보 선택·pool 관리, seed·refill·retry 정책 |
 | `music_autoplay_logging.py` | 검색·선택 JSONL 기록, 용량 제한 순환 파일과 공개 곡 메타데이터 요약 |
 | `music_lyrics_sources.py` | LRCLIB 조회·선택과 YouTube 수동 subtitle 후보 선택·다운로드·JSON3/VTT 파싱 |
-| `music_namuwiki_parsing.py` | 나무마크·HTML table 파싱과 원문·독음·번역 행 추출 |
-| `music_namuwiki.py` | 나무위키 문서 후보·아티스트 일치·override, API/HTML/preview 조회와 최종 가사 선택 |
 
 ## 상태 소유권
 
@@ -46,7 +43,6 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 
 - `bot.py`는 Discord client, shutdown flag, YouTube Music client/cache/rate lock, 보조 network semaphore와 operation/worker task set, subtitle rate state, lyrics executor, voice operation과 housekeeping task를 소유합니다.
 - `music_ytdl.py`는 process-wide priority scheduler, active worker/job, cache/rate state와 YouTube circuit state를 소유합니다.
-- `music_namuwiki.py`는 동기 요청 lock, 마지막 요청 시각과 preview renderer 선택 상태를 소유합니다.
 
 Process-scoped 상태가 모두 `bot.py`에 있다는 가정으로 소유권을 나누면 안 됩니다.
 
@@ -55,7 +51,7 @@ Process-scoped 상태가 모두 `bot.py`에 있다는 가정으로 소유권을 
 `bot.music_states`가 guild ID별 `GuildMusicState`를 보관합니다. 각 state는 다음을 소유합니다.
 
 - queue, current, voice, announcement channel과 repeat/skip/stop 상태
-- persistent control message/view와 lyrics message/view, private lyrics message
+- persistent control message/view와 lyrics message
 - autoplay candidate pool, duplicate history와 실제 recent playback history
 - 일반 state, voice connection, control panel을 위한 서로 다른 lock
 - playback advance, delayed noncritical work, autoplay, lyrics, message cleanup, idle/empty disconnect task handle
@@ -67,9 +63,8 @@ Process-scoped 상태가 모두 `bot.py`에 있다는 가정으로 소유권을 
 
 - stream URL, resolve 시각, audio codec
 - playback attempt, transcode와 retry 상태
-- 원문·한국어 가사 cache와 source
-- manual subtitle metadata와 나무위키 조회 여부
-- 곡별 한국어 가사 조회 lock
+- 원문 가사 cache와 source
+- manual subtitle metadata
 
 ### Persisted configuration state
 
@@ -102,6 +97,6 @@ Process-scoped 상태가 모두 `bot.py`에 있다는 가정으로 소유권을 
 - Pure policy·parsing·source behavior의 단위 테스트는 새 owner의 테스트로 이동하거나 추가할 수 있습니다. Discord wiring, cancellation, lock ordering과 guild lifecycle을 검증하는 integration test는 runtime owner에 남깁니다.
 - 사용자에게 보이는 신청, queue, 재생, panel, lyrics, autoplay와 shutdown 동작이 유지되는지 실패·취소·경합 경로까지 검증합니다.
 
-큰 연속 코드 영역이라는 사실만으로 하나의 추출 경계가 성립하지는 않습니다. 예를 들어 `run_lyrics_job`부터 `get_track_lyrics`, `get_track_korean_lyrics`, `LyricsVariantView`, `publish_current_lyrics`로 이어지는 영역은 process executor·auxiliary task, YouTube circuit, `Track` cache·lock과 Discord message/view lifecycle을 함께 사용합니다. 조회·cache 영역을 독립적으로 조사할 수는 있지만 새 owner가 이 상태를 어떻게 함께 소유할지도 제시해야 하며, 이는 추출 승인이나 반대를 의미하지 않습니다.
+큰 연속 코드 영역이라는 사실만으로 하나의 추출 경계가 성립하지는 않습니다. 예를 들어 `run_lyrics_job`부터 `get_track_lyrics`, `publish_current_lyrics`로 이어지는 영역은 process executor·auxiliary task, YouTube circuit, `Track` cache와 Discord message lifecycle을 함께 사용합니다. 조회·cache 영역을 독립적으로 조사할 수는 있지만 새 owner가 이 상태를 어떻게 함께 소유할지도 제시해야 하며, 이는 추출 승인이나 반대를 의미하지 않습니다.
 
 Voice 연결·이동·stale client 정리, `ensure_voice_channel` 계열, `stop_playback`, idle/empty disconnect와 playback scheduling도 개념적 묶음은 보입니다. 동시에 guild/voice lock, autoplay·lyrics cleanup, panel과 `play_next`에 연결되어 있으므로 실제 호출·상태·테스트 경계를 조사한 뒤 변경 범위를 정해야 합니다.

@@ -11,7 +11,6 @@ from discord.ui.view import ViewStore
 
 import bot
 import music_discord_display
-import music_namuwiki
 import music_ytdl
 from devtools.local_music_bot import LocalMusicMode
 
@@ -1541,485 +1540,10 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
         youtube_lookup.assert_not_awaited()
 
 
-class LyricsVariantTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncTearDown(self) -> None:
-        for state in bot.music_states.values():
-            bot.schedule_private_lyrics_cleanup(state)
-            bot.cancel_queue_message_cleanups(state)
-        await asyncio.sleep(0)
-        bot.music_states.clear()
-
-    def test_variant_view_only_shows_modes_available_for_the_track(self) -> None:
-        japanese_track = make_track("Japanese")
-        korean_track = make_track("Korean")
-
-        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True):
-            japanese_view = bot.make_lyrics_variant_view(
-                100,
-                japanese_track,
-                "君の声が聞こえる",
-            )
-            korean_view = bot.make_lyrics_variant_view(
-                100,
-                korean_track,
-                "너의 목소리가 들려",
-            )
-
-        self.assertEqual(
-            {item.label for item in japanese_view.children},
-            {"나무위키 가사"},
-        )
-        self.assertIsNone(korean_view)
-
-    def test_korean_lyrics_button_accepts_manual_subtitles_without_api_key(
-        self,
-    ) -> None:
-        track = make_track("Japanese")
-        track.manual_subtitles = {
-            "ko": [{"ext": "json3", "url": "https://example.com/ko"}],
-        }
-
-        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", False):
-            view = bot.make_lyrics_variant_view(
-                100,
-                track,
-                "君の声が聞こえる",
-            )
-
-        self.assertIsNotNone(view)
-        self.assertEqual(
-            {item.label for item in view.children},
-            {"한국어 자막"},
-        )
-
-    def test_korean_lyrics_button_is_hidden_without_available_source(
-        self,
-    ) -> None:
-        track = make_track("English")
-
-        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", False):
-            view = bot.make_lyrics_variant_view(
-                100,
-                track,
-                "I can hear your voice",
-            )
-
-        self.assertIsNone(view)
-
-    def test_korean_lyrics_button_is_available_for_namuwiki_lookup(self) -> None:
-        track = make_track("Foreign song")
-
-        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True):
-            view = bot.make_lyrics_variant_view(
-                100,
-                track,
-                "I can hear your voice",
-            )
-
-        self.assertIsNotNone(view)
-        self.assertEqual(
-            {item.label for item in view.children},
-            {"나무위키 가사"},
-        )
-
-    def test_confirmed_namuwiki_miss_hides_the_korean_lyrics_button(
-        self,
-    ) -> None:
-        track = make_track("Foreign song")
-        track.namuwiki_lyrics_checked = True
-
-        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True):
-            self.assertFalse(bot.can_show_korean_lyrics(track, "foreign lyrics"))
-
-    def test_korean_lyrics_button_is_available_when_original_lyrics_are_missing(
-        self,
-    ) -> None:
-        track = make_track("泥濘鳴鳴")
-        track.subtitle_language = "ja"
-
-        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True):
-            view = bot.make_lyrics_variant_view(100, track, "")
-
-        self.assertIsNotNone(view)
-        self.assertEqual(
-            {item.label for item in view.children},
-            {"나무위키 가사"},
-        )
-
-    def test_missing_korean_lyrics_do_not_offer_korean_variant(self) -> None:
-        track = make_track("한국 노래")
-
-        with patch.object(bot, "NAMUWIKI_LYRICS_ENABLED", True):
-            view = bot.make_lyrics_variant_view(100, track, "")
-
-        self.assertIsNone(view)
-
-    async def test_manual_korean_subtitles_are_used_when_namuwiki_misses(
-        self,
-    ) -> None:
-        track = make_track("foreign")
-        track.lyrics = "Original lyrics"
-        track.lyrics_loaded = True
-        track.manual_subtitles = {
-            "ko": [{"ext": "json3", "url": "https://example.com/manual"}],
-        }
-
-        with (
-            patch.object(
-                bot,
-                "lookup_namuwiki_lyrics",
-                return_value=None,
-            ),
-            patch.object(
-                bot,
-                "get_selected_youtube_subtitle",
-                new=AsyncMock(return_value="사람이 작성한 한국어 자막"),
-            ) as subtitle_lookup,
-        ):
-            lyrics = await bot.get_track_korean_lyrics(track)
-
-        self.assertEqual(lyrics, "사람이 작성한 한국어 자막")
-        self.assertEqual(track.korean_lyrics_source, "YouTube 제공 한국어 자막")
-        subtitle_lookup.assert_awaited_once_with(
-            track,
-            ("ko", "json3", "https://example.com/manual"),
-            purpose="manual Korean lyrics",
-        )
-
-    async def test_automatic_captions_are_never_used_for_korean_lyrics(
-        self,
-    ) -> None:
-        track = bot.make_track_from_info(
-            {
-                "id": "machine001",
-                "title": "Foreign song",
-                "webpage_url": "https://www.youtube.com/watch?v=machine001",
-                "automatic_captions": {
-                    "ko": [
-                        {
-                            "ext": "json3",
-                            "url": "https://example.com/auto?lang=ja&tlang=ko",
-                        }
-                    ],
-                },
-                "language": "ja",
-            },
-            "tester",
-            "https://www.youtube.com/watch?v=machine001",
-        )
-
-        with (
-            patch.object(bot, "lookup_namuwiki_lyrics", return_value=None),
-            patch.object(
-                bot,
-                "get_selected_youtube_subtitle",
-                new=AsyncMock(),
-            ) as subtitle_lookup,
-        ):
-            with self.assertRaises(bot.KoreanLyricsError):
-                await bot.get_track_korean_lyrics(track)
-
-        subtitle_lookup.assert_not_awaited()
-
-    async def test_korean_lyrics_button_uses_original_response_and_cache(
-        self,
-    ) -> None:
-        guild_id = 101
-        track = make_track("foreign")
-        track.lyrics = "Original lyrics"
-        track.lyrics_loaded = True
-        state = bot.get_state(guild_id)
-        state.current = track
-        first_message = MagicMock()
-        first_message.delete = AsyncMock()
-        second_message = MagicMock()
-        second_message.delete = AsyncMock()
-        first_interaction = MagicMock()
-        first_interaction.response.send_message = AsyncMock()
-        first_interaction.edit_original_response = AsyncMock(
-            return_value=first_message
-        )
-        second_interaction = MagicMock()
-        second_interaction.response.send_message = AsyncMock()
-        second_interaction.edit_original_response = AsyncMock(
-            return_value=second_message
-        )
-        view = bot.LyricsVariantView.__new__(bot.LyricsVariantView)
-        view.guild_id = guild_id
-        view.track = track
-
-        with (
-            patch.object(
-                bot,
-                "lookup_namuwiki_lyrics",
-                return_value=None,
-            ),
-            patch.object(
-                bot,
-                "get_youtube_korean_lyrics",
-                new=AsyncMock(
-                    return_value=("사람이 작성한 한국어 자막", "YouTube 제공 한국어 자막")
-                ),
-            ) as request_lyrics,
-        ):
-            await view.show_korean_lyrics(first_interaction)
-            await view.show_korean_lyrics(second_interaction)
-
-        first_interaction.response.send_message.assert_awaited_once_with(
-            "가사 정보를 확인하고 있어요...",
-            ephemeral=True,
-        )
-        second_interaction.response.send_message.assert_awaited_once_with(
-            "가사 정보를 확인하고 있어요...",
-            ephemeral=True,
-        )
-        first_interaction.edit_original_response.assert_awaited_once()
-        second_interaction.edit_original_response.assert_awaited_once()
-        self.assertEqual(
-            first_interaction.edit_original_response.await_args.kwargs["attachments"],
-            [],
-        )
-        self.assertEqual(
-            second_interaction.edit_original_response.await_args.kwargs["attachments"],
-            [],
-        )
-        request_lyrics.assert_awaited_once_with(track)
-        first_message.delete.assert_not_awaited()
-        second_message.delete.assert_not_awaited()
-        self.assertEqual(
-            state.private_lyrics_messages[track.track_id],
-            [first_message, second_message],
-        )
-
-        bot.schedule_private_lyrics_cleanup(state, track.track_id)
-        await asyncio.sleep(0)
-
-        first_message.delete.assert_awaited_once_with()
-        second_message.delete.assert_awaited_once_with()
-        self.assertNotIn(track.track_id, state.private_lyrics_messages)
-
-    async def test_korean_lyrics_button_acknowledges_before_slow_lookup(self) -> None:
-        guild_id = 103
-        track = make_track("slow foreign")
-        state = bot.get_state(guild_id)
-        state.current = track
-        interaction = MagicMock()
-        interaction.response.send_message = AsyncMock()
-        message = MagicMock()
-        message.delete = AsyncMock()
-        interaction.edit_original_response = AsyncMock(return_value=message)
-        lookup_started = asyncio.Event()
-        lookup_gate = asyncio.Event()
-        view = bot.LyricsVariantView.__new__(bot.LyricsVariantView)
-        view.guild_id = guild_id
-        view.track = track
-
-        async def slow_lookup(requested_track: bot.Track) -> str:
-            self.assertIs(requested_track, track)
-            lookup_started.set()
-            await lookup_gate.wait()
-            requested_track.korean_lyrics_source = "나무위키 · 원문·독음·번역"
-            requested_track.korean_lyrics_url = "https://namu.wiki/w/test"
-            return "원문\n독음\n번역"
-
-        with patch.object(bot, "get_track_korean_lyrics", new=slow_lookup):
-            task = asyncio.create_task(view.show_korean_lyrics(interaction))
-            await lookup_started.wait()
-
-            interaction.response.send_message.assert_awaited_once_with(
-                "가사 정보를 확인하고 있어요...",
-                ephemeral=True,
-            )
-            interaction.edit_original_response.assert_not_awaited()
-
-            lookup_gate.set()
-            await task
-
-        interaction.edit_original_response.assert_awaited_once()
-        self.assertEqual(
-            state.private_lyrics_messages[track.track_id],
-            [message],
-        )
-
-    async def test_long_korean_lyrics_are_attached_to_original_response(self) -> None:
-        guild_id = 104
-        track = make_track("long foreign")
-        track.korean_lyrics = "원문\n독음\n번역\n\n" * 500
-        track.korean_lyrics_loaded = True
-        track.korean_lyrics_source = "나무위키 · 원문·독음·번역"
-        track.korean_lyrics_url = "https://namu.wiki/w/test"
-        state = bot.get_state(guild_id)
-        state.current = track
-        interaction = MagicMock()
-        interaction.response.send_message = AsyncMock()
-        message = MagicMock()
-        message.delete = AsyncMock()
-        interaction.edit_original_response = AsyncMock(return_value=message)
-        view = bot.LyricsVariantView.__new__(bot.LyricsVariantView)
-        view.guild_id = guild_id
-        view.track = track
-
-        await view.show_korean_lyrics(interaction)
-
-        attachments = interaction.edit_original_response.await_args.kwargs[
-            "attachments"
-        ]
-        self.assertEqual(len(attachments), 1)
-        self.assertEqual(attachments[0].filename, "lyrics-korean.txt")
-        self.assertLess(
-            len(
-                interaction.edit_original_response.await_args.kwargs[
-                    "embed"
-                ].description
-            ),
-            bot.LYRICS_INLINE_LIMIT,
-        )
-        attachments[0].close()
-
-    async def test_late_private_lyrics_result_is_deleted_after_track_change(
-        self,
-    ) -> None:
-        guild_id = 102
-        finished_track = make_track("finished")
-        state = bot.get_state(guild_id)
-        state.current = make_track("next")
-        message = MagicMock()
-        message.delete = AsyncMock()
-
-        await bot.register_private_lyrics_message(
-            guild_id,
-            finished_track,
-            message,
-        )
-
-        message.delete.assert_awaited_once_with()
-        self.assertFalse(state.private_lyrics_messages)
-
-
-class NamuWikiLyricsTests(unittest.IsolatedAsyncioTestCase):
-    EXPECTED_LYRICS = (
-        "泥濘 鳴鳴\n"
-        "でいねい めいめい\n"
-        "진창에서 울리는 노랫소리\n\n"
-        "礼を持って\n"
-        "れいをもって\n"
-        "예를 갖추어 다시 걸어가"
-    )
-    DOCUMENT = "泥濘鳴鳴"
-    PAGE_URL = (
-        "https://namu.wiki/w/"
-        "%E6%B3%A5%E6%BF%98%E9%B3%B4%E9%B3%B4"
-    )
-
-    async def test_namuwiki_lyrics_are_cached_before_youtube_fallback(
-        self,
-    ) -> None:
-        track = make_track(self.DOCUMENT)
-        namuwiki_result = (
-            self.EXPECTED_LYRICS,
-            "나무위키 · 원문·독음·번역",
-            self.PAGE_URL,
-        )
-
-        with (
-            patch.object(
-                bot,
-                "lookup_namuwiki_lyrics",
-                return_value=namuwiki_result,
-            ) as namuwiki_lookup,
-            patch.object(
-                bot,
-                "get_youtube_korean_lyrics",
-                new=AsyncMock(),
-            ) as youtube_lookup,
-        ):
-            first = await bot.get_track_korean_lyrics(track)
-            second = await bot.get_track_korean_lyrics(track)
-
-        self.assertEqual(first, self.EXPECTED_LYRICS)
-        self.assertEqual(second, self.EXPECTED_LYRICS)
-        self.assertEqual(track.korean_lyrics_url, self.PAGE_URL)
-        namuwiki_lookup.assert_called_once_with(track)
-        youtube_lookup.assert_not_awaited()
-
-    async def test_transient_namuwiki_failure_is_not_cached(self) -> None:
-        track = make_track(self.DOCUMENT)
-
-        with patch.object(
-            bot,
-            "lookup_namuwiki_lyrics",
-            side_effect=bot.NamuWikiLyricsError("request blocked"),
-        ) as namuwiki_lookup:
-            first = await bot.get_track_namuwiki_lyrics(track)
-            second = await bot.get_track_namuwiki_lyrics(track)
-
-        self.assertIsNone(first)
-        self.assertIsNone(second)
-        self.assertFalse(track.namuwiki_lyrics_checked)
-        self.assertEqual(namuwiki_lookup.call_count, 2)
-
-    async def test_confirmed_namuwiki_miss_is_cached(self) -> None:
-        track = make_track(self.DOCUMENT)
-
-        with patch.object(
-            bot,
-            "lookup_namuwiki_lyrics",
-            return_value=None,
-        ) as namuwiki_lookup:
-            first = await bot.get_track_namuwiki_lyrics(track)
-            second = await bot.get_track_namuwiki_lyrics(track)
-
-        self.assertIsNone(first)
-        self.assertIsNone(second)
-        self.assertTrue(track.namuwiki_lyrics_checked)
-        namuwiki_lookup.assert_called_once_with(track)
-
-    async def test_unexpected_namuwiki_failure_still_uses_youtube(
-        self,
-    ) -> None:
-        track = make_track(self.DOCUMENT)
-        track.lyrics = "泥濘 鳴鳴"
-        track.lyrics_loaded = True
-
-        with (
-            patch.object(
-                bot,
-                "lookup_namuwiki_lyrics",
-                side_effect=ValueError("unexpected response"),
-            ),
-            patch.object(
-                bot,
-                "get_youtube_korean_lyrics",
-                new=AsyncMock(
-                    return_value=("유튜브 번역 가사입니다", "YouTube 제공 한국어 자막")
-                ),
-            ) as youtube_lookup,
-        ):
-            lyrics = await bot.get_track_korean_lyrics(track)
-
-        self.assertEqual(lyrics, "유튜브 번역 가사입니다")
-        youtube_lookup.assert_awaited_once_with(track)
-
-    def test_korean_lyrics_embed_links_to_the_source_document(self) -> None:
-        track = make_track(self.DOCUMENT)
-
-        embed = bot.make_lyrics_variant_embed(
-            track,
-            "나무위키 가사",
-            self.EXPECTED_LYRICS,
-            "나무위키 · 원문·독음·번역",
-            self.PAGE_URL,
-        )
-
-        self.assertEqual(embed.url, self.PAGE_URL)
-        self.assertEqual(embed.footer.text, "나무위키 · 원문·독음·번역")
-
-
 class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         for state in bot.music_states.values():
             bot.cancel_lyrics_publish(state)
-            bot.schedule_private_lyrics_cleanup(state)
             bot.cancel_queue_message_cleanups(state)
         await asyncio.sleep(0)
         bot.music_states.clear()
@@ -2036,55 +1560,6 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
         message.delete = AsyncMock()
         channel.send.return_value = message
         return channel, message
-
-    async def test_replacing_lyrics_view_restores_new_button_callbacks(
-        self,
-    ) -> None:
-        guild_id = 609
-        message_id = 709
-        custom_id = "lyrics:korean:replacement-test"
-        state = bot.get_state(guild_id)
-        previous_view = bot.discord.ui.View(timeout=None)
-        previous_view.add_item(
-            bot.discord.ui.Button(label="이전", custom_id=custom_id)
-        )
-        replacement_view = bot.discord.ui.View(timeout=None)
-        replacement_button = bot.discord.ui.Button(
-            label="새 가사",
-            custom_id=custom_id,
-        )
-        replacement_view.add_item(replacement_button)
-        view_store = ViewStore(bot.bot._connection)
-        view_store.add_view(previous_view, message_id)
-        view_store.add_view(replacement_view, message_id)
-        state.lyrics_view = previous_view
-
-        def register_view(
-            view: bot.discord.ui.View,
-            *,
-            message_id: int,
-        ) -> None:
-            view_store.add_view(view, message_id)
-
-        with patch.object(
-            bot.bot,
-            "add_view",
-            side_effect=register_view,
-        ) as add_view:
-            bot.replace_lyrics_view(
-                state,
-                replacement_view,
-                message_id=message_id,
-            )
-
-        key = (bot.discord.ComponentType.button.value, custom_id)
-        self.assertIs(view_store._views[message_id][key], replacement_button)
-        add_view.assert_called_once_with(
-            replacement_view,
-            message_id=message_id,
-        )
-
-        bot.replace_lyrics_view(state, None)
 
     async def test_new_track_edits_the_existing_lyrics_message(self) -> None:
         guild_id = 600
@@ -2121,17 +1596,10 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
         track = make_track("missing")
         state.current = track
 
-        with (
-            patch.object(
-                bot,
-                "get_track_lyrics",
-                new=AsyncMock(return_value=None),
-            ),
-            patch.object(
-                bot,
-                "get_track_namuwiki_lyrics",
-                new=AsyncMock(),
-            ) as namuwiki_lookup,
+        with patch.object(
+            bot,
+            "get_track_lyrics",
+            new=AsyncMock(return_value=None),
         ):
             await bot.publish_current_lyrics(guild_id, track)
 
@@ -2139,65 +1607,8 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
         message.edit.assert_awaited_once()
         final_embed = message.edit.await_args.kwargs["embed"]
         self.assertEqual(final_embed.description, "미제공")
-        final_view = message.edit.await_args.kwargs["view"]
-        self.assertIsInstance(final_view, bot.LyricsVariantView)
-        self.assertIn("나무위키 가사", {item.label for item in final_view.children})
+        self.assertNotIn("view", message.edit.await_args.kwargs)
         self.assertIs(state.lyrics_message, message)
-        namuwiki_lookup.assert_not_awaited()
-
-    async def test_missing_original_lyrics_does_not_start_namuwiki_lookup(
-        self,
-    ) -> None:
-        guild_id = 606
-        channel, _ = self.make_channel_and_message()
-        state = bot.get_state(guild_id)
-        state.announcement_channel = channel
-        track = make_track("namuwiki fallback")
-        state.current = track
-
-        with (
-            patch.object(
-                bot,
-                "get_track_lyrics",
-                new=AsyncMock(return_value=None),
-            ),
-            patch.object(
-                bot,
-                "get_track_namuwiki_lyrics",
-                new=AsyncMock(return_value="원문\n독음\n번역"),
-            ) as namuwiki_lookup,
-        ):
-            await bot.publish_current_lyrics(guild_id, track)
-
-        channel.send.assert_awaited_once()
-        namuwiki_lookup.assert_not_awaited()
-
-    async def test_available_original_lyrics_do_not_lookup_namuwiki(
-        self,
-    ) -> None:
-        guild_id = 607
-        channel, _ = self.make_channel_and_message()
-        state = bot.get_state(guild_id)
-        state.announcement_channel = channel
-        track = make_track("original lyrics available")
-        state.current = track
-
-        with (
-            patch.object(
-                bot,
-                "get_track_lyrics",
-                new=AsyncMock(return_value="lrclib lyrics"),
-            ),
-            patch.object(
-                bot,
-                "get_track_namuwiki_lyrics",
-                new=AsyncMock(),
-            ) as namuwiki_lookup,
-        ):
-            await bot.publish_current_lyrics(guild_id, track)
-
-        channel.send.assert_awaited_once()
-        namuwiki_lookup.assert_not_awaited()
 
     async def test_long_lyrics_replace_attachment_with_full_utf8_text(self) -> None:
         guild_id = 602
@@ -2226,24 +1637,13 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
         channel, message = self.make_channel_and_message()
         state = bot.get_state(guild_id)
         state.current = make_track("current")
-        private_lyrics_message = MagicMock()
-        private_lyrics_message.delete = AsyncMock()
-        state.private_lyrics_messages[state.current.track_id] = [
-            private_lyrics_message
-        ]
         state.lyrics_message = message
-        lyrics_view = MagicMock()
-        state.lyrics_view = lyrics_view
 
         bot.stop_playback(state, guild_id)
         await asyncio.sleep(0)
 
         message.delete.assert_awaited_once()
-        private_lyrics_message.delete.assert_awaited_once_with()
-        lyrics_view.stop.assert_called_once_with()
         self.assertIsNone(state.lyrics_message)
-        self.assertIsNone(state.lyrics_view)
-        self.assertFalse(state.private_lyrics_messages)
 
     async def test_empty_queue_deletes_the_lyrics_message(self) -> None:
         guild_id = 604
@@ -2292,7 +1692,6 @@ class EphemeralResponseTests(unittest.IsolatedAsyncioTestCase):
         bot.lyrics_executor_closing = False
         for state in bot.music_states.values():
             bot.cancel_queue_message_cleanups(state)
-            bot.schedule_private_lyrics_cleanup(state)
         await asyncio.sleep(0)
         bot.music_states.clear()
 
@@ -6035,7 +5434,8 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(extract.await_count, 2)
         self.assertIs(extract.await_args_list[0].args[0], seed)
         self.assertIs(extract.await_args_list[1].args[0], candidates[-1])
-        self.assertEqual(update_panel.await_count, 8)
+        # One panel edit per refill, not one per queued track.
+        self.assertEqual(update_panel.await_count, 4)
 
     async def test_refill_caches_rest_after_filling_empty_queue(self) -> None:
         guild_id = 566
@@ -6066,7 +5466,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(state.queue), candidates[:5])
         self.assertEqual(list(state.autoplay_candidate_pool), candidates[5:])
         extract.assert_awaited_once()
-        self.assertEqual(update_panel.await_count, 5)
+        update_panel.assert_awaited_once_with(guild_id, state)
         info.assert_called_once_with(
             "Autoplay candidate fetch in guild %s for %s: "
             "requested=%s considered=%s recent=%s overlap=%.2f "
@@ -10693,7 +10093,6 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
             bot.cancel_autoplay_refill(state)
             bot.cancel_idle_voice_disconnect(state)
             bot.cancel_lyrics_publish(state)
-            bot.schedule_private_lyrics_cleanup(state)
             bot.cancel_queue_message_cleanups(state)
             if state.advance_task and not state.advance_task.done():
                 state.advance_task.cancel()
@@ -11446,56 +10845,6 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
 
         schedule_refill.assert_not_called()
         schedule_lyrics.assert_not_called()
-
-    async def test_track_end_deletes_its_private_lyrics_messages(self) -> None:
-        class FakeVoice:
-            def __init__(self) -> None:
-                self.playing = False
-                self.after = None
-
-            def is_connected(self) -> bool:
-                return True
-
-            def is_playing(self) -> bool:
-                return self.playing
-
-            def is_paused(self) -> bool:
-                return False
-
-            def play(self, source: object, *, after: object) -> None:
-                self.playing = True
-                self.after = after
-
-        guild_id = 457
-        track = make_track("finished")
-        voice = FakeVoice()
-        private_message = MagicMock()
-        private_message.delete = AsyncMock()
-        state = bot.get_state(guild_id)
-        state.voice = voice
-        state.queue.append(track)
-        state.private_lyrics_messages[track.track_id] = [private_message]
-        fake_bot = MagicMock()
-        fake_bot.loop = asyncio.get_running_loop()
-
-        with (
-            patch.object(bot, "ffmpeg_is_available", return_value=True),
-            patch.object(bot, "resolve_track_stream", new=AsyncMock()),
-            patch.object(bot.discord, "FFmpegOpusAudio", return_value=MagicMock()),
-            patch.object(bot, "schedule_noncritical_tasks"),
-            patch.object(bot, "schedule_play_next") as schedule_next,
-            patch.object(bot, "bot", fake_bot),
-        ):
-            await bot.play_next(guild_id, announce=False)
-            self.assertIsNotNone(voice.after)
-            voice.after(None)
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
-
-        private_message.delete.assert_awaited_once_with()
-        self.assertFalse(state.private_lyrics_messages)
-        self.assertIsNone(state.current)
-        schedule_next.assert_called_once_with(guild_id)
 
     async def test_fresh_stream_url_is_reused(self) -> None:
         track = make_track("fresh")

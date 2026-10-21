@@ -28,8 +28,8 @@ LYRICS_NATIVE_SCRIPT_SCORE_WINDOW = 20
 LYRICS_DURATION_MATCH_TOLERANCE_SECONDS = 8
 # LRCLIB sheds load with 503; retry a few times inside one lookup deadline.
 LYRICS_RETRY_STATUS_CODES = frozenset({429, 503})
-LYRICS_RETRY_DELAYS_SECONDS = (2.0, 5.0)
-LYRICS_LOOKUP_TIMEOUT_SECONDS = LYRICS_REQUEST_TIMEOUT_SECONDS * 3
+LYRICS_RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0, 15.0)
+LYRICS_LOOKUP_TIMEOUT_SECONDS = LYRICS_REQUEST_TIMEOUT_SECONDS * 6
 LRC_TIMESTAMP_RE = re.compile(
     r"\[(?:(?:\d{1,2}):)?\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]"
 )
@@ -529,24 +529,6 @@ def select_manual_subtitle(track: Track) -> tuple[str, str, str] | None:
             language_score += 100
         if language_key.endswith("-orig"):
             language_score += 50
-        candidates.append(
-            (language_score + format_score, language, extension, url)
-        )
-
-    if not candidates:
-        return None
-    _, language, extension, url = max(candidates, key=lambda candidate: candidate[0])
-    return language, extension, url
-
-
-def select_korean_manual_subtitle(track: Track) -> tuple[str, str, str] | None:
-    candidates: list[tuple[int, str, str, str]] = []
-    for language, extension, url, format_score in get_manual_subtitle_candidates(track):
-        language_key = language.casefold().replace("_", "-")
-        language_parts = language_key.split("-")
-        if not language_parts or language_parts[0] != "ko":
-            continue
-        language_score = 20 if language_key in {"ko", "ko-kr"} else 0
         candidates.append(
             (language_score + format_score, language, extension, url)
         )

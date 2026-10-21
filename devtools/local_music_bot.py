@@ -92,7 +92,6 @@ class LocalMusicMode:
         music_bot.extract_tracks = self.extract_tracks
         music_bot.extract_auto_tracks = self.extract_auto_tracks
         music_bot.FFMPEG_OPTIONS = {"options": "-vn"}
-        music_bot.NAMUWIKI_LYRICS_ENABLED = False
         music_bot.YOUTUBE_LYRICS_FALLBACK = False
         music_bot.lookup_track_lyrics = lambda track: None
 

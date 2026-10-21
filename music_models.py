@@ -49,15 +49,6 @@ class Track:
     lyrics: str | None = None
     lyrics_loaded: bool = False
     lyrics_source: str | None = None
-    korean_lyrics: str | None = None
-    korean_lyrics_loaded: bool = False
-    korean_lyrics_source: str | None = None
-    korean_lyrics_url: str | None = None
-    namuwiki_lyrics_checked: bool = False
-    korean_lyrics_lock: asyncio.Lock = field(
-        default_factory=asyncio.Lock,
-        repr=False,
-    )
     manual_subtitles: dict[str, list[dict]] = field(default_factory=dict)
     subtitle_language: str | None = None
     track_id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -99,11 +90,6 @@ class GuildMusicState:
     autoplay_task: asyncio.Task[None] | None = None
     lyrics_task: asyncio.Task[None] | None = None
     lyrics_message: discord.Message | None = None
-    lyrics_view: discord.ui.View | None = None
-    private_lyrics_messages: dict[
-        str,
-        list[discord.WebhookMessage | discord.InteractionMessage],
-    ] = field(default_factory=dict)
     queue_cleanup_tasks: dict[int, asyncio.Task[None]] = field(default_factory=dict)
     empty_channel_task: asyncio.Task[None] | None = None
     idle_voice_task: asyncio.Task[None] | None = None

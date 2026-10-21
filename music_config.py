@@ -89,25 +89,6 @@ def parse_nonnegative_float_env(name: str, default: float) -> float:
     return value
 
 
-def parse_string_map_env(name: str) -> dict[str, str]:
-    raw_value = os.getenv(name, "").strip()
-    if not raw_value:
-        return {}
-    try:
-        payload = json.loads(raw_value)
-    except json.JSONDecodeError:
-        logger.warning("%s must be a JSON object. Ignoring its value.", name)
-        return {}
-    if not isinstance(payload, dict):
-        logger.warning("%s must be a JSON object. Ignoring its value.", name)
-        return {}
-    return {
-        str(key).strip(): str(value).strip()
-        for key, value in payload.items()
-        if str(key).strip() and str(value).strip()
-    }
-
-
 MAX_BULK_TRACKS = parse_positive_int_env("MAX_BULK_TRACKS", 50)
 MUSIC_FEEDBACK_DELETE_SECONDS = parse_positive_int_env("MUSIC_FEEDBACK_DELETE_SECONDS", 10)
 EPHEMERAL_RESPONSE_DELETE_SECONDS = parse_positive_int_env(
@@ -148,36 +129,6 @@ YOUTUBE_LYRICS_FALLBACK = os.getenv("YOUTUBE_LYRICS_FALLBACK", "true").lower() n
     "no",
     "off",
 }
-NAMUWIKI_LYRICS_ENABLED = os.getenv(
-    "NAMUWIKI_LYRICS_ENABLED", "true"
-).lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
-NAMUWIKI_PAGE_BASE_URL = os.getenv(
-    "NAMUWIKI_PAGE_BASE_URL", "https://namu.wiki/w"
-).rstrip("/")
-NAMUWIKI_API_BASE_URL = os.getenv(
-    "NAMUWIKI_API_BASE_URL", "https://wiki-api.namu.la/api"
-).rstrip("/")
-NAMUWIKI_API_TOKEN = os.getenv("NAMUWIKI_API_TOKEN", "").strip() or None
-NAMUWIKI_PREVIEW_FALLBACK_ENABLED = os.getenv(
-    "NAMUWIKI_PREVIEW_FALLBACK_ENABLED", "true"
-).lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
-NAMUWIKI_REQUEST_TIMEOUT_SECONDS = parse_positive_int_env(
-    "NAMUWIKI_REQUEST_TIMEOUT_SECONDS", 10
-)
-NAMUWIKI_REQUEST_INTERVAL_SECONDS = parse_nonnegative_float_env(
-    "NAMUWIKI_REQUEST_INTERVAL_SECONDS", 1.1
-)
-NAMUWIKI_DOCUMENT_OVERRIDES = parse_string_map_env("NAMUWIKI_DOCUMENT_OVERRIDES")
 YTDL_EXTRACT_TIMEOUT_SECONDS = parse_positive_int_env("YTDL_EXTRACT_TIMEOUT_SECONDS", 45)
 YTDL_MAX_CONCURRENT_EXTRACTIONS = parse_positive_int_env(
     "YTDL_MAX_CONCURRENT_EXTRACTIONS", 1

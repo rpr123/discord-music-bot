@@ -45,7 +45,6 @@ MOVED_NAMES = (
     "get_manual_subtitle_candidates",
     "get_subtitle_candidates",
     "normalize_subtitle_text",
-    "select_korean_manual_subtitle",
     "select_manual_subtitle",
 )
 
@@ -442,11 +441,13 @@ class LyricsLookupTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 3)
         self.assertEqual(
             [call.args[0] for call in sleep.call_args_list],
-            list(music_lyrics_sources.LYRICS_RETRY_DELAYS_SECONDS),
+            list(music_lyrics_sources.LYRICS_RETRY_DELAYS_SECONDS[:2]),
         )
 
     def test_request_gives_up_on_overload_and_other_http_errors(self) -> None:
-        for code, expected_attempts in ((503, 3), (404, 1)):
+        overload_attempts = len(music_lyrics_sources.LYRICS_RETRY_DELAYS_SECONDS) + 1
+        self.assertEqual(overload_attempts, 5)
+        for code, expected_attempts in ((503, overload_attempts), (404, 1)):
             error = urllib.error.HTTPError(
                 "https://lrclib.net/api/search", code, "error", {}, None,
             )
@@ -592,29 +593,4 @@ class LyricsSourceParsingTests(unittest.TestCase):
         self.assertEqual(
             music_lyrics_sources.select_manual_subtitle(track),
             ("ja", "vtt", "https://example.com/ja"),
-        )
-
-    def test_korean_manual_subtitle_is_selected_independently(self) -> None:
-        track = make_track("captioned")
-        track.subtitle_language = "ja"
-        track.manual_subtitles = {
-            "ja": [{"ext": "json3", "url": "https://example.com/ja"}],
-            "en": [{"ext": "json3", "url": "https://example.com/en"}],
-            "ko-KR": [{"ext": "vtt", "url": "https://example.com/ko"}],
-        }
-
-        self.assertEqual(
-            music_lyrics_sources.select_korean_manual_subtitle(track),
-            ("ko-KR", "vtt", "https://example.com/ko"),
-        )
-
-    def test_korean_manual_subtitle_does_not_use_other_languages(self) -> None:
-        track = make_track("captioned")
-        track.manual_subtitles = {
-            "ja": [{"ext": "json3", "url": "https://example.com/ja"}],
-            "en": [{"ext": "vtt", "url": "https://example.com/en"}],
-        }
-
-        self.assertIsNone(
-            music_lyrics_sources.select_korean_manual_subtitle(track)
         )

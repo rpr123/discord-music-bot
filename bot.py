@@ -68,7 +68,6 @@ from music_discord_display import (
     delete_interaction_response_later,
     delete_message_later,
     delete_music_request_message,
-    delete_private_interaction_message,
     describe_queue_selection,
     format_duration,
     is_silent_music_channel,
@@ -77,7 +76,6 @@ from music_discord_display import (
     make_idle_player_embed,
     make_lyrics_embed,
     make_lyrics_file,
-    make_lyrics_variant_embed,
     make_player_embed,
     make_queue_line,
     make_queue_embed,
@@ -117,55 +115,8 @@ from music_lyrics_sources import (
     normalize_subtitle_text,
     request_lyrics_records,
     request_youtube_subtitle,
-    select_korean_manual_subtitle,
     select_lyrics_record,
     select_manual_subtitle,
-)
-from music_namuwiki import (
-    NAMUWIKI_MAX_DOCUMENT_CANDIDATES,
-    build_namuwiki_document_candidates,
-    extract_namuwiki_primary_artist_from_tables,
-    find_namuwiki_override,
-    get_namuwiki_document_candidates,
-    get_namuwiki_override,
-    get_namuwiki_track_artists,
-    lookup_namuwiki_lyrics,
-    namuwiki_artist_matches_track,
-    parse_namuwiki_candidate,
-    read_limited_http_response,
-    request_namuwiki_api_source,
-    request_namuwiki_html,
-    request_namuwiki_html_once,
-    split_namuwiki_candidate,
-    wait_for_namuwiki_interval,
-)
-from music_namuwiki_parsing import (
-    NAMUMARK_FOOTNOTE_RE,
-    NAMUMARK_LINK_RE,
-    NAMUMARK_RUBY_RE,
-    NAMUMARK_STYLE_PREFIX_RE,
-    NAMUWIKI_IGNORED_HTML_TAGS,
-    NAMUWIKI_VOID_HTML_TAGS,
-    NamuWikiLyricsError,
-    NamuWikiHTMLTableParser,
-    NamuWikiPageBlockedError,
-    _NamuWikiHTMLTableContext,
-    best_namuwiki_header_column,
-    clean_namumark_cell,
-    extract_interleaved_namuwiki_groups,
-    extract_interleaved_namuwiki_lyrics,
-    extract_namuwiki_lyrics_from_html,
-    extract_namuwiki_lyrics_from_namumark,
-    extract_namuwiki_lyrics_from_tables,
-    is_usable_namuwiki_lyrics,
-    is_valid_korean_translation,
-    lyrics_are_primarily_korean,
-    namuwiki_reading_header_score,
-    namuwiki_source_header_score,
-    namuwiki_translation_header_score,
-    normalize_namuwiki_table_text,
-    parse_namumark_tables,
-    parse_namuwiki_html_tables,
 )
 from music_request_parsing import (
     YOUTUBE_HOSTS,
@@ -260,14 +211,6 @@ from music_config import (
     MUSIC_CHANNEL_NAME,
     MUSIC_CHANNELS_FILE,
     MUSIC_FEEDBACK_DELETE_SECONDS,
-    NAMUWIKI_API_BASE_URL,
-    NAMUWIKI_API_TOKEN,
-    NAMUWIKI_DOCUMENT_OVERRIDES,
-    NAMUWIKI_LYRICS_ENABLED,
-    NAMUWIKI_PAGE_BASE_URL,
-    NAMUWIKI_PREVIEW_FALLBACK_ENABLED,
-    NAMUWIKI_REQUEST_INTERVAL_SECONDS,
-    NAMUWIKI_REQUEST_TIMEOUT_SECONDS,
     PROJECT_DIR,
     QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
     QUEUE_SELECT_LIMIT,
@@ -309,7 +252,6 @@ from music_config import (
     logger,
     parse_nonnegative_float_env,
     parse_positive_int_env,
-    parse_string_map_env,
     resolve_project_path,
     save_music_channel_config,
     set_autoplay_enabled,
@@ -967,37 +909,6 @@ async def send_ephemeral_followup(
     if message is not None and delete_after is not None:
         create_housekeeping_task(delete_message_later(message, delete_after))
     return message
-
-
-async def register_private_lyrics_message(
-    guild_id: int,
-    track: Track,
-    message: discord.WebhookMessage | discord.InteractionMessage,
-) -> None:
-    state = get_state(guild_id)
-    if state.current is not track:
-        await delete_private_interaction_message(message)
-        return
-    state.private_lyrics_messages.setdefault(track.track_id, []).append(message)
-
-
-def schedule_private_lyrics_cleanup(
-    state: GuildMusicState,
-    track_id: str | None = None,
-) -> None:
-    if track_id is None:
-        messages = [
-            message
-            for tracked_messages in state.private_lyrics_messages.values()
-            for message in tracked_messages
-        ]
-        state.private_lyrics_messages.clear()
-    else:
-        messages = state.private_lyrics_messages.pop(track_id, [])
-
-    for message in messages:
-        if not bot_shutdown_started:
-            create_housekeeping_task(delete_private_interaction_message(message))
 
 
 async def delete_queue_message_after(
@@ -2055,10 +1966,6 @@ async def extract_first_info(
     raise ValueError(f"No playable search results were found for '{query}'.")
 
 
-class KoreanLyricsError(RuntimeError):
-    pass
-
-
 async def run_lyrics_job(function: Callable[..., T], *args: object) -> T:
     if lyrics_executor_closing:
         raise asyncio.CancelledError
@@ -2167,20 +2074,6 @@ async def get_youtube_manual_lyrics(track: Track) -> str | None:
     )
 
 
-async def get_youtube_korean_lyrics(track: Track) -> tuple[str, str] | None:
-    selected = select_korean_manual_subtitle(track)
-    if selected is None:
-        return None
-    lyrics = await get_selected_youtube_subtitle(
-        track,
-        selected,
-        purpose="manual Korean lyrics",
-    )
-    if not lyrics:
-        return None
-    return lyrics, "YouTube 제공 한국어 자막"
-
-
 async def get_track_lyrics(track: Track) -> str | None:
     if track.lyrics_loaded:
         return track.lyrics
@@ -2209,135 +2102,6 @@ async def get_track_lyrics(track: Track) -> str | None:
     return lyrics
 
 
-def can_show_korean_lyrics(track: Track, lyrics: str) -> bool:
-    lyrics = lyrics.strip()
-    if lyrics and lyrics_are_primarily_korean(lyrics):
-        return False
-    if not lyrics:
-        language = (track.subtitle_language or "").casefold()
-        title = track.song_name or clean_track_title_preserving_case(track.title)
-        if (
-            language == "ko"
-            or language.startswith("ko-")
-            or lyrics_are_primarily_korean(title)
-        ):
-            return False
-
-    namuwiki_may_have_lyrics = NAMUWIKI_LYRICS_ENABLED and (
-        not track.namuwiki_lyrics_checked
-        or (
-            track.korean_lyrics_loaded
-            and track.korean_lyrics is not None
-            and track.korean_lyrics_url is not None
-        )
-    )
-    return bool(namuwiki_may_have_lyrics or select_korean_manual_subtitle(track))
-
-
-def get_korean_lyrics_label(track: Track) -> str:
-    if track.korean_lyrics_url or (
-        NAMUWIKI_LYRICS_ENABLED and not track.namuwiki_lyrics_checked
-    ):
-        return "나무위키 가사"
-    return "한국어 자막"
-
-
-async def get_track_namuwiki_lyrics(track: Track) -> str | None:
-    if track.korean_lyrics_loaded:
-        return (
-            track.korean_lyrics
-            if track.korean_lyrics is not None and track.korean_lyrics_url is not None
-            else None
-        )
-    if track.namuwiki_lyrics_checked:
-        return None
-
-    async with track.korean_lyrics_lock:
-        if track.korean_lyrics_loaded:
-            return (
-                track.korean_lyrics
-                if (
-                    track.korean_lyrics is not None
-                    and track.korean_lyrics_url is not None
-                )
-                else None
-            )
-        if track.namuwiki_lyrics_checked:
-            return None
-
-        namuwiki_result: tuple[str, str, str] | None = None
-        try:
-            request_attempts_per_candidate = (
-                1
-                + (1 if NAMUWIKI_API_TOKEN else 0)
-                + (1 if NAMUWIKI_PREVIEW_FALLBACK_ENABLED else 0)
-            )
-            namuwiki_result = await asyncio.wait_for(
-                run_lyrics_job(lookup_namuwiki_lyrics, track),
-                timeout=(
-                    NAMUWIKI_REQUEST_TIMEOUT_SECONDS
-                    * NAMUWIKI_MAX_DOCUMENT_CANDIDATES
-                    * request_attempts_per_candidate
-                    + NAMUWIKI_REQUEST_INTERVAL_SECONDS
-                    * NAMUWIKI_MAX_DOCUMENT_CANDIDATES
-                    * request_attempts_per_candidate
-                    + 5
-                ),
-            )
-        except (asyncio.TimeoutError, NamuWikiLyricsError) as error:
-            logger.warning(
-                "NamuWiki lyrics lookup failed for %s: %s",
-                track.title,
-                error,
-            )
-            return None
-        except Exception:
-            logger.exception(
-                "Unexpected NamuWiki lyrics failure for %s",
-                track.title,
-            )
-            return None
-
-        track.namuwiki_lyrics_checked = True
-        if namuwiki_result is not None:
-            lyrics, source, source_url = namuwiki_result
-            track.korean_lyrics = lyrics
-            track.korean_lyrics_source = source
-            track.korean_lyrics_url = source_url
-            track.korean_lyrics_loaded = True
-            return lyrics
-        return None
-
-
-async def get_track_korean_lyrics(track: Track) -> str:
-    if track.korean_lyrics_loaded and track.korean_lyrics is not None:
-        return track.korean_lyrics
-
-    namuwiki_lyrics = await get_track_namuwiki_lyrics(track)
-    if namuwiki_lyrics is not None:
-        return namuwiki_lyrics
-
-    async with track.korean_lyrics_lock:
-        if track.korean_lyrics_loaded and track.korean_lyrics is not None:
-            return track.korean_lyrics
-        try:
-            youtube_result = await get_youtube_korean_lyrics(track)
-        except (YouTubeSubtitleError, YouTubeCircuitOpenError) as error:
-            raise KoreanLyricsError(str(error)) from error
-        if youtube_result is None:
-            raise KoreanLyricsError(
-                "No NamuWiki lyrics or manually provided Korean YouTube subtitles "
-                "are available."
-            )
-
-        lyrics, source = youtube_result
-        track.korean_lyrics = lyrics
-        track.korean_lyrics_source = source
-        track.korean_lyrics_url = None
-        track.korean_lyrics_loaded = True
-        return lyrics
-
-
 def cancel_lyrics_publish(state: GuildMusicState) -> None:
     task = state.lyrics_task
     if task and not task.done():
@@ -2348,7 +2112,6 @@ def cancel_lyrics_publish(state: GuildMusicState) -> None:
 async def clear_lyrics_message(guild_id: int, state: GuildMusicState) -> None:
     message = state.lyrics_message
     state.lyrics_message = None
-    replace_lyrics_view(state, None)
     if message is not None:
         await delete_music_channel_message(guild_id, message)
 
@@ -2356,7 +2119,6 @@ async def clear_lyrics_message(guild_id: int, state: GuildMusicState) -> None:
 def schedule_lyrics_message_cleanup(guild_id: int, state: GuildMusicState) -> None:
     message = state.lyrics_message
     state.lyrics_message = None
-    replace_lyrics_view(state, None)
     if message is not None and not bot_shutdown_started:
         create_housekeeping_task(delete_music_channel_message(guild_id, message))
 
@@ -2366,153 +2128,6 @@ def track_is_current(guild_id: int, track: Track) -> bool:
     return state is not None and state.current is track
 
 
-def replace_lyrics_view(
-    state: GuildMusicState,
-    view: discord.ui.View | None,
-    *,
-    message_id: int | None = None,
-) -> None:
-    previous_view = state.lyrics_view
-    state.lyrics_view = view
-    if previous_view is not None and previous_view is not view:
-        previous_view.stop()
-        if view is not None and message_id is not None:
-            # message.edit stores the new items before the old view is stopped.
-            # Identical custom IDs are removed with the old view, so restore them.
-            bot.add_view(view, message_id=message_id)
-
-
-async def send_private_lyrics_variant(
-    interaction: discord.Interaction,
-    guild_id: int,
-    track: Track,
-    *,
-    label: str,
-    text: str,
-    source: str,
-    filename: str,
-    source_url: str | None = None,
-    edit_original: bool = False,
-) -> None:
-    attachment: discord.File | None = None
-    if len(text) <= LYRICS_INLINE_LIMIT:
-        embed = make_lyrics_variant_embed(
-            track,
-            label,
-            text,
-            source,
-            source_url,
-        )
-    else:
-        embed = make_lyrics_variant_embed(
-            track,
-            label,
-            "내용이 길어 전체 내용을 파일로 첨부했어요.",
-            source,
-            source_url,
-        )
-        attachment = make_lyrics_file(text, filename)
-
-    if edit_original:
-        message = await interaction.edit_original_response(
-            content=None,
-            embed=embed,
-            attachments=[attachment] if attachment is not None else [],
-        )
-    else:
-        message = await send_ephemeral_followup(
-            interaction,
-            embed=embed,
-            file=attachment,
-            delete_after=None,
-        )
-    if message is not None:
-        await register_private_lyrics_message(guild_id, track, message)
-
-
-class LyricsVariantView(discord.ui.View):
-    def __init__(self, guild_id: int, track: Track, lyrics: str):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-        self.track = track
-
-        if can_show_korean_lyrics(track, lyrics):
-            korean_lyrics_button = discord.ui.Button(
-                label=get_korean_lyrics_label(track),
-                style=discord.ButtonStyle.secondary,
-                custom_id=f"lyrics:korean:{track.track_id}",
-            )
-            korean_lyrics_button.callback = self.show_korean_lyrics
-            self.add_item(korean_lyrics_button)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if track_is_current(self.guild_id, self.track):
-            return True
-        await send_ephemeral_response(
-            interaction,
-            "이미 재생이 끝난 곡이에요.",
-        )
-        return False
-
-    async def show_korean_lyrics(self, interaction: discord.Interaction) -> None:
-        logger.info("Korean lyrics button received for %s", self.track.title)
-        await interaction.response.send_message(
-            "가사 정보를 확인하고 있어요...",
-            ephemeral=True,
-        )
-        logger.info("Korean lyrics button acknowledged for %s", self.track.title)
-        try:
-            lyrics = await get_track_korean_lyrics(self.track)
-        except KoreanLyricsError as error:
-            logger.warning(
-                "Korean lyrics lookup failed for %s: %s",
-                self.track.title,
-                error,
-            )
-            message = await interaction.edit_original_response(
-                content="한국어 가사를 가져오지 못했어요. 잠시 후 다시 시도해 주세요.",
-                embed=None,
-                attachments=[],
-            )
-            create_housekeeping_task(
-                delete_message_later(message, EPHEMERAL_RESPONSE_DELETE_SECONDS)
-            )
-            return
-
-        if not track_is_current(self.guild_id, self.track):
-            message = await interaction.edit_original_response(
-                content="가사를 가져오는 동안 곡이 바뀌었어요.",
-                embed=None,
-                attachments=[],
-            )
-            create_housekeeping_task(
-                delete_message_later(message, EPHEMERAL_RESPONSE_DELETE_SECONDS)
-            )
-            return
-        await send_private_lyrics_variant(
-            interaction,
-            self.guild_id,
-            self.track,
-            label=get_korean_lyrics_label(self.track),
-            text=lyrics,
-            source=(
-                self.track.korean_lyrics_source
-                or get_korean_lyrics_label(self.track)
-            ),
-            filename="lyrics-korean.txt",
-            source_url=self.track.korean_lyrics_url,
-            edit_original=True,
-        )
-
-def make_lyrics_variant_view(
-    guild_id: int,
-    track: Track,
-    lyrics: str,
-) -> LyricsVariantView | None:
-    view = LyricsVariantView(guild_id, track, lyrics)
-    return view if view.children else None
-
-
 async def upsert_lyrics_message(
     guild_id: int,
     state: GuildMusicState,
@@ -2520,7 +2135,6 @@ async def upsert_lyrics_message(
     description: str,
     *,
     attachment_lyrics: str | None = None,
-    view: discord.ui.View | None = None,
 ) -> discord.Message | None:
     channel = resolve_control_panel_channel(guild_id, state)
     if channel is None or state.current is not track:
@@ -2537,7 +2151,6 @@ async def upsert_lyrics_message(
         ):
             await delete_music_channel_message(guild_id, message)
             state.lyrics_message = None
-            replace_lyrics_view(state, None)
             message = None
 
     embed = make_lyrics_embed(track, description)
@@ -2552,11 +2165,9 @@ async def upsert_lyrics_message(
                 content=None,
                 embed=embed,
                 attachments=attachments,
-                view=view,
             )
         except discord.NotFound:
             state.lyrics_message = None
-            replace_lyrics_view(state, None)
             message = None
         except discord.Forbidden:
             logger.warning(
@@ -2575,11 +2186,6 @@ async def upsert_lyrics_message(
                 )
                 return None
             state.lyrics_message = edited_message or message
-            replace_lyrics_view(
-                state,
-                view,
-                message_id=state.lyrics_message.id,
-            )
             return state.lyrics_message
 
     send_options: dict[str, object] = {
@@ -2588,8 +2194,6 @@ async def upsert_lyrics_message(
     }
     if attachment_lyrics is not None:
         send_options["file"] = make_lyrics_file(attachment_lyrics)
-    if view is not None:
-        send_options["view"] = view
     try:
         message = await channel.send(**send_options)
     except discord.Forbidden:
@@ -2603,7 +2207,6 @@ async def upsert_lyrics_message(
         await delete_music_channel_message(guild_id, message)
         return None
     state.lyrics_message = message
-    replace_lyrics_view(state, view, message_id=message.id)
     return message
 
 
@@ -2638,33 +2241,17 @@ async def publish_current_lyrics(guild_id: int, track: Track) -> None:
         if state.current is not track:
             return
         if not lyrics:
-            view = make_lyrics_variant_view(guild_id, track, "")
+            await upsert_lyrics_message(guild_id, state, track, "미제공")
+        elif len(lyrics) <= LYRICS_INLINE_LIMIT:
+            await upsert_lyrics_message(guild_id, state, track, lyrics)
+        else:
             await upsert_lyrics_message(
                 guild_id,
                 state,
                 track,
-                "미제공",
-                view=view,
+                "가사가 길어 전체 원문을 첨부했어요.",
+                attachment_lyrics=lyrics,
             )
-        else:
-            view = make_lyrics_variant_view(guild_id, track, lyrics)
-            if len(lyrics) <= LYRICS_INLINE_LIMIT:
-                await upsert_lyrics_message(
-                    guild_id,
-                    state,
-                    track,
-                    lyrics,
-                    view=view,
-                )
-            else:
-                await upsert_lyrics_message(
-                    guild_id,
-                    state,
-                    track,
-                    "가사가 길어 전체 원문을 첨부했어요.",
-                    attachment_lyrics=lyrics,
-                    view=view,
-                )
 
     except asyncio.CancelledError:
         raise
@@ -3041,6 +2628,20 @@ async def refill_autoplay_queue(
     added_track = False
     failure_count = 0
     successful_fetch_in_cycle = False
+    # Filling several tracks in a burst would edit the panel once per track
+    # and hit Discord's message edit rate limit, so refresh it once before a
+    # slow search and once when the refill ends.
+    panel_stale = False
+
+    async def refresh_stale_panel() -> None:
+        nonlocal panel_stale
+        if (
+            panel_stale
+            and state.current is not None
+            and generation == state.playback_generation
+        ):
+            await update_control_panel(guild_id, state)
+        panel_stale = False
 
     try:
         while autoplay_can_refill(state, generation):
@@ -3095,6 +2696,7 @@ async def refill_autoplay_queue(
                     state.autoplay_next_fetch_limit = None
 
             if candidate is None:
+                await refresh_stale_panel()
                 try:
                     candidates = await extract_auto_tracks_from_seed(
                         seed,
@@ -3274,8 +2876,7 @@ async def refill_autoplay_queue(
                     getattr(candidate, "_autoplay_source_index", None),
                     len(state.autoplay_candidate_pool),
                 )
-            if state.current is not None:
-                await update_control_panel(guild_id, state)
+            panel_stale = True
 
             if should_start:
                 advance_task = state.advance_task
@@ -3302,7 +2903,11 @@ async def refill_autoplay_queue(
                 ):
                     schedule_play_next(guild_id)
                 return
+    except asyncio.CancelledError:
+        panel_stale = False
+        raise
     finally:
+        await refresh_stale_panel()
         if state.autoplay_task is current_task:
             state.autoplay_task = None
             current_track_id = state.current.track_id if state.current else None
@@ -3690,7 +3295,6 @@ def stop_playback(state: GuildMusicState, guild_id: int) -> None:
     state.stop_requested = True
     state.queue.clear()
     clear_autoplay_candidate_pool(state)
-    schedule_private_lyrics_cleanup(state)
     if state.current is not None:
         reset_track_playback_state(state.current)
     state.current = None
@@ -4688,7 +4292,6 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
 
                             cancel_noncritical_tasks(state)
                             cancel_lyrics_publish(state)
-                            schedule_private_lyrics_cleanup(state, track.track_id)
                             if error:
                                 retrying = requeue_track_after_playback_error(
                                     state,

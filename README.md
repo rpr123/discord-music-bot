@@ -91,14 +91,6 @@ EPHEMERAL_RESPONSE_DELETE_SECONDS=15
 QUEUE_DELETE_RESPONSE_DELETE_SECONDS=30
 LYRICS_API_URL=https://lrclib.net/api/search
 LYRICS_REQUEST_TIMEOUT_SECONDS=10
-NAMUWIKI_LYRICS_ENABLED=true
-NAMUWIKI_PAGE_BASE_URL=https://namu.wiki/w
-NAMUWIKI_API_BASE_URL=https://wiki-api.namu.la/api
-# NAMUWIKI_API_TOKEN=
-NAMUWIKI_PREVIEW_FALLBACK_ENABLED=true
-NAMUWIKI_REQUEST_TIMEOUT_SECONDS=10
-NAMUWIKI_REQUEST_INTERVAL_SECONDS=1.1
-# NAMUWIKI_DOCUMENT_OVERRIDES={"video:abcdefghijk":"泥濘鳴鳴"}
 # YOUTUBE_COOKIES_FILE=./cookies.txt
 YTDL_EXTRACT_TIMEOUT_SECONDS=45
 YTDL_MAX_CONCURRENT_EXTRACTIONS=1
@@ -136,11 +128,7 @@ AUTOPLAY_HISTORY_TTL_SECONDS=43200
 
 마지막 곡이 끝나거나 정지 버튼으로 재생을 멈춘 뒤 대기열도 비어 있으면 `IDLE_VOICE_DISCONNECT_DELAY_SECONDS`가 지난 후 봇이 음성 채널에서 자동으로 나갑니다. 기본값은 `300`초(5분)이며, 그 전에 새 곡이 추가되거나 재생되면 기존 타이머를 취소합니다. 일시정지는 재생 중으로 취급해 타이머를 시작하지 않습니다. `0`으로 설정하면 사람이 남아 있는 동안의 유휴 자동 퇴장을 끌 수 있습니다. 사람이 모두 나간 빈 음성 채널에서 3초 뒤 나가는 기존 동작은 이 설정과 별개로 유지됩니다.
 
-곡이 재생된 뒤 `LYRICS_START_DELAY_SECONDS`가 지나면 LRCLIB에서 현재 곡을 찾아 전용 채널에 별도의 원문 가사 메시지를 자동으로 보냅니다. LRCLIB에 결과가 없거나 조회에 실패하면 해당 YouTube 영상에서 제공하는 수동 자막을 한 번 더 확인하며, 자동 생성 자막은 가사로 사용하지 않습니다. 두 출처 모두 결과가 없으면 원문 메시지에는 `미제공`으로 표시합니다. 나무위키는 곡 전환 때 자동 조회하지 않고 `나무위키 가사` 버튼을 누를 때만 확인합니다. 자막 정보는 재생을 위해 이미 조회한 영상 정보에서 재사용하므로 별도의 영상 재검색은 하지 않습니다. 이후 곡이 바뀔 때는 원문 메시지를 수정하고, 재생목록이 완전히 끝나거나 정지·퇴장할 때 메시지를 삭제합니다. 같은 곡의 로마자판과 원문 문자판이 함께 검색되면 원문 문자판을 우선합니다. Discord 메시지 길이 제한을 넘는 가사는 같은 메시지의 UTF-8 텍스트 파일로 전체 원문을 첨부합니다. LRCLIB가 과부하(HTTP 503)나 요청 제한(429)을 반환하면 2초, 5초 뒤 다시 시도합니다. 제목이 `곡명 - 아티스트` 순서여도 채널명이나 YouTube 아티스트 정보와 맞는 쪽을 아티스트로 보고, 판단할 수 없으면 곡명만으로 찾은 뒤 반대 순서로 한 번 더 찾습니다. `/` 구분자도 인식하며, YouTube가 여러 아티스트를 나열하면 첫 아티스트로 검색합니다. 아티스트가 일치하지 않는 결과는 영상 제목이 주로 일본어·한국어 같은 비라틴 문자인데 가사가 그렇지 않으면 다른 곡으로 보고 사용하지 않습니다. `LYRICS_REQUEST_TIMEOUT_SECONDS`는 LRCLIB 요청 하나를 기다리는 최대 시간이며, 재시도를 포함한 한 곡의 LRCLIB 조회는 이 값의 3배 안에서 끝냅니다. `YOUTUBE_LYRICS_FALLBACK=false`로 수동 자막 fallback을 끌 수 있습니다.
-
-원문이 한국어가 아니면 가사 메시지에 `나무위키 가사` 버튼이 표시됩니다. 외국어 곡의 원문을 LRCLIB와 YouTube에서 찾지 못해 `미제공`으로 표시된 경우에도 버튼은 남습니다. 버튼을 누른 사용자에게만 결과를 보여주며, 먼저 곡명과 같은 나무위키 문서의 가사 표에서 `원문 → 한글 독음 → 한국어 번역`의 세 줄 묶음을 순서 그대로 가져옵니다. 열로 나뉜 표와 한 셀 또는 여러 행에 세 줄씩 이어지는 표를 모두 처리하며, 접기 문구·제목 뜻·번역 없는 독음 행은 제외합니다. 성공한 결과에는 원문 문서 링크와 출처를 표시합니다. 나무위키 가사가 없고 업로더가 직접 제공한 YouTube 수동 한국어 자막만 사용할 수 있으면 버튼 이름이 `한국어 자막`으로 바뀝니다. 자동 생성 자막과 `tlang=ko` 기계 번역 자막은 사용하지 않습니다. 최초 성공 결과와 출처는 현재 곡에 캐시하며, 개인 가사 메시지는 해당 곡이 끝나거나 스킵·정지되면 바로 삭제됩니다.
-
-`NAMUWIKI_LYRICS_ENABLED=true`는 나무위키 조회와 나무위키 가사 버튼을 켭니다. 기본값은 공개 문서 HTML을 `NAMUWIKI_REQUEST_INTERVAL_SECONDS` 이상의 간격으로 읽습니다. GCP에서 일반 페이지가 HTTP 403 또는 보안 확인 화면을 반환하면 `NAMUWIKI_PREVIEW_FALLBACK_ENABLED=true`가 같은 문서의 Discord 링크 미리보기용 HTML로 한 번 재시도하며, 성공한 프로세스에서는 이후 조회에도 그 경로를 우선 사용합니다. 별도 토큰은 필요하지 않습니다. `api_access` 권한이 있는 계정의 토큰을 `NAMUWIKI_API_TOKEN`에 넣은 경우에는 [the seed 공개 API](https://doc.theseed.io/)의 나무마크 원문을 가장 먼저 사용합니다. 영상 제목의 아티스트 접두사와 `Official MV` 같은 표시는 자동으로 제거합니다. 동명곡은 맨제목 문서의 `가수` 항목을 현재 트랙과 비교하며, 다르면 `곡명(아티스트)` 문서를 이어서 확인합니다. 그래도 문서명이 다르면 `NAMUWIKI_DOCUMENT_OVERRIDES`에 `video:YouTube영상ID` 또는 곡 식별 키와 정확한 문서명을 한 줄짜리 JSON 객체로 지정할 수 있습니다. 예를 들어 `{"video:keOnleW2eak":"らしさ(Official髭男dism)"}`처럼 설정합니다. 토큰은 `.env`에만 두고 커밋하지 마세요. 예전 기계번역용 `LYRICS_TRANSLATION_ENABLED` 설정은 더 이상 사용하지 않으므로 기존 `.env`에서 삭제해도 됩니다.
+곡이 재생된 뒤 `LYRICS_START_DELAY_SECONDS`가 지나면 LRCLIB에서 현재 곡을 찾아 전용 채널에 별도의 원문 가사 메시지를 자동으로 보냅니다. LRCLIB에 결과가 없거나 조회에 실패하면 해당 YouTube 영상에서 제공하는 수동 자막을 한 번 더 확인하며, 자동 생성 자막은 가사로 사용하지 않습니다. 두 출처 모두 결과가 없으면 원문 메시지에는 `미제공`으로 표시합니다. 자막 정보는 재생을 위해 이미 조회한 영상 정보에서 재사용하므로 별도의 영상 재검색은 하지 않습니다. 이후 곡이 바뀔 때는 원문 메시지를 수정하고, 재생목록이 완전히 끝나거나 정지·퇴장할 때 메시지를 삭제합니다. 같은 곡의 로마자판과 원문 문자판이 함께 검색되면 원문 문자판을 우선합니다. Discord 메시지 길이 제한을 넘는 가사는 같은 메시지의 UTF-8 텍스트 파일로 전체 원문을 첨부합니다. LRCLIB가 과부하(HTTP 503)나 요청 제한(429)을 반환하면 2초, 5초, 10초, 15초 간격으로 다시 시도합니다. 제목이 `곡명 - 아티스트` 순서여도 채널명이나 YouTube 아티스트 정보와 맞는 쪽을 아티스트로 보고, 판단할 수 없으면 곡명만으로 찾은 뒤 반대 순서로 한 번 더 찾습니다. `/` 구분자도 인식하며, YouTube가 여러 아티스트를 나열하면 첫 아티스트로 검색합니다. 아티스트가 일치하지 않는 결과는 영상 제목이 주로 일본어·한국어 같은 비라틴 문자인데 가사가 그렇지 않으면 다른 곡으로 보고 사용하지 않습니다. `LYRICS_REQUEST_TIMEOUT_SECONDS`는 LRCLIB 요청 하나를 기다리는 최대 시간이며, 재시도를 포함한 한 곡의 LRCLIB 조회는 이 값의 6배(기본 60초) 안에서 끝냅니다. `YOUTUBE_LYRICS_FALLBACK=false`로 수동 자막 fallback을 끌 수 있습니다.
 
 `YTDL_MIN_INTERVAL_SECONDS=6`은 일반 yt-dlp 작업 사이에 최소 6초를 둡니다. 백그라운드 자동재생 조회에는 더 보수적인 `AUTOPLAY_MIN_INTERVAL_SECONDS=15`를 적용하며, 사용자가 직접 실행한 검색과 `autoN:` 요청은 기존 간격을 사용합니다. yt-dlp 작업은 기본 한 개의 worker가 처리하며, 재생 직전 스트림 해석, 사용자 검색, 앨범·재생목록, 자동재생 순서로 대기 작업을 선택합니다. 현재 곡의 재생에 필요한 스트림 URL 해석은 이 간격을 기다리지 않으며, 아직 요청 간격을 기다리는 자동재생 작업보다 먼저 실행됩니다. 자동재생 보충은 재생 시작 후 `AUTOPLAY_START_DELAY_SECONDS`가 지난 뒤 실행됩니다. 가사는 `LYRICS_START_DELAY_SECONDS` 뒤에 시작해 FFmpeg·자동재생·가사 조회가 곡 전환 순간에 한꺼번에 몰리지 않게 합니다. 가벼운 YouTube Music 메타데이터와 YouTube 수동 자막 조회는 yt-dlp worker와 분리된 한 개의 보조 네트워크 슬롯을 사용합니다. Music 조회는 별도의 `YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS=1`을, 수동 자막은 `YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS=6`을 사용하므로 느린 자막 요청이 재생용 스트림 해석을 막지 않습니다. Music 결과와 일반 검색 결과는 `YTDL_CACHE_TTL_SECONDS` 동안 메모리에서 재사용하며, 기본 캐시 수는 저사양 서버에 맞춰 16개로 제한합니다. 일반 YouTube fallback은 `YOUTUBE_SEARCH_CANDIDATES`개의 가벼운 결과에서 제목 일치도, Music에서 얻은 아티스트, 길이, `Full Version`, `Short Ver.`, `Game MV` 같은 표시를 비교해 풀 버전을 우선합니다. 선택된 영상의 스트림은 실제 재생 직전에 준비하므로 오래 대기한 스트림 URL을 다시 받는 요청도 줄어듭니다. 직접 URL을 보냈거나 검색어에 `short`, `game mv`, `live`, `cover`, `off vocal` 같은 버전을 명시한 경우에는 Music 카탈로그를 건너뛰고 그 요청을 우선합니다. 후보 수는 최대 20입니다. 429 또는 봇 확인 오류가 감지되면 `YOUTUBE_CIRCUIT_BREAKER_SECONDS` 동안 새 YouTube 요청을 즉시 거절해 차단을 더 악화시키지 않습니다. 자동재생 검색 실패도 1분, 2분, 5분, 15분, 30분 순서로 간격을 늘려 재시도합니다.
 
@@ -171,7 +159,6 @@ GCP 같은 클라우드 서버에서 `Sign in to confirm you're not a bot` 오�
 
 점수 조정 시 `selection`에서 선택된 곡과 밀린 후보를 비교하고, 같은 `search_id`의 `search_results`에서 제목·길이·채널·방송 상태·스타일을 확인하면 됩니다. `schema_version`과 `policy_version`도 기록합니다. 이 로그는 대기열 선택 기록이며 실제 청취 완료 기록은 아닙니다. 요청자 정보, 인증 정보와 재생용 스트림 URL은 저장하지 않습니다. 파일 기록 실패로 재생을 중단하지 않습니다.
 
-
 재생은 Opus 형식을 우선 선택하고 가능한 경우 재인코딩 없이 Discord로 전달합니다. 공용 `BOT_VOLUME` 처리는 CPU 절약을 위해 제거했으며, 음량은 각 사용자가 Discord에서 봇을 우클릭해 사용자 음량으로 조절합니다.
 
 ## 개발 및 검증
@@ -185,7 +172,7 @@ python -m compileall -q .
 python -m unittest discover -s tests -q
 ```
 
-단위 테스트에는 Discord token이나 YouTube credential이 필요하지 않습니다. Discord, YouTube, LRCLIB, 나무위키와 subprocess 경계를 mock해 parsing, policy, orchestration, cancellation을 검증하며, 실제 외부 서비스와의 호환성을 보증하는 live integration test는 아닙니다.
+단위 테스트에는 Discord token이나 YouTube credential이 필요하지 않습니다. Discord, YouTube, LRCLIB와 subprocess 경계를 mock해 parsing, policy, orchestration, cancellation을 검증하며, 실제 외부 서비스와의 호환성을 보증하는 live integration test는 아닙니다.
 
 실제 Discord 연결과 FFmpeg 재생 흐름을 YouTube 검색 대신 로컬 음원으로 점검하려면 바로 다음 개발 하네스를 사용하세요.
 

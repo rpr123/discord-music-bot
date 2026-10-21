@@ -114,7 +114,6 @@ class MusicModelTests(unittest.TestCase):
                 expires_at=2.0,
             )
         )
-        first.private_lyrics_messages[track.track_id] = []
         first.queue_cleanup_tasks[1] = object()
         track.manual_subtitles["ko"] = []
 
@@ -123,7 +122,6 @@ class MusicModelTests(unittest.TestCase):
         self.assertFalse(second.recent_track_keys)
         self.assertFalse(second.recent_video_ids)
         self.assertFalse(second.recent_playbacks)
-        self.assertFalse(second.private_lyrics_messages)
         self.assertFalse(second.queue_cleanup_tasks)
         self.assertFalse(self.make_track("other").manual_subtitles)
 
@@ -143,7 +141,6 @@ class MusicModelTests(unittest.TestCase):
             "empty_channel_task",
             "idle_voice_task",
             "lyrics_message",
-            "lyrics_view",
         ):
             self.assertIsNone(getattr(first, name))
 
@@ -182,12 +179,6 @@ class MusicModelTests(unittest.TestCase):
                 "lyrics",
                 "lyrics_loaded",
                 "lyrics_source",
-                "korean_lyrics",
-                "korean_lyrics_loaded",
-                "korean_lyrics_source",
-                "korean_lyrics_url",
-                "namuwiki_lyrics_checked",
-                "korean_lyrics_lock",
                 "manual_subtitles",
                 "subtitle_language",
                 "track_id",
@@ -222,8 +213,6 @@ class MusicModelTests(unittest.TestCase):
                 "autoplay_task",
                 "lyrics_task",
                 "lyrics_message",
-                "lyrics_view",
-                "private_lyrics_messages",
                 "queue_cleanup_tasks",
                 "empty_channel_task",
                 "idle_voice_task",

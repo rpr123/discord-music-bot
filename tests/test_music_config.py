@@ -36,14 +36,6 @@ MOVED_NAMES = (
     "MUSIC_CHANNEL_SILENT",
     "MUSIC_CHANNELS_FILE",
     "MUSIC_FEEDBACK_DELETE_SECONDS",
-    "NAMUWIKI_API_BASE_URL",
-    "NAMUWIKI_API_TOKEN",
-    "NAMUWIKI_DOCUMENT_OVERRIDES",
-    "NAMUWIKI_LYRICS_ENABLED",
-    "NAMUWIKI_PAGE_BASE_URL",
-    "NAMUWIKI_PREVIEW_FALLBACK_ENABLED",
-    "NAMUWIKI_REQUEST_INTERVAL_SECONDS",
-    "NAMUWIKI_REQUEST_TIMEOUT_SECONDS",
     "PROJECT_DIR",
     "QUEUE_DELETE_RESPONSE_DELETE_SECONDS",
     "QUEUE_SELECT_LIMIT",
@@ -85,7 +77,6 @@ MOVED_NAMES = (
     "logger",
     "parse_nonnegative_float_env",
     "parse_positive_int_env",
-    "parse_string_map_env",
     "resolve_project_path",
     "save_music_channel_config",
     "set_autoplay_enabled",
@@ -126,7 +117,6 @@ class MusicConfigTests(unittest.TestCase):
     def test_bot_and_config_share_logger_and_parser_warnings(self) -> None:
         positive_name = "MUSIC_CONFIG_TEST_POSITIVE_WARNING"
         float_name = "MUSIC_CONFIG_TEST_FLOAT_WARNING"
-        map_name = "MUSIC_CONFIG_TEST_MAP_WARNING"
 
         self.assertIs(bot.logger, music_config.logger)
         with patch.dict(
@@ -134,7 +124,6 @@ class MusicConfigTests(unittest.TestCase):
             {
                 positive_name: "invalid",
                 float_name: "-0.5",
-                map_name: "not-json",
             },
             clear=False,
         ):
@@ -157,25 +146,17 @@ class MusicConfigTests(unittest.TestCase):
                     1.25,
                 )
 
-                warning.reset_mock()
-                self.assertEqual(bot.parse_string_map_env(map_name), {})
-                warning.assert_called_once_with(
-                    "%s must be a JSON object. Ignoring its value.",
-                    map_name,
-                )
 
     def test_environment_parsers_preserve_valid_values(self) -> None:
         positive_name = "MUSIC_CONFIG_TEST_POSITIVE_VALUE"
         minimum_name = "MUSIC_CONFIG_TEST_POSITIVE_MINIMUM"
         float_name = "MUSIC_CONFIG_TEST_FLOAT_VALUE"
-        map_name = "MUSIC_CONFIG_TEST_MAP_VALUE"
         with patch.dict(
             music_config.os.environ,
             {
                 positive_name: "17",
                 minimum_name: "0",
                 float_name: "0.25",
-                map_name: '{" artist ": " document ", "": "ignored", "count": 3}',
             },
             clear=False,
         ):
@@ -184,10 +165,6 @@ class MusicConfigTests(unittest.TestCase):
             self.assertEqual(
                 bot.parse_nonnegative_float_env(float_name, 5.0),
                 0.25,
-            )
-            self.assertEqual(
-                bot.parse_string_map_env(map_name),
-                {"artist": "document", "count": "3"},
             )
 
     def test_load_env_file_preserves_existing_and_parses_supported_lines(self) -> None:

@@ -117,17 +117,6 @@ async def notify_playback_error(state: GuildMusicState, content: str) -> None:
         log_discord_http_error("sending a playback error message", error)
 
 
-async def delete_private_interaction_message(
-    message: discord.WebhookMessage | discord.InteractionMessage,
-) -> None:
-    try:
-        await message.delete()
-    except discord.NotFound:
-        pass
-    except discord.HTTPException as error:
-        log_discord_http_error("deleting a private interaction message", error)
-
-
 def format_duration(seconds: int | None) -> str:
     if seconds is None:
         return "live"
@@ -344,28 +333,6 @@ def make_lyrics_embed(track: Track, description: str) -> discord.Embed:
 
     source = track.lyrics_source or "LRCLIB → YouTube 수동 자막"
     embed.set_footer(text=f"{source} · 원문 가사")
-    return embed
-
-
-def make_lyrics_variant_embed(
-    track: Track,
-    label: str,
-    description: str,
-    source: str,
-    source_url: str | None = None,
-) -> discord.Embed:
-    song_title = track.song_name or track.title
-    embed = discord.Embed(
-        title=f"{label} · {truncate_text(song_title, 220)}",
-        description=description,
-        color=discord.Color.blurple(),
-    )
-    artist = track.artist or track.uploader
-    if artist:
-        embed.set_author(name=truncate_text(artist, 200))
-    if source_url:
-        embed.url = source_url
-    embed.set_footer(text=source)
     return embed
 
 
