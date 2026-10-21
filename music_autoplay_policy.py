@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import random
 import time
 from typing import Deque
 
@@ -25,6 +27,9 @@ AUTOPLAY_RECENT_OVERLAP_MEDIUM = 0.30
 AUTOPLAY_RECENT_OVERLAP_HIGH = 0.60
 AUTOPLAY_MEDIUM_FETCH_LIMIT = 12
 AUTOPLAY_HIGH_FETCH_LIMIT = 15
+# A fresh track this many quality points below the best is ~e times less likely.
+AUTOPLAY_SELECTION_TEMPERATURE = 30.0
+_autoplay_random = random.Random()
 
 
 def _prune_expired_recent_values(
@@ -288,6 +293,57 @@ def select_autoplay_candidate(
     return oldest_recent_candidate
 
 
+def _sample_fresh_autoplay_candidates(
+    state: GuildMusicState,
+    candidates: list[Track],
+    excluded_keys: set[str],
+    *,
+    limit: int,
+    now: float,
+    rng: random.Random,
+) -> list[Track]:
+    recent_keys = set(_get_recent_expiry_by_key(state, now))
+    seen_keys = _get_active_track_keys(state) | excluded_keys
+    fresh: list[Track] = []
+    for candidate in candidates:
+        identity_keys = get_track_identity_keys(candidate)
+        if not identity_keys.isdisjoint(seen_keys):
+            continue
+        seen_keys.update(identity_keys)
+        if identity_keys.isdisjoint(recent_keys):
+            fresh.append(candidate)
+    if len(fresh) <= limit:
+        return candidates
+
+    def quality(candidate: Track) -> int:
+        return int(getattr(candidate, "_autoplay_score", 0))
+
+    best_quality = max(quality(candidate) for candidate in fresh)
+
+    # Weighted sampling without replacement: every fresh track can win, and
+    # better or earlier Radio entries (via the quality score) win more often.
+    def sample_key(candidate: Track) -> float:
+        inverse_weight = math.exp(
+            (best_quality - quality(candidate)) / AUTOPLAY_SELECTION_TEMPERATURE
+        )
+        return math.log(1.0 - rng.random()) * inverse_weight
+
+    sampled_ids = {
+        candidate.track_id
+        for candidate in sorted(fresh, key=sample_key, reverse=True)[:limit]
+    }
+    dropped_ids = {
+        candidate.track_id
+        for candidate in fresh
+        if candidate.track_id not in sampled_ids
+    }
+    return [
+        candidate
+        for candidate in candidates
+        if candidate.track_id not in dropped_ids
+    ]
+
+
 def select_autoplay_candidates(
     state: GuildMusicState,
     candidates: list[Track],
@@ -296,6 +352,7 @@ def select_autoplay_candidates(
     limit: int,
     recent_penalty: int | None = None,
     now: float | None = None,
+    rng: random.Random | None = None,
 ) -> list[Track]:
     if limit <= 0:
         return []
@@ -303,6 +360,15 @@ def select_autoplay_candidates(
     current_time = time.monotonic() if now is None else now
     selected: list[Track] = []
     selected_keys = set(extra_excluded_keys or ())
+    if recent_penalty is not None:
+        candidates = _sample_fresh_autoplay_candidates(
+            state,
+            candidates,
+            selected_keys,
+            limit=limit,
+            now=current_time,
+            rng=rng or _autoplay_random,
+        )
     while len(selected) < limit:
         candidate = select_autoplay_candidate(
             state,
@@ -447,5 +513,5 @@ def log_autoplay_selection(
     log_autoplay_event(
         "selection", guild_id=guild_id, source=source,
         seed=describe_autoplay_track(seed), candidates=records,
-        selection_rule="fresh_first_then_oldest_recent_then_quality",
+        selection_rule="weighted_fresh_sample_then_oldest_recent_then_quality",
     )

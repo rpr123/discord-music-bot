@@ -130,7 +130,7 @@ AUTOPLAY_HISTORY_TTL_SECONDS = parse_positive_int_env(
     "AUTOPLAY_HISTORY_TTL_SECONDS", 12 * 60 * 60
 )
 AUTOPLAY_REFILL_CANDIDATES = min(
-    parse_positive_int_env("AUTOPLAY_REFILL_CANDIDATES", 10),
+    parse_positive_int_env("AUTOPLAY_REFILL_CANDIDATES", 25),
     MAX_AUTO_TRACKS,
 )
 AUTOPLAY_MIN_INTERVAL_SECONDS = parse_nonnegative_float_env(

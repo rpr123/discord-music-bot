@@ -267,6 +267,76 @@ class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(getattr(tracks[1], "_autoplay_score"), 60)
 
+    async def test_background_autoplay_excludes_covers_without_cover_intent(
+        self,
+    ) -> None:
+        seed = bot.Track(
+            title="Seed Song",
+            webpage_url="https://example.test/seed",
+            requester="tester",
+            source_url="https://example.test/seed",
+        )
+        entries = [
+            {
+                "id": "aaaaaaaaaaa",
+                "title": "Artist A - Candidate (Self Cover)",
+                "duration": 240,
+            },
+            {
+                "id": "bbbbbbbbbbb",
+                "title": "Artist B - Plain Candidate",
+                "duration": 240,
+            },
+            {
+                "id": "ccccccccccc",
+                "title": "Artist C - Cover Me",
+                "duration": 240,
+            },
+        ]
+
+        for job_kind, expected in (
+            (
+                bot.YtdlJobKind.AUTOPLAY,
+                ["Seed Song", "Artist B - Plain Candidate", "Artist C - Cover Me"],
+            ),
+            (
+                bot.YtdlJobKind.USER_REQUEST,
+                [
+                    "Seed Song",
+                    "Artist B - Plain Candidate",
+                    "Artist C - Cover Me",
+                    "Artist A - Candidate (Self Cover)",
+                ],
+            ),
+        ):
+            with (
+                self.subTest(job_kind=job_kind),
+                patch.object(
+                    bot,
+                    "extract_ytdl_info",
+                    new=AsyncMock(return_value={"entries": entries}),
+                ),
+                patch.object(bot, "log_autoplay_event") as log_event,
+            ):
+                tracks = await bot.extract_auto_tracks_from_seed(
+                    seed,
+                    "자동재생",
+                    4,
+                    job_kind=job_kind,
+                )
+
+                self.assertEqual([track.title for track in tracks], expected)
+                statuses = {
+                    record["title"]: record["status"]
+                    for record in log_event.call_args.kwargs["candidates"]
+                }
+                self.assertEqual(
+                    statuses["Artist A - Candidate (Self Cover)"],
+                    "cover_excluded"
+                    if job_kind == bot.YtdlJobKind.AUTOPLAY
+                    else "candidate",
+                )
+
     async def test_manual_auto_passes_original_query_as_style_context(self) -> None:
         seed_info = {
             "id": "abcdefghijk",
@@ -5633,6 +5703,8 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
             ) as extract,
             patch.object(bot, "extract_auto_tracks", new=AsyncMock()) as query_extract,
             patch.object(bot, "update_control_panel", new=AsyncMock()) as update_panel,
+            # Adaptive 12/15 limits only apply below the default of 25.
+            patch.object(bot, "AUTOPLAY_REFILL_CANDIDATES", 10),
         ):
             await bot.refill_autoplay_queue(
                 guild_id,
@@ -5645,10 +5717,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.autoplay_next_fetch_limit, 12)
         extract.assert_awaited_once()
         self.assertIs(extract.await_args.args[0], queued)
-        self.assertEqual(
-            extract.await_args.args[2],
-            bot.AUTOPLAY_REFILL_CANDIDATES,
-        )
+        self.assertEqual(extract.await_args.args[2], 10)
         self.assertEqual(
             extract.await_args.kwargs["job_kind"],
             bot.YtdlJobKind.AUTOPLAY,

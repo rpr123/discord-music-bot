@@ -1,12 +1,13 @@
 import ast
+import random
 import unittest
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 
 import bot
 import music_autoplay_policy
 import music_track_metadata
-from music_models import GuildMusicState, Track
+from music_models import AUTOPLAY_HISTORY_SIZE, GuildMusicState, Track
 
 
 MOVED_NAMES = (
@@ -191,13 +192,15 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             ["First display", "Bridge display", "Second display", "First display"],
         )
 
-    def test_recent_playback_history_prunes_expired_entries_and_caps_at_fifty(
+    def test_recent_playback_history_prunes_expired_entries_and_caps_size(
         self,
     ) -> None:
+        size = AUTOPLAY_HISTORY_SIZE
+        self.assertEqual(size, 200)
         state = GuildMusicState()
         tracks = [
             make_track(f"track {index}", video_id=f"{index:011d}")
-            for index in range(51)
+            for index in range(size + 1)
         ]
         for index, track in enumerate(tracks):
             music_autoplay_policy.remember_recent_playback(
@@ -207,8 +210,8 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
                 played_at=1_700_000_000.0 + index,
             )
 
-        entries = music_autoplay_policy.get_recent_playbacks(state, now=50.0)
-        self.assertEqual(len(entries), 50)
+        entries = music_autoplay_policy.get_recent_playbacks(state, now=float(size))
+        self.assertEqual(len(entries), size)
         self.assertNotIn("track 0", {entry.title for entry in entries})
 
         entries = music_autoplay_policy.get_recent_playbacks(
@@ -217,7 +220,7 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             [entry.title for entry in entries],
-            [f"track {index}" for index in range(50, 25, -1)],
+            [f"track {index}" for index in range(size, 25, -1)],
         )
 
     def test_autoplay_history_expires_at_configured_ttl(self) -> None:
@@ -302,11 +305,12 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             music_track_metadata.get_track_identity_keys(first).issubset(excluded)
         )
 
-    def test_autoplay_history_keeps_only_fifty_most_recent_tracks(self) -> None:
+    def test_autoplay_history_keeps_only_most_recent_tracks(self) -> None:
+        size = AUTOPLAY_HISTORY_SIZE
         state = GuildMusicState()
         tracks = [
             make_track(f"track {index}", video_id=f"{index:011d}")
-            for index in range(51)
+            for index in range(size + 1)
         ]
 
         for track in tracks:
@@ -316,8 +320,8 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
                 now=0.0,
             )
 
-        self.assertEqual(len(state.recent_track_keys), 50)
-        self.assertEqual(len(state.recent_video_ids), 50)
+        self.assertEqual(len(state.recent_track_keys), size)
+        self.assertEqual(len(state.recent_video_ids), size)
         excluded = music_autoplay_policy.get_autoplay_excluded_keys(state, now=0.0)
         self.assertTrue(
             music_track_metadata.get_track_identity_keys(tracks[0]).isdisjoint(excluded)
@@ -767,6 +771,59 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
                         recent_penalty=penalty, now=20.0,
                     )
                     self.assertEqual(selected, [fresh_high, fresh_low, older, newer])
+
+    def test_scored_selection_samples_fresh_tracks_beyond_the_top_scores(
+        self,
+    ) -> None:
+        fresh = [
+            make_track(f"fresh {index}", video_id=f"f{index:010d}")
+            for index in range(20)
+        ]
+        recent = make_track("recent", video_id="rrrrrrrrrrr")
+        state = GuildMusicState()
+        music_autoplay_policy.remember_autoplay_track(state, recent, now=0.0)
+        setattr(recent, "_autoplay_score", 1000)
+        for index, track in enumerate(fresh):
+            setattr(track, "_autoplay_score", 120 - index * 3)
+
+        picks: Counter[str] = Counter()
+        rng = random.Random(1234)
+        for _ in range(400):
+            selected = music_autoplay_policy.select_autoplay_candidates(
+                state, [recent, *fresh], limit=7,
+                recent_penalty=80, now=1.0, rng=rng,
+            )
+            self.assertEqual(len(selected), 7)
+            self.assertNotIn(recent, selected)
+            scores = [getattr(track, "_autoplay_score") for track in selected]
+            self.assertEqual(scores, sorted(scores, reverse=True))
+            self.assertEqual(
+                getattr(selected[0], "_autoplay_recent_penalty"),
+                80,
+            )
+            picks.update(track.title for track in selected)
+
+        # Lower-ranked tracks still play, but the top of the Radio list wins more.
+        self.assertTrue(all(picks[track.title] > 0 for track in fresh))
+        self.assertGreater(picks["fresh 0"], picks["fresh 10"])
+        self.assertGreater(picks["fresh 10"], picks["fresh 19"])
+
+    def test_scored_selection_keeps_every_fresh_track_when_within_limit(
+        self,
+    ) -> None:
+        fresh = [
+            make_track(f"fresh {index}", video_id=f"f{index:010d}")
+            for index in range(7)
+        ]
+        for index, track in enumerate(fresh):
+            setattr(track, "_autoplay_score", index)
+
+        selected = music_autoplay_policy.select_autoplay_candidates(
+            GuildMusicState(), fresh, limit=7,
+            recent_penalty=80, now=1.0, rng=random.Random(0),
+        )
+
+        self.assertEqual(selected, list(reversed(fresh)))
 
     def test_scored_recent_fallback_uses_latest_matching_identity(self) -> None:
         replayed = make_track("original title", video_id="aaaaaaaaaaa")

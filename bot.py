@@ -2903,6 +2903,15 @@ async def extract_auto_tracks_from_seed(
             if not seen_keys.isdisjoint(identity_keys):
                 record["status"] = "seed_or_duplicate"
                 continue
+            if (
+                job_kind == YtdlJobKind.AUTOPLAY
+                and "cover" not in frozen_style_intents
+                and "cover" in get_version_style_intents(
+                    str(entry.get("title") or "")
+                )
+            ):
+                record["status"] = "cover_excluded"
+                continue
             if len(tracks) >= auto_count:
                 record["status"] = "candidate_limit"
                 continue

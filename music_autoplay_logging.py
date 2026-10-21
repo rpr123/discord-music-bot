@@ -27,7 +27,7 @@ def log_autoplay_event(event: str, **details: object) -> None:
         message = json.dumps(
             {
                 "schema_version": 1,
-                "policy_version": "fresh_first_v1",
+                "policy_version": "weighted_fresh_v2",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "event": event,
                 **details,
