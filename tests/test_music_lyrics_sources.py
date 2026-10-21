@@ -1,8 +1,10 @@
 import ast
+import io
 import json
 import unittest
+import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import bot
 import music_lyrics_sources
@@ -82,6 +84,7 @@ class MusicLyricsSourcesTests(unittest.TestCase):
                 "music_models",
                 "music_search_scoring",
                 "re",
+                "time",
                 "unicodedata",
                 "urllib.error",
                 "urllib.parse",
@@ -293,7 +296,194 @@ class LyricsLookupTests(unittest.TestCase):
             lyrics = music_lyrics_sources.lookup_track_lyrics(track)
 
         self.assertEqual(lyrics, "Japanese lyrics fixture")
-        request.assert_called_once_with("rashisa", "official hige dandism")
+        request.assert_called_once()
+        self.assertEqual(request.call_args.args, ("rashisa", "official hige dandism"))
+
+    def test_title_side_matching_the_channel_is_used_as_artist(self) -> None:
+        cases = (
+            ("廻廻奇譚 - Eve MV", "Eve", ("廻廻奇譚", "eve")),
+            (
+                "W/X/Y - Tani Yuuki (Official Lyric Video)",
+                "Tani Yuuki",
+                ("w/x/y", "tani yuuki"),
+            ),
+            ("レミオロメン - 粉雪", "レミオロメン", ("粉雪", "レミオロメン")),
+        )
+        for title, uploader, expected in cases:
+            with self.subTest(title=title):
+                track = make_track(title)
+                track.uploader = uploader
+                self.assertEqual(
+                    music_lyrics_sources.get_lyrics_search_candidates(track),
+                    [expected],
+                )
+
+    def test_unknown_title_order_tries_artist_first_then_swapped(self) -> None:
+        track = make_track("スピッツ / 渚")
+        track.uploader = "spitzclips"
+
+        self.assertEqual(
+            music_lyrics_sources.get_lyrics_search_candidates(track),
+            [("渚", "スピッツ"), ("スピッツ", "渚")],
+        )
+
+    def test_youtube_music_metadata_uses_the_first_listed_artist(self) -> None:
+        track = make_track("Star-mine")
+        track.song_name = "Star-mine"
+        track.artist = "Hatsuboshi Gakuen, JIN, Begrazia, Ume Hanami"
+        track.uploader = "HATSUBOSHI GAKUEN"
+
+        self.assertEqual(
+            music_lyrics_sources.get_lyrics_search_terms(track),
+            ("star-mine", "hatsuboshi gakuen"),
+        )
+
+    def test_title_artist_beats_channel_credit_and_leading_tags(self) -> None:
+        track = make_track("【リゼロ】鈴木このみ「Recollect」-lyric video-")
+        track.artist = "「Re:ゼロから始める異世界生活」チャンネル【公式】, Konomi Suzuki"
+        track.uploader = "「Re:ゼロから始める異世界生活」チャンネル【公式】"
+
+        self.assertEqual(
+            music_lyrics_sources.get_lyrics_search_terms(track),
+            ("recollect", "鈴木このみ"),
+        )
+
+    def test_title_that_starts_with_quotes_keeps_the_quoted_song(self) -> None:
+        track = make_track("「ねえ、言っちゃうよ。」 - 初星学園 [Lyrics]")
+        track.uploader = "fan channel"
+
+        self.assertEqual(
+            music_lyrics_sources.get_lyrics_search_terms(track),
+            ("ねえ、言っちゃうよ。", "初星学園"),
+        )
+
+    def test_lookup_tries_swapped_order_after_title_only_miss(self) -> None:
+        track = make_track("廻廻奇譚 - Eve MV")
+        track.uploader = "fan uploads"
+        track.duration = 223
+        english_song = {
+            "trackName": "Eve",
+            "artistName": "Chantal Kreviazuk",
+            "duration": 225,
+            "instrumental": False,
+            "plainLyrics": "Eve is gone again",
+        }
+        japanese_song = {
+            "trackName": "廻廻奇譚",
+            "artistName": "Eve",
+            "duration": 223,
+            "instrumental": False,
+            "plainLyrics": "言いたいことも言えずに",
+        }
+
+        with patch.object(
+            music_lyrics_sources,
+            "request_lyrics_records",
+            side_effect=[[], [english_song], [japanese_song]],
+        ) as request:
+            lyrics = music_lyrics_sources.lookup_track_lyrics(track)
+
+        self.assertEqual(lyrics, "言いたいことも言えずに")
+        self.assertEqual(
+            [call.args for call in request.call_args_list],
+            [("eve", "廻廻奇譚"), ("eve", None), ("廻廻奇譚", "eve")],
+        )
+
+    def test_native_title_rejects_foreign_lyrics_without_artist_match(self) -> None:
+        record = {
+            "trackName": "Eve",
+            "artistName": "Chantal Kreviazuk",
+            "duration": 225,
+            "instrumental": False,
+            "plainLyrics": "Eve is gone again",
+        }
+
+        self.assertIs(
+            music_lyrics_sources.select_lyrics_record([record], "eve", "廻廻奇譚", 223),
+            record,
+        )
+        self.assertIsNone(
+            music_lyrics_sources.select_lyrics_record(
+                [record], "eve", "廻廻奇譚", 223, require_native_script=True,
+            )
+        )
+
+    def test_plain_lyrics_drop_stray_lrc_timestamps(self) -> None:
+        record = {
+            "instrumental": False,
+            "plainLyrics": "淡い暗い夜に浮かんで\n[00:05.10] 崩れた",
+        }
+
+        self.assertEqual(
+            music_lyrics_sources.extract_original_lyrics(record),
+            "淡い暗い夜に浮かんで\n崩れた",
+        )
+
+    def test_request_retries_when_lrclib_is_overloaded(self) -> None:
+        overloaded = urllib.error.HTTPError(
+            "https://lrclib.net/api/search", 503, "Service Unavailable", {}, None,
+        )
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            [{"trackName": "Song"}]
+        ).encode("utf-8")
+
+        with (
+            patch.object(
+                music_lyrics_sources.urllib.request,
+                "urlopen",
+                side_effect=[overloaded, overloaded, response],
+            ) as urlopen,
+            patch.object(music_lyrics_sources.time, "sleep") as sleep,
+        ):
+            records = music_lyrics_sources.request_lyrics_records("song", None)
+
+        self.assertEqual(records, [{"trackName": "Song"}])
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            list(music_lyrics_sources.LYRICS_RETRY_DELAYS_SECONDS),
+        )
+
+    def test_request_gives_up_on_overload_and_other_http_errors(self) -> None:
+        for code, expected_attempts in ((503, 3), (404, 1)):
+            error = urllib.error.HTTPError(
+                "https://lrclib.net/api/search", code, "error", {}, None,
+            )
+            with (
+                self.subTest(code=code),
+                patch.object(
+                    music_lyrics_sources.urllib.request,
+                    "urlopen",
+                    side_effect=error,
+                ) as urlopen,
+                patch.object(music_lyrics_sources.time, "sleep"),
+                self.assertRaises(music_lyrics_sources.LyricsLookupError),
+            ):
+                music_lyrics_sources.request_lyrics_records("song", None)
+            self.assertEqual(urlopen.call_count, expected_attempts)
+
+    def test_request_does_not_retry_past_the_lookup_deadline(self) -> None:
+        overloaded = urllib.error.HTTPError(
+            "https://lrclib.net/api/search", 503, "Service Unavailable", {}, None,
+        )
+
+        with (
+            patch.object(
+                music_lyrics_sources.urllib.request,
+                "urlopen",
+                side_effect=overloaded,
+            ) as urlopen,
+            patch.object(music_lyrics_sources.time, "sleep") as sleep,
+            patch.object(music_lyrics_sources.time, "monotonic", return_value=100.0),
+            self.assertRaises(music_lyrics_sources.LyricsLookupError),
+        ):
+            music_lyrics_sources.request_lyrics_records(
+                "song", None, deadline=101.0,
+            )
+
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
 
     def test_native_script_beats_nearby_romanized_duplicate(self) -> None:
         romanized_record = {

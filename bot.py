@@ -64,6 +64,7 @@ from music_discord_display import (
     MUSIC_CHANNEL_DELETE_REQUESTS,
     MUSIC_CHANNEL_SILENT,
     PLAYING_PANEL_TITLE,
+    RECENT_PLAYBACK_DELETE_SECONDS,
     delete_interaction_response_later,
     delete_message_later,
     delete_music_request_message,
@@ -94,6 +95,7 @@ from music_lyrics_sources import (
     LRC_METADATA_RE,
     LRC_TIMESTAMP_RE,
     LYRICS_DURATION_MATCH_TOLERANCE_SECONDS,
+    LYRICS_LOOKUP_TIMEOUT_SECONDS,
     LYRICS_NATIVE_SCRIPT_MIN_RATIO,
     LYRICS_NATIVE_SCRIPT_SCORE_WINDOW,
     QUOTED_TRACK_TITLE_RE,
@@ -1956,7 +1958,7 @@ class MusicControlView(discord.ui.View):
         await send_ephemeral_response(
             interaction,
             embed=make_recent_playback_embed(entries),
-            delete_after=None,
+            delete_after=RECENT_PLAYBACK_DELETE_SECONDS,
         )
 
 
@@ -2187,7 +2189,7 @@ async def get_track_lyrics(track: Track) -> str | None:
     try:
         lyrics = await asyncio.wait_for(
             run_lyrics_job(lookup_track_lyrics, track),
-            timeout=LYRICS_REQUEST_TIMEOUT_SECONDS + 2,
+            timeout=LYRICS_LOOKUP_TIMEOUT_SECONDS + 2,
         )
     except (asyncio.TimeoutError, LyricsLookupError) as error:
         logger.warning("LRCLIB lookup failed for %s: %s", track.title, error)

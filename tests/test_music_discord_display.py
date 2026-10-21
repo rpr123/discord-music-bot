@@ -238,7 +238,11 @@ class MusicDiscordDisplayTests(unittest.TestCase):
         embed = music_discord_display.make_recent_playback_embed(entries)
 
         self.assertEqual(embed.title, "🕘 최근 재생곡")
-        self.assertIn("같은 곡도 재생할 때마다 표시", embed.description)
+        self.assertEqual(
+            embed.description,
+            "최근 12시간 동안 재생한 곡을 최신순으로 최대 50곡까지 보여줘요.",
+        )
+        self.assertIsNone(embed.footer.text)
         self.assertEqual(len(embed.fields), 1)
         self.assertLess(
             embed.fields[0].value.index("Newest Song"),
@@ -268,7 +272,11 @@ class MusicDiscordDisplayTests(unittest.TestCase):
         )
         full = music_discord_display.make_recent_playback_embed(entries)
 
-        self.assertIn("없어요", empty.description)
+        self.assertEqual(empty.description, "최근 12시간 동안 재생한 곡이 없어요.")
+        self.assertEqual(
+            music_discord_display.format_recent_playback_period(5400),
+            "90분",
+        )
         self.assertEqual(len(full.fields), 5)
         self.assertTrue(all(len(field.value) <= 1024 for field in full.fields))
         self.assertLessEqual(len(full), 6000)

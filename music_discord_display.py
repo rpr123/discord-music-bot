@@ -6,6 +6,7 @@ import io
 import discord
 
 from music_config import (
+    AUTOPLAY_HISTORY_TTL_SECONDS,
     MAX_BULK_TRACKS,
     MUSIC_CHANNEL_DELETE_REQUESTS,
     MUSIC_CHANNEL_SILENT,
@@ -22,6 +23,8 @@ CONTROL_PANEL_TITLES = frozenset({PLAYING_PANEL_TITLE, IDLE_PANEL_TITLE})
 LYRICS_INLINE_LIMIT = 3900
 RECENT_PLAYBACKS_PER_FIELD = 10
 RECENT_PLAYBACK_LINK_LIMIT = 72
+RECENT_PLAYBACK_DELETE_SECONDS = 60
+RECENT_PLAYBACK_DISPLAY_LIMIT = 50
 
 
 def is_silent_music_channel(channel: discord.abc.Messageable | None) -> bool:
@@ -268,19 +271,26 @@ def make_queue_embed(state: GuildMusicState) -> discord.Embed:
     return embed
 
 
+def format_recent_playback_period(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}시간"
+    return f"{max(1, round(seconds / 60))}분"
+
+
 def make_recent_playback_embed(
     entries: tuple[RecentPlaybackEntry, ...],
 ) -> discord.Embed:
     embed = discord.Embed(title="🕘 최근 재생곡", color=discord.Color.blurple())
+    period = format_recent_playback_period(AUTOPLAY_HISTORY_TTL_SECONDS)
     if not entries:
-        embed.description = "현재 실행 중 기록된 최근 재생곡이 없어요."
+        embed.description = f"최근 {period} 동안 재생한 곡이 없어요."
         return embed
 
     embed.description = (
-        "자동재생 중복 방지 기간에 실제 재생을 시작한 순서예요. "
-        "같은 곡도 재생할 때마다 표시되며, 봇을 재시작하면 초기화돼요."
+        f"최근 {period} 동안 재생한 곡을 최신순으로 "
+        f"최대 {RECENT_PLAYBACK_DISPLAY_LIMIT}곡까지 보여줘요."
     )
-    visible_entries = entries[:50]
+    visible_entries = entries[:RECENT_PLAYBACK_DISPLAY_LIMIT]
     for offset in range(0, len(visible_entries), RECENT_PLAYBACKS_PER_FIELD):
         group = visible_entries[offset : offset + RECENT_PLAYBACKS_PER_FIELD]
         first_index = offset + 1

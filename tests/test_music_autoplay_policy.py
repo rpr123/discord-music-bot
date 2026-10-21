@@ -948,10 +948,11 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
         )
 
         self.assertTrue(music_autoplay_policy.autoplay_can_refill(state, 7))
-        self.assertEqual(music_autoplay_policy.AUTOPLAY_QUEUE_TARGET, 2)
-        state.queue.append(make_track("one"))
-        self.assertTrue(music_autoplay_policy.autoplay_can_refill(state, 7))
-        state.queue.append(make_track("two"))
+        self.assertEqual(music_autoplay_policy.AUTOPLAY_QUEUE_TARGET, 5)
+        for index in range(4):
+            state.queue.append(make_track(f"queued {index}"))
+            self.assertTrue(music_autoplay_policy.autoplay_can_refill(state, 7))
+        state.queue.append(make_track("queued 4"))
         self.assertFalse(music_autoplay_policy.autoplay_can_refill(state, 7))
 
         state.queue.clear()

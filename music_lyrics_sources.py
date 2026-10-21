@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -18,12 +19,17 @@ from music_search_scoring import (
     clean_track_title,
     normalize_artist_name,
     normalize_identity_component,
+    strip_edge_title_tags,
 )
 
 
 LYRICS_NATIVE_SCRIPT_MIN_RATIO = 0.3
 LYRICS_NATIVE_SCRIPT_SCORE_WINDOW = 20
 LYRICS_DURATION_MATCH_TOLERANCE_SECONDS = 8
+# LRCLIB sheds load with 503; retry a few times inside one lookup deadline.
+LYRICS_RETRY_STATUS_CODES = frozenset({429, 503})
+LYRICS_RETRY_DELAYS_SECONDS = (2.0, 5.0)
+LYRICS_LOOKUP_TIMEOUT_SECONDS = LYRICS_REQUEST_TIMEOUT_SECONDS * 3
 LRC_TIMESTAMP_RE = re.compile(
     r"\[(?:(?:\d{1,2}):)?\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]"
 )
@@ -34,39 +40,89 @@ LRC_METADATA_RE = re.compile(
 QUOTED_TRACK_TITLE_RE = re.compile(
     r"^\s*(?P<artist>.+?)\s*[「『](?P<title>[^」』]+)[」』]"
 )
+LEADING_QUOTED_TRACK_TITLE_RE = re.compile(
+    r"^\s*[「『](?P<title>[^」』]+)[」』](?P<rest>.*)$"
+)
+LYRICS_TITLE_SEPARATOR_RE = re.compile(r"\s+(?:-|–|—|\||/)\s+")
 
 
 class LyricsLookupError(RuntimeError):
     pass
 
 
-def get_lyrics_search_terms(track: Track) -> tuple[str, str | None]:
-    parsed_artist: str | None = None
-    raw_title = track.song_name or track.title
-    quoted_match = (
-        QUOTED_TRACK_TITLE_RE.match(raw_title)
-        if track.song_name is None
-        else None
-    )
-    if quoted_match:
-        parsed_artist = quoted_match.group("artist")
-        song_name = clean_track_title(quoted_match.group("title"))
-    else:
-        cleaned_title = clean_track_title(raw_title)
-        song_name = cleaned_title
+def get_first_listed_artist(value: str | None) -> str | None:
+    if not value:
+        return None
+    # YouTube Music lists every credited artist as "A, B, C".
+    return value.split(",", 1)[0].strip() or None
 
-    if track.song_name is None and quoted_match is None:
-        title_parts = re.split(
-            r"\s+(?:-|–|—|\|)\s+",
-            song_name,
+
+def artist_names_match(left: str, right: str) -> bool:
+    left = normalize_artist_name(left)
+    right = normalize_artist_name(right)
+    if not left or not right:
+        return False
+    return left == right or (
+        min(len(left), len(right)) >= 3 and (left in right or right in left)
+    )
+
+
+def make_lyrics_search_terms(
+    song_name: str,
+    artist: str | None,
+) -> tuple[str, str | None]:
+    artist_name = normalize_artist_name(artist) if artist else None
+    return clean_track_title(song_name).strip(), artist_name or None
+
+
+def get_lyrics_search_candidates(track: Track) -> list[tuple[str, str | None]]:
+    listed_artist = get_first_listed_artist(track.artist)
+    fallback_artist = listed_artist or track.uploader
+    if track.song_name:
+        return [make_lyrics_search_terms(track.song_name, fallback_artist)]
+
+    title = strip_edge_title_tags(track.title)
+    quoted_match = QUOTED_TRACK_TITLE_RE.match(title)
+    if quoted_match:
+        return [
+            make_lyrics_search_terms(
+                quoted_match.group("title"),
+                quoted_match.group("artist"),
+            )
+        ]
+    leading_quoted_match = LEADING_QUOTED_TRACK_TITLE_RE.match(title)
+    if leading_quoted_match:
+        rest_parts = re.split(
+            r"(?:^|\s+)(?:-|–|—|\||/)\s+",
+            clean_track_title(leading_quoted_match.group("rest")),
             maxsplit=1,
         )
-        if len(title_parts) == 2:
-            parsed_artist, song_name = title_parts
+        artist = rest_parts[1] if len(rest_parts) == 2 else fallback_artist
+        return [make_lyrics_search_terms(leading_quoted_match.group("title"), artist)]
 
-    artist = track.artist or parsed_artist or track.uploader
-    artist_name = normalize_artist_name(artist) if artist else None
-    return song_name.strip(), artist_name or None
+    cleaned_title = clean_track_title(track.title)
+    title_parts = LYRICS_TITLE_SEPARATOR_RE.split(cleaned_title, maxsplit=1)
+    if len(title_parts) != 2:
+        return [make_lyrics_search_terms(cleaned_title, fallback_artist)]
+
+    # Titles use both "Artist - Song" and "Song - Artist"; prefer the side
+    # that matches the channel or YouTube artist, otherwise try both.
+    left, right = title_parts
+    known_artists = [value for value in (listed_artist, track.uploader) if value]
+    left_is_artist = any(artist_names_match(left, value) for value in known_artists)
+    right_is_artist = any(artist_names_match(right, value) for value in known_artists)
+    if right_is_artist and not left_is_artist:
+        return [make_lyrics_search_terms(left, right)]
+    if left_is_artist and not right_is_artist:
+        return [make_lyrics_search_terms(right, left)]
+    return [
+        make_lyrics_search_terms(right, left),
+        make_lyrics_search_terms(left, right),
+    ]
+
+
+def get_lyrics_search_terms(track: Track) -> tuple[str, str | None]:
+    return get_lyrics_search_candidates(track)[0]
 
 
 def extract_original_lyrics(record: dict) -> str | None:
@@ -75,7 +131,14 @@ def extract_original_lyrics(record: dict) -> str | None:
 
     plain_lyrics = record.get("plainLyrics")
     if isinstance(plain_lyrics, str) and plain_lyrics.strip():
-        return plain_lyrics.replace("\r\n", "\n").replace("\r", "\n").strip()
+        # Some uploads leave LRC timestamps inside the plain lyrics.
+        plain_lines = [
+            LRC_TIMESTAMP_RE.sub("", line).strip()
+            if LRC_TIMESTAMP_RE.search(line)
+            else line
+            for line in plain_lyrics.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        ]
+        return "\n".join(plain_lines).strip()
 
     synced_lyrics = record.get("syncedLyrics")
     if not isinstance(synced_lyrics, str) or not synced_lyrics.strip():
@@ -107,9 +170,8 @@ def get_lyrics_title_aliases(value: str) -> set[str]:
     return {alias for alias in aliases if alias}
 
 
-def lyrics_native_script_ratio(record: dict) -> float:
-    lyrics = extract_original_lyrics(record) or ""
-    letters = [character for character in lyrics if character.isalpha()]
+def non_latin_letter_ratio(value: str) -> float:
+    letters = [character for character in value if character.isalpha()]
     if not letters:
         return 0.0
 
@@ -120,11 +182,17 @@ def lyrics_native_script_ratio(record: dict) -> float:
     return non_latin_letters / len(letters)
 
 
+def lyrics_native_script_ratio(record: dict) -> float:
+    return non_latin_letter_ratio(extract_original_lyrics(record) or "")
+
+
 def lyrics_record_score(
     record: dict,
     track_name: str,
     artist_name: str | None,
     duration: int | None,
+    *,
+    require_native_script: bool = False,
 ) -> int | None:
     if extract_original_lyrics(record) is None:
         return None
@@ -161,19 +229,31 @@ def lyrics_record_score(
         and duration_difference <= LYRICS_DURATION_MATCH_TOLERANCE_SECONDS
     )
 
+    artist_matched = False
     if artist_name:
         expected_artist = normalize_artist_name(artist_name)
         candidate_artist = normalize_artist_name(str(record.get("artistName") or ""))
         if candidate_artist == expected_artist:
             score += 80
+            artist_matched = True
         elif (
             candidate_artist
             and len(expected_artist) >= 3
             and (expected_artist in candidate_artist or candidate_artist in expected_artist)
         ):
             score += 25
+            artist_matched = True
         elif not title_and_duration_match:
             return None
+
+    # Without an artist match, a same-named song in another language can
+    # slip through on title and duration alone (e.g. "Eve" for an Eve MV).
+    if (
+        require_native_script
+        and not artist_matched
+        and lyrics_native_script_ratio(record) < LYRICS_NATIVE_SCRIPT_MIN_RATIO
+    ):
+        return None
 
     if duration_difference is not None:
         if duration_difference <= 2:
@@ -191,10 +271,18 @@ def select_lyrics_record(
     track_name: str,
     artist_name: str | None,
     duration: int | None,
+    *,
+    require_native_script: bool = False,
 ) -> dict | None:
     scored_records: list[tuple[dict, int]] = []
     for record in records:
-        score = lyrics_record_score(record, track_name, artist_name, duration)
+        score = lyrics_record_score(
+            record,
+            track_name,
+            artist_name,
+            duration,
+            require_native_script=require_native_script,
+        )
         if score is not None:
             scored_records.append((record, score))
 
@@ -221,7 +309,12 @@ def select_lyrics_record(
     return max(scored_records, key=lambda candidate: candidate[1])[0]
 
 
-def request_lyrics_records(track_name: str, artist_name: str | None) -> list[dict]:
+def request_lyrics_records(
+    track_name: str,
+    artist_name: str | None,
+    *,
+    deadline: float | None = None,
+) -> list[dict]:
     params = {"track_name": track_name}
     if artist_name:
         params["artist_name"] = artist_name
@@ -237,14 +330,34 @@ def request_lyrics_records(track_name: str, artist_name: str | None) -> list[dic
             ),
         },
     )
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=LYRICS_REQUEST_TIMEOUT_SECONDS,
-        ) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
-        raise LyricsLookupError(str(error)) from error
+    for retry_delay in (*LYRICS_RETRY_DELAYS_SECONDS, None):
+        timeout = float(LYRICS_REQUEST_TIMEOUT_SECONDS)
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                raise LyricsLookupError("Lyrics lookup ran out of time.")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as error:
+            if (
+                error.code not in LYRICS_RETRY_STATUS_CODES
+                or retry_delay is None
+                or (
+                    deadline is not None
+                    and time.monotonic() + retry_delay >= deadline
+                )
+            ):
+                raise LyricsLookupError(str(error)) from error
+            logger.info(
+                "LRCLIB returned HTTP %s; retrying in %.0f seconds",
+                error.code,
+                retry_delay,
+            )
+            time.sleep(retry_delay)
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+            raise LyricsLookupError(str(error)) from error
 
     if not isinstance(payload, list):
         raise LyricsLookupError("Lyrics API returned an invalid response.")
@@ -252,27 +365,44 @@ def request_lyrics_records(track_name: str, artist_name: str | None) -> list[dic
 
 
 def lookup_track_lyrics(track: Track) -> str | None:
-    track_name, artist_name = get_lyrics_search_terms(track)
+    search_candidates = get_lyrics_search_candidates(track)
+    track_name, artist_name = search_candidates[0]
     if not track_name:
         return None
-    records = request_lyrics_records(track_name, artist_name)
-    record = select_lyrics_record(
-        records,
-        track_name,
-        artist_name,
-        track.duration,
+    deadline = time.monotonic() + LYRICS_LOOKUP_TIMEOUT_SECONDS
+    require_native_script = (
+        non_latin_letter_ratio(track.title) >= LYRICS_NATIVE_SCRIPT_MIN_RATIO
     )
-    if record is None and artist_name:
-        records = request_lyrics_records(track_name, None)
-        record = select_lyrics_record(
+
+    def find_record(
+        name: str,
+        artist: str | None,
+        query_artist: str | None,
+    ) -> dict | None:
+        records = request_lyrics_records(name, query_artist, deadline=deadline)
+        return select_lyrics_record(
             records,
-            track_name,
-            artist_name,
+            name,
+            artist,
             track.duration,
+            require_native_script=require_native_script,
         )
+
+    record = find_record(track_name, artist_name, artist_name)
+    if record is None and artist_name:
+        record = find_record(track_name, artist_name, None)
         if record is not None:
             logger.info(
                 "LRCLIB title-only retry matched lyrics for %s",
+                track.title,
+            )
+    for alternate_name, alternate_artist in search_candidates[1:]:
+        if record is not None:
+            break
+        record = find_record(alternate_name, alternate_artist, alternate_artist)
+        if record is not None:
+            logger.info(
+                "LRCLIB swapped title and artist matched lyrics for %s",
                 track.title,
             )
     return extract_original_lyrics(record) if record else None
