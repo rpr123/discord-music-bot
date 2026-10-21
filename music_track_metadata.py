@@ -10,7 +10,17 @@ from music_search_scoring import (
     clean_track_title,
     normalize_artist_name,
     normalize_identity_component,
+    strip_edge_title_tags,
 )
+
+
+QUOTED_TITLE_SEGMENT_RE = re.compile(r"[「『](?P<title>[^」』]+)[」』]")
+# Quotes right after these labels name the anime/film/game, not the song.
+WORK_TITLE_LABEL_RE = re.compile(r"(?:アニメ|映画|劇場版|ゲーム|ドラマ)\s*$")
+TRACK_TITLE_SEPARATOR_RE = re.compile(r"\s+(?:-|–|—|\||/)\s+")
+LEADING_TRACK_TITLE_SEPARATOR_RE = re.compile(r"(?:^|\s+)(?:-|–|—|\||/)\s+")
+PARENTHESIZED_ALIAS_RE = re.compile(r"[(（]([^)）]+)[)）]")
+TRAILING_SQUARE_TAGS_RE = re.compile(r"(?:\s*[\[［【][^\]］】]*[\]］】])+\s*$")
 
 
 def get_video_id(info: dict, url: str | None = None) -> str | None:
@@ -28,6 +38,120 @@ def get_video_id(info: dict, url: str | None = None) -> str | None:
         return values[0]
 
     return None
+
+
+def get_first_listed_artist(value: str | None) -> str | None:
+    if not value:
+        return None
+    # YouTube Music lists every credited artist as "A, B, C".
+    return value.split(",", 1)[0].strip() or None
+
+
+def artist_names_match(left: str, right: str) -> bool:
+    left = normalize_artist_name(left)
+    right = normalize_artist_name(right)
+    if not left or not right:
+        return False
+    return left == right or (
+        min(len(left), len(right)) >= 3 and (left in right or right in left)
+    )
+
+
+def get_track_song_parts(track: Track) -> list[tuple[str, str | None]]:
+    """Return raw (song, artist) readings of a track, most likely first."""
+    listed_artist = get_first_listed_artist(track.artist)
+    fallback_artist = listed_artist or track.uploader
+    if track.song_name:
+        return [(track.song_name, fallback_artist)]
+
+    title = strip_edge_title_tags(track.title)
+    quoted_segments = list(QUOTED_TITLE_SEGMENT_RE.finditer(title))
+    song_segment = next(
+        (
+            segment
+            for segment in quoted_segments
+            if not WORK_TITLE_LABEL_RE.search(title[: segment.start()])
+        ),
+        None,
+    )
+    if song_segment is not None:
+        prefix = title[: song_segment.start()].strip()
+        if not prefix:
+            # Keep "(alias)" after the artist; it often holds the native name.
+            title_offset = max(track.title.find(title), 0)
+            rest_parts = LEADING_TRACK_TITLE_SEPARATOR_RE.split(
+                TRAILING_SQUARE_TAGS_RE.sub(
+                    "",
+                    track.title[title_offset + song_segment.end() :],
+                ),
+                maxsplit=1,
+            )
+            artist = (
+                rest_parts[1].strip() if len(rest_parts) == 2 else fallback_artist
+            )
+            return [(song_segment.group("title"), artist)]
+        if song_segment is quoted_segments[0]:
+            return [(song_segment.group("title"), prefix)]
+        return [(song_segment.group("title"), fallback_artist)]
+
+    cleaned_title = clean_track_title(track.title)
+    title_parts = TRACK_TITLE_SEPARATOR_RE.split(cleaned_title, maxsplit=1)
+    if len(title_parts) != 2:
+        return [(cleaned_title, fallback_artist)]
+
+    # Titles use both "Artist - Song" and "Song - Artist"; prefer the side
+    # that matches the channel or YouTube artist, otherwise keep both.
+    left, right = title_parts
+    known_artists = [value for value in (listed_artist, track.uploader) if value]
+    left_is_artist = any(artist_names_match(left, value) for value in known_artists)
+    right_is_artist = any(artist_names_match(right, value) for value in known_artists)
+    if right_is_artist and not left_is_artist:
+        return [(left, right)]
+    if left_is_artist and not right_is_artist:
+        return [(right, left)]
+    return [(right, left), (left, right)]
+
+
+def get_track_song_candidates(track: Track) -> list[tuple[str, str | None]]:
+    candidates: list[tuple[str, str | None]] = []
+    for song_name, artist in get_track_song_parts(track):
+        artist_name = normalize_artist_name(artist) if artist else None
+        candidates.append((clean_track_title(song_name).strip(), artist_name or None))
+    return candidates
+
+
+def get_artist_aliases(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    aliases = {
+        normalize_artist_name(value),
+        normalize_artist_name(PARENTHESIZED_ALIAS_RE.sub(" ", value)),
+    }
+    aliases.update(
+        normalize_artist_name(alias)
+        for alias in PARENTHESIZED_ALIAS_RE.findall(value)
+    )
+    return {alias for alias in aliases if alias}
+
+
+def get_track_song_alias_keys(track: Track) -> set[str]:
+    """Song keys under every known artist name, so an MV, its Topic audio and
+    a lyric video match even when each spells the artist differently."""
+    song_parts = get_track_song_parts(track)
+    keys: set[str] = set()
+    for song_name, artist in song_parts:
+        song_key = normalize_identity_component(clean_track_title(song_name))
+        if not song_key:
+            continue
+        artist_aliases = get_artist_aliases(artist)
+        # With an unsure "A - B" order the channel could be attached to the
+        # artist's name as a song, merging different songs from one channel.
+        if len(song_parts) == 1:
+            for listed_artist in (track.artist or "").split(","):
+                artist_aliases.update(get_artist_aliases(listed_artist.strip()))
+            artist_aliases.update(get_artist_aliases(track.uploader))
+        keys.update(f"song:{alias}|{song_key}" for alias in artist_aliases)
+    return keys
 
 
 def normalize_track_key(track: Track) -> str:
@@ -64,6 +188,7 @@ def get_track_video_id(track: Track) -> str | None:
 
 def get_track_identity_keys(track: Track) -> set[str]:
     keys = {normalize_track_key(track)}
+    keys.update(get_track_song_alias_keys(track))
     video_id = get_track_video_id(track)
     if video_id:
         keys.add(f"video:{video_id}")

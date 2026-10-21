@@ -16,6 +16,7 @@ from music_models import (
 )
 from music_track_metadata import (
     get_track_identity_keys,
+    get_track_song_alias_keys,
     get_track_video_id,
     normalize_track_key,
 )
@@ -44,6 +45,7 @@ def remember_recent_value(
     values: Deque[AutoplayHistoryEntry],
     value: str,
     *,
+    aliases: frozenset[str] = frozenset(),
     now: float | None = None,
 ) -> None:
     current_time = time.monotonic() if now is None else now
@@ -56,6 +58,7 @@ def remember_recent_value(
         AutoplayHistoryEntry(
             value=value,
             expires_at=current_time + AUTOPLAY_HISTORY_TTL_SECONDS,
+            aliases=aliases,
         )
     )
 
@@ -67,9 +70,11 @@ def remember_autoplay_track(
     now: float | None = None,
 ) -> None:
     current_time = time.monotonic() if now is None else now
+    track_key = normalize_track_key(track)
     remember_recent_value(
         state.recent_track_keys,
-        normalize_track_key(track),
+        track_key,
+        aliases=frozenset(get_track_song_alias_keys(track) - {track_key}),
         now=current_time,
     )
     video_id = get_track_video_id(track)
@@ -129,10 +134,11 @@ def _get_recent_expiry_by_key(
     _prune_expired_recent_values(state.recent_video_ids, now)
     expiry_by_key: dict[str, float] = {}
     for entry in state.recent_track_keys:
-        expiry_by_key[entry.value] = max(
-            expiry_by_key.get(entry.value, entry.expires_at),
-            entry.expires_at,
-        )
+        for key in (entry.value, *entry.aliases):
+            expiry_by_key[key] = max(
+                expiry_by_key.get(key, entry.expires_at),
+                entry.expires_at,
+            )
     for entry in state.recent_video_ids:
         key = f"video:{entry.value}"
         expiry_by_key[key] = max(

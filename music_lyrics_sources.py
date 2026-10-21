@@ -19,8 +19,8 @@ from music_search_scoring import (
     clean_track_title,
     normalize_artist_name,
     normalize_identity_component,
-    strip_edge_title_tags,
 )
+from music_track_metadata import get_track_song_candidates
 
 
 LYRICS_NATIVE_SCRIPT_MIN_RATIO = 0.3
@@ -37,88 +37,12 @@ LRC_METADATA_RE = re.compile(
     r"^\[(?:ar|ti|al|by|offset|length|re|ve):.*\]\s*$",
     flags=re.IGNORECASE,
 )
-QUOTED_TRACK_TITLE_RE = re.compile(
-    r"^\s*(?P<artist>.+?)\s*[「『](?P<title>[^」』]+)[」』]"
-)
-LEADING_QUOTED_TRACK_TITLE_RE = re.compile(
-    r"^\s*[「『](?P<title>[^」』]+)[」』](?P<rest>.*)$"
-)
-LYRICS_TITLE_SEPARATOR_RE = re.compile(r"\s+(?:-|–|—|\||/)\s+")
-
-
 class LyricsLookupError(RuntimeError):
     pass
 
 
-def get_first_listed_artist(value: str | None) -> str | None:
-    if not value:
-        return None
-    # YouTube Music lists every credited artist as "A, B, C".
-    return value.split(",", 1)[0].strip() or None
-
-
-def artist_names_match(left: str, right: str) -> bool:
-    left = normalize_artist_name(left)
-    right = normalize_artist_name(right)
-    if not left or not right:
-        return False
-    return left == right or (
-        min(len(left), len(right)) >= 3 and (left in right or right in left)
-    )
-
-
-def make_lyrics_search_terms(
-    song_name: str,
-    artist: str | None,
-) -> tuple[str, str | None]:
-    artist_name = normalize_artist_name(artist) if artist else None
-    return clean_track_title(song_name).strip(), artist_name or None
-
-
 def get_lyrics_search_candidates(track: Track) -> list[tuple[str, str | None]]:
-    listed_artist = get_first_listed_artist(track.artist)
-    fallback_artist = listed_artist or track.uploader
-    if track.song_name:
-        return [make_lyrics_search_terms(track.song_name, fallback_artist)]
-
-    title = strip_edge_title_tags(track.title)
-    quoted_match = QUOTED_TRACK_TITLE_RE.match(title)
-    if quoted_match:
-        return [
-            make_lyrics_search_terms(
-                quoted_match.group("title"),
-                quoted_match.group("artist"),
-            )
-        ]
-    leading_quoted_match = LEADING_QUOTED_TRACK_TITLE_RE.match(title)
-    if leading_quoted_match:
-        rest_parts = re.split(
-            r"(?:^|\s+)(?:-|–|—|\||/)\s+",
-            clean_track_title(leading_quoted_match.group("rest")),
-            maxsplit=1,
-        )
-        artist = rest_parts[1] if len(rest_parts) == 2 else fallback_artist
-        return [make_lyrics_search_terms(leading_quoted_match.group("title"), artist)]
-
-    cleaned_title = clean_track_title(track.title)
-    title_parts = LYRICS_TITLE_SEPARATOR_RE.split(cleaned_title, maxsplit=1)
-    if len(title_parts) != 2:
-        return [make_lyrics_search_terms(cleaned_title, fallback_artist)]
-
-    # Titles use both "Artist - Song" and "Song - Artist"; prefer the side
-    # that matches the channel or YouTube artist, otherwise try both.
-    left, right = title_parts
-    known_artists = [value for value in (listed_artist, track.uploader) if value]
-    left_is_artist = any(artist_names_match(left, value) for value in known_artists)
-    right_is_artist = any(artist_names_match(right, value) for value in known_artists)
-    if right_is_artist and not left_is_artist:
-        return [make_lyrics_search_terms(left, right)]
-    if left_is_artist and not right_is_artist:
-        return [make_lyrics_search_terms(right, left)]
-    return [
-        make_lyrics_search_terms(right, left),
-        make_lyrics_search_terms(left, right),
-    ]
+    return get_track_song_candidates(track)
 
 
 def get_lyrics_search_terms(track: Track) -> tuple[str, str | None]:

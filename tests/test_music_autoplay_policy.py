@@ -616,6 +616,42 @@ class MusicAutoplayPolicyTests(unittest.TestCase):
             fresh,
         )
 
+    def test_recent_mv_excludes_its_topic_audio_and_lyric_video(self) -> None:
+        mv = make_track(
+            "初星学園 「白線」Official Music Video (HATSUBOSHI GAKUEN - Hakusen)",
+            video_id="aaaaaaaaaaa",
+            uploader="HATSUBOSHI GAKUEN",
+        )
+        topic_audio = make_track(
+            "白線",
+            video_id="bbbbbbbbbbb",
+            artist="Hatsuboshi Gakuen, Lilja Katsuragi",
+            song_name="白線",
+            uploader="HATSUBOSHI GAKUEN",
+        )
+        lyric_video = make_track(
+            "初星学園 「白線」Lyric Video (HATSUBOSHI GAKUEN - Hakusen)",
+            video_id="ccccccccccc",
+            uploader="HATSUBOSHI GAKUEN",
+        )
+        fresh = make_track(
+            "初星学園 「光景」Official Music Video (HATSUBOSHI GAKUEN - Koukei)",
+            video_id="ddddddddddd",
+            uploader="HATSUBOSHI GAKUEN",
+        )
+        state = GuildMusicState()
+        music_autoplay_policy.remember_autoplay_track(state, mv, now=0.0)
+
+        self.assertEqual(len(state.recent_track_keys), 1)
+        self.assertIs(
+            music_autoplay_policy.select_autoplay_candidate(
+                state,
+                [topic_audio, lyric_video, fresh],
+                now=1.0,
+            ),
+            fresh,
+        )
+
     def test_candidate_batch_prefers_all_fresh_then_oldest_recent(self) -> None:
         current = make_track("current", video_id="ccccccccccc")
         hard_excluded = make_track("seed", video_id="sssssssssss")

@@ -1,0 +1,2 @@
+# Keep LF in the repository even when Windows tools write CRLF.
+* text=auto eol=lf

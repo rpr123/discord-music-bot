@@ -128,6 +128,78 @@ class MusicTrackMetadataTests(unittest.TestCase):
             music_track_metadata.normalize_track_key(topic_audio),
         )
 
+    def song_keys(self, track: bot.Track) -> set[str]:
+        return {
+            key
+            for key in music_track_metadata.get_track_identity_keys(track)
+            if not key.startswith("video:")
+        }
+
+    def test_quoted_mv_topic_audio_and_lyric_video_share_a_song_key(self) -> None:
+        mv = self.make_identity_track(
+            "初星学園 「クライアイ」Official Music Video (HATSUBOSHI GAKUEN - Kuraiai)",
+            "aaaaaaaaaaa",
+            uploader="HATSUBOSHI GAKUEN",
+        )
+        topic_audio = self.make_identity_track(
+            "クライアイ",
+            "bbbbbbbbbbb",
+            artist="Hatsuboshi Gakuen, JIN, Begrazia",
+            song_name="クライアイ",
+            uploader="HATSUBOSHI GAKUEN",
+        )
+        fan_lyrics = self.make_identity_track(
+            "「クライアイ」(Kuraiai) - Gakuen iDOLM@STER (初星学園) [Color Coded Lyrics]",
+            "ccccccccccc",
+            uploader="lyrics fan channel",
+        )
+
+        self.assertTrue(self.song_keys(mv) & self.song_keys(topic_audio))
+        self.assertTrue(self.song_keys(mv) & self.song_keys(fan_lyrics))
+
+    def test_different_songs_from_one_channel_stay_distinct(self) -> None:
+        first = self.make_identity_track(
+            "初星学園 「光景」Official Music Video (HATSUBOSHI GAKUEN - Koukei)",
+            "ddddddddddd",
+            uploader="HATSUBOSHI GAKUEN",
+        )
+        second = self.make_identity_track(
+            "初星学園 「白線」Official Music Video (HATSUBOSHI GAKUEN - Hakusen)",
+            "eeeeeeeeeee",
+            uploader="HATSUBOSHI GAKUEN",
+        )
+        fan_first = self.make_identity_track(
+            "Velvet - back number",
+            "fffffffffff",
+            uploader="fan uploads",
+        )
+        fan_second = self.make_identity_track(
+            "Shiawase - back number",
+            "ggggggggggg",
+            uploader="fan uploads",
+        )
+
+        self.assertFalse(self.song_keys(first) & self.song_keys(second))
+        self.assertFalse(self.song_keys(fan_first) & self.song_keys(fan_second))
+
+    def test_quoted_work_title_is_not_taken_as_the_song(self) -> None:
+        memento = self.make_identity_track(
+            "TVアニメ「Re:ゼロから始める異世界生活」2nd season EDテーマ「Memento」MV",
+            "hhhhhhhhhhh",
+            uploader="KADOKAWAanime",
+        )
+        long_shot = self.make_identity_track(
+            "TVアニメ「Re:ゼロから始める異世界生活」2nd season 後期OPテーマ「Long shot」MV",
+            "iiiiiiiiiii",
+            uploader="KADOKAWAanime",
+        )
+
+        self.assertEqual(
+            music_track_metadata.get_track_song_candidates(memento),
+            [("memento", "kadokawaanime")],
+        )
+        self.assertFalse(self.song_keys(memento) & self.song_keys(long_shot))
+
     def test_live_remix_and_cover_remain_distinct_versions(self) -> None:
         studio = self.make_identity_track(
             "Artist - Same Song (Official Audio)",

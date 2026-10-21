@@ -18,6 +18,7 @@ MAX_PLAYBACK_ATTEMPTS = 2
 class AutoplayHistoryEntry:
     value: str
     expires_at: float
+    aliases: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
