@@ -4,33 +4,9 @@ import unittest
 from collections import Counter, deque
 from pathlib import Path
 
-import bot
 import music_autoplay_policy
 import music_track_metadata
 from music_models import AUTOPLAY_HISTORY_SIZE, GuildMusicState, Track
-
-
-MOVED_NAMES = (
-    "AUTOPLAY_CANDIDATE_POOL_CAP",
-    "AUTOPLAY_QUEUE_TARGET",
-    "AUTOPLAY_RETRY_DELAYS_SECONDS",
-    "autoplay_can_refill",
-    "clear_autoplay_candidate_pool",
-    "consume_autoplay_candidate",
-    "get_autoplay_excluded_keys",
-    "get_autoplay_recent_overlap_counts",
-    "get_autoplay_recent_penalty",
-    "get_autoplay_refill_candidate_count",
-    "get_recent_playbacks",
-    "get_autoplay_retry_delay",
-    "get_autoplay_seed",
-    "remember_autoplay_track",
-    "remember_recent_playback",
-    "remember_recent_value",
-    "replace_autoplay_candidate_pool",
-    "select_autoplay_candidate",
-    "select_autoplay_candidates",
-)
 
 
 def make_track(
@@ -63,14 +39,6 @@ class Voice:
 
 
 class MusicAutoplayPolicyTests(unittest.TestCase):
-    def test_bot_reexports_moved_autoplay_policy_names(self) -> None:
-        for name in MOVED_NAMES:
-            with self.subTest(name=name):
-                self.assertIs(
-                    getattr(bot, name),
-                    getattr(music_autoplay_policy, name),
-                )
-
     def test_module_dependencies_are_limited(self) -> None:
         source = Path(music_autoplay_policy.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)

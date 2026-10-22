@@ -8,40 +8,6 @@ import music_discord_display
 from music_models import GuildMusicState, RecentPlaybackEntry, Track
 
 
-MOVED_NAMES = (
-    "CONTROL_PANEL_TITLES",
-    "DISCORD_EMBED_FIELD_LIMIT",
-    "IDLE_PANEL_TITLE",
-    "LYRICS_INLINE_LIMIT",
-    "MUSIC_CHANNEL_DELETE_REQUESTS",
-    "MUSIC_CHANNEL_SILENT",
-    "PLAYING_PANEL_TITLE",
-    "delete_interaction_response_later",
-    "delete_message_later",
-    "delete_music_request_message",
-    "describe_queue_selection",
-    "format_duration",
-    "is_silent_music_channel",
-    "log_discord_http_error",
-    "make_bulk_embed",
-    "make_idle_player_embed",
-    "make_lyrics_embed",
-    "make_lyrics_file",
-    "make_player_embed",
-    "make_queue_embed",
-    "make_queue_line",
-    "make_recent_playback_embed",
-    "make_track_embed",
-    "make_track_link",
-    "notify_playback_error",
-    "requester_label",
-    "send_music_request_reply",
-    "single_line",
-    "truncate_option_text",
-    "truncate_text",
-)
-
-
 def make_player_track(title: str, *, requester_id: int | None = None) -> Track:
     return Track(
         title=title,
@@ -82,14 +48,6 @@ def make_lyrics_track() -> Track:
 
 
 class MusicDiscordDisplayTests(unittest.TestCase):
-    def test_bot_reexports_discord_display_names(self) -> None:
-        for name in MOVED_NAMES:
-            with self.subTest(name=name):
-                self.assertIs(
-                    getattr(bot, name),
-                    getattr(music_discord_display, name),
-                )
-
     def test_module_has_only_the_expected_import_dependencies(self) -> None:
         source = Path(music_discord_display.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)

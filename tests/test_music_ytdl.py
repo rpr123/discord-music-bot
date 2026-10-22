@@ -4,6 +4,8 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import bot
+import music_config
+import music_extraction
 import music_ytdl
 
 
@@ -30,7 +32,7 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
         music_ytdl.youtube_circuit_reason = None
 
     def test_default_options_leave_youtube_client_selection_to_ytdl(self) -> None:
-        extractor_args = bot.YTDL_BASE_OPTIONS.get("extractor_args", {})
+        extractor_args = music_config.YTDL_BASE_OPTIONS.get("extractor_args", {})
         youtube_args = extractor_args.get("youtube", {})
 
         self.assertNotIn("player_client", youtube_args)
@@ -45,15 +47,15 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(music_ytdl, "YTDL_MIN_INTERVAL_SECONDS", 0.0),
             patch.object(music_ytdl, "YTDL_CACHE_TTL_SECONDS", 600),
         ):
-            first = await bot.extract_ytdl_info(
-                bot.YTDL_OPTIONS,
+            first = await music_extraction.extract_ytdl_info(
+                music_extraction.YTDL_OPTIONS,
                 "ytsearch1:cache-protection-test",
                 "cache test",
                 job_kind=music_ytdl.YtdlJobKind.USER_REQUEST,
             )
             first["title"] = "caller mutation"
-            second = await bot.extract_ytdl_info(
-                bot.YTDL_OPTIONS,
+            second = await music_extraction.extract_ytdl_info(
+                music_extraction.YTDL_OPTIONS,
                 "ytsearch1:cache-protection-test",
                 "cache test",
                 job_kind=music_ytdl.YtdlJobKind.USER_REQUEST,
@@ -185,16 +187,16 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(music_ytdl, "run_ytdl_worker", new=worker),
         ):
             with self.assertRaises(asyncio.TimeoutError):
-                await bot.extract_ytdl_info(
-                    bot.YTDL_OPTIONS,
+                await music_extraction.extract_ytdl_info(
+                    music_extraction.YTDL_OPTIONS,
                     "ytsearch1:worker-timeout-test",
                     "worker timeout test",
                     job_kind=music_ytdl.YtdlJobKind.USER_REQUEST,
                     use_cache=False,
                 )
 
-            result = await bot.extract_ytdl_info(
-                bot.YTDL_OPTIONS,
+            result = await music_extraction.extract_ytdl_info(
+                music_extraction.YTDL_OPTIONS,
                 "ytsearch1:worker-after-timeout",
                 "worker after timeout",
                 job_kind=music_ytdl.YtdlJobKind.USER_REQUEST,
@@ -238,8 +240,8 @@ class YtdlProtectionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(music_ytdl, "run_ytdl_worker", new=worker),
             self.assertRaises(music_ytdl.YouTubeCircuitOpenError),
         ):
-            await bot.extract_ytdl_info(
-                bot.YTDL_OPTIONS,
+            await music_extraction.extract_ytdl_info(
+                music_extraction.YTDL_OPTIONS,
                 "ytsearch1:circuit-open-test",
                 "circuit test",
                 job_kind=music_ytdl.YtdlJobKind.USER_REQUEST,

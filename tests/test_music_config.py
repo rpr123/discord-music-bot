@@ -9,91 +9,7 @@ import bot
 import music_config
 
 
-MOVED_NAMES = (
-    "AUTOPLAY_BUTTON_CUSTOM_ID",
-    "AUTOPLAY_HISTORY_TTL_SECONDS",
-    "AUTOPLAY_MIN_INTERVAL_SECONDS",
-    "AUTOPLAY_REFILL_CANDIDATES",
-    "AUTOPLAY_START_DELAY_SECONDS",
-    "CONTROL_PANEL_HISTORY_LIMIT",
-    "DEFAULT_AUTO_TRACKS",
-    "DEV_GUILD_ID",
-    "DISCORD_TOKEN",
-    "EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS",
-    "EPHEMERAL_RESPONSE_DELETE_SECONDS",
-    "FFMPEG_EXECUTABLE",
-    "FFMPEG_OPTIONS",
-    "IDLE_VOICE_DISCONNECT_DELAY_SECONDS",
-    "LOG_LEVEL",
-    "LYRICS_API_URL",
-    "LYRICS_REQUEST_TIMEOUT_SECONDS",
-    "LYRICS_START_DELAY_SECONDS",
-    "MAX_AUTO_TRACKS",
-    "MAX_BULK_TRACKS",
-    "MUSIC_CHANNEL_DELETE_REQUESTS",
-    "MUSIC_CHANNEL_ID",
-    "MUSIC_CHANNEL_NAME",
-    "MUSIC_CHANNEL_SILENT",
-    "MUSIC_CHANNELS_FILE",
-    "MUSIC_FEEDBACK_DELETE_SECONDS",
-    "PROJECT_DIR",
-    "QUEUE_DELETE_RESPONSE_DELETE_SECONDS",
-    "QUEUE_SELECT_LIMIT",
-    "STREAM_URL_MAX_AGE_SECONDS",
-    "VOICE_DISCONNECT_TIMEOUT_SECONDS",
-    "VOICE_RECONNECT_GRACE_SECONDS",
-    "YOUTUBE_CIRCUIT_BREAKER_SECONDS",
-    "YOUTUBE_COOKIES_FILE",
-    "YOUTUBE_LYRICS_FALLBACK",
-    "YOUTUBE_MUSIC_AUTH_FILE",
-    "YOUTUBE_MUSIC_LANGUAGE",
-    "YOUTUBE_MUSIC_LOCATION",
-    "YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS",
-    "YOUTUBE_MUSIC_OAUTH_CLIENT_ID",
-    "YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET",
-    "YOUTUBE_MUSIC_SEARCH_ENABLED",
-    "YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS",
-    "YOUTUBE_SEARCH_CANDIDATES",
-    "YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS",
-    "YTDL_BASE_OPTIONS",
-    "YTDL_CACHE_MAX_ENTRIES",
-    "YTDL_CACHE_TTL_SECONDS",
-    "YTDL_EXTRACT_TIMEOUT_SECONDS",
-    "YTDL_MAX_CONCURRENT_EXTRACTIONS",
-    "YTDL_MIN_INTERVAL_SECONDS",
-    "YTDL_OPTIONS",
-    "YTDL_PLAYLIST_OPTIONS",
-    "YTDL_SEARCH_OPTIONS",
-    "YTDL_WORKER_PATH",
-    "clear_control_message_id",
-    "configured_autoplay_enabled",
-    "configured_control_messages",
-    "configured_music_channels",
-    "get_autoplay_enabled",
-    "get_control_message_id",
-    "get_music_channel_id",
-    "load_env_file",
-    "load_music_channel_config",
-    "logger",
-    "parse_nonnegative_float_env",
-    "parse_positive_int_env",
-    "resolve_project_path",
-    "save_music_channel_config",
-    "set_autoplay_enabled",
-    "set_control_message_id",
-    "set_music_channel",
-)
-
-
 class MusicConfigTests(unittest.TestCase):
-    def test_bot_reexports_moved_config_names(self) -> None:
-        for name in MOVED_NAMES:
-            with self.subTest(name=name):
-                self.assertTrue(
-                    getattr(bot, name) is getattr(music_config, name),
-                    f"{name} is not re-exported from music_config",
-                )
-
     def test_module_has_only_the_expected_import_dependencies(self) -> None:
         source = Path(music_config.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -128,7 +44,7 @@ class MusicConfigTests(unittest.TestCase):
             clear=False,
         ):
             with patch.object(bot.logger, "warning") as warning:
-                self.assertEqual(bot.parse_positive_int_env(positive_name, 7), 7)
+                self.assertEqual(music_config.parse_positive_int_env(positive_name, 7), 7)
                 warning.assert_called_once_with(
                     "%s must be a positive integer. Falling back to %s.",
                     positive_name,
@@ -137,7 +53,7 @@ class MusicConfigTests(unittest.TestCase):
 
                 warning.reset_mock()
                 self.assertEqual(
-                    bot.parse_nonnegative_float_env(float_name, 1.25),
+                    music_config.parse_nonnegative_float_env(float_name, 1.25),
                     1.25,
                 )
                 warning.assert_called_once_with(
@@ -160,10 +76,10 @@ class MusicConfigTests(unittest.TestCase):
             },
             clear=False,
         ):
-            self.assertEqual(bot.parse_positive_int_env(positive_name, 5), 17)
-            self.assertEqual(bot.parse_positive_int_env(minimum_name, 5), 1)
+            self.assertEqual(music_config.parse_positive_int_env(positive_name, 5), 17)
+            self.assertEqual(music_config.parse_positive_int_env(minimum_name, 5), 1)
             self.assertEqual(
-                bot.parse_nonnegative_float_env(float_name, 5.0),
+                music_config.parse_nonnegative_float_env(float_name, 5.0),
                 0.25,
             )
 
@@ -207,7 +123,7 @@ class MusicConfigTests(unittest.TestCase):
                 for name in managed_names - {existing_name}:
                     music_config.os.environ.pop(name, None)
 
-                bot.load_env_file(env_path)
+                music_config.load_env_file(env_path)
 
                 self.assertEqual(music_config.os.environ[existing_name], "original")
                 self.assertEqual(music_config.os.environ[double_name], "two words")

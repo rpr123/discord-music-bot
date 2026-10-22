@@ -3,65 +3,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import bot
+import music_request_parsing
 import music_search_scoring
 
 
-MOVED_FUNCTION_NAMES = (
-    "build_youtube_search_query",
-    "clean_track_title",
-    "clean_track_title_preserving_case",
-    "get_search_result_duration",
-    "get_version_style_intents",
-    "get_youtube_music_artist_hint",
-    "get_youtube_music_artist_names",
-    "get_youtube_search_tokens",
-    "infer_youtube_search_song_title",
-    "is_likely_official_youtube_upload",
-    "normalize_artist_name",
-    "normalize_identity_component",
-    "rank_autoplay_candidates",
-    "resolve_query",
-    "score_autoplay_candidate",
-    "score_youtube_search_result",
-    "select_youtube_music_song_result",
-    "select_youtube_search_result",
-    "should_use_youtube_music_search",
-    "strip_edge_title_tags",
-    "youtube_music_entries_are_ambiguous",
-    "youtube_music_result_to_entry",
-)
-
-MOVED_CONSTANT_NAMES = (
-    "ALTERNATE_VERSION_SEARCH_RE",
-    "ARTIST_CHANNEL_SUFFIX_RE",
-    "BRACKETED_TITLE_PART_RE",
-    "FULL_VERSION_SEARCH_RE",
-    "GAME_VIDEO_SEARCH_RE",
-    "LEADING_BRACKETED_TITLE_PART_RE",
-    "LONG_FORM_SEARCH_RE",
-    "NON_SONG_LABEL_RE",
-    "NON_SONG_SUFFIX_RE",
-    "OFFICIAL_AUDIO_SEARCH_RE",
-    "OFFICIAL_CHANNEL_RE",
-    "OFFICIAL_MEDIA_SEARCH_RE",
-    "OFFICIAL_VIDEO_SEARCH_RE",
-    "SHORT_VERSION_SEARCH_RE",
-    "TRAILING_BRACKETED_TITLE_PART_RE",
-    "VERSION_MARKER_RE",
-    "YOUTUBE_SEARCH_NOISE_TOKENS",
-)
-
-
 class MusicSearchScoringTests(unittest.TestCase):
-    def test_bot_reexports_moved_search_names(self) -> None:
-        for name in MOVED_FUNCTION_NAMES + MOVED_CONSTANT_NAMES:
-            with self.subTest(name=name):
-                self.assertIs(
-                    getattr(bot, name),
-                    getattr(music_search_scoring, name),
-                )
-
     def test_module_has_expected_dependencies(self) -> None:
         source = Path(music_search_scoring.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -726,21 +672,21 @@ class SearchRoutingTests(unittest.TestCase):
 
     def test_playlist_links_are_detected_as_bulk_requests(self) -> None:
         self.assertTrue(
-            bot.is_bulk_youtube_url("https://www.youtube.com/playlist?list=PL123")
+            music_request_parsing.is_bulk_youtube_url("https://www.youtube.com/playlist?list=PL123")
         )
         self.assertFalse(
-            bot.is_bulk_youtube_url(
+            music_request_parsing.is_bulk_youtube_url(
                 "https://www.youtube.com/watch?v=abcdefghijk&list=PL123"
             )
         )
         self.assertFalse(
-            bot.is_bulk_youtube_url("https://www.youtube.com/watch?v=abcdefghijk")
+            music_request_parsing.is_bulk_youtube_url("https://www.youtube.com/watch?v=abcdefghijk")
         )
 
     def test_playlist_result_uses_playlist_id(self) -> None:
         result = {"id": "PL1234567890ABCDEFG"}
 
         self.assertEqual(
-            bot.get_playlist_result_url(result),
+            music_request_parsing.get_playlist_result_url(result),
             "https://www.youtube.com/playlist?list=PL1234567890ABCDEFG",
         )

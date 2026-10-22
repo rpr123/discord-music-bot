@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import json
 import tempfile
@@ -10,7 +11,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from discord.ui.view import ViewStore
 
 import bot
+import music_autoplay_policy
+import music_config
 import music_discord_display
+import music_extraction
+import music_track_metadata
 import music_ytdl
 from devtools.local_music_bot import LocalMusicMode
 
@@ -22,693 +27,6 @@ def make_track(title: str) -> bot.Track:
         requester="tester",
         source_url=f"https://www.youtube.com/watch?v={title:0<11}"[:43],
     )
-
-
-class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_text_search_uses_flat_candidates_and_selector(self) -> None:
-        entries = [
-            {"id": "first-track", "title": "Game Version", "duration": 120},
-            {"id": "second-track", "title": "Full Version", "duration": 240},
-        ]
-        extract = AsyncMock(return_value={"entries": entries})
-
-        with (
-            patch.object(
-                bot,
-                "search_youtube_music",
-                new=AsyncMock(return_value=[]),
-            ),
-            patch.object(bot, "extract_ytdl_info", extract),
-            patch.object(
-                bot,
-                "select_youtube_search_result",
-                return_value=entries[1],
-            ) as select,
-        ):
-            result = await bot.extract_first_info(
-                "sample song",
-                f"ytsearch{bot.YOUTUBE_SEARCH_CANDIDATES}:sample song",
-            )
-
-        self.assertIs(result, entries[1])
-        extract.assert_awaited_once_with(
-            bot.YTDL_SEARCH_OPTIONS,
-            f"ytsearch{bot.YOUTUBE_SEARCH_CANDIDATES}:sample song",
-            "YouTube search",
-            job_kind=bot.YtdlJobKind.USER_REQUEST,
-        )
-        select.assert_called_once_with("sample song", entries)
-
-    async def test_catalog_song_is_resolved_directly(self) -> None:
-        music_results = [
-            {
-                "resultType": "song",
-                "videoId": "CuRIuFRD1zI",
-                "title": "泥濘鳴鳴",
-                "artists": [{"name": "CoMETIK"}],
-                "duration_seconds": 235,
-            }
-        ]
-        resolved = {
-            "id": "CuRIuFRD1zI",
-            "title": "泥濘鳴鳴",
-            "webpage_url": "https://www.youtube.com/watch?v=CuRIuFRD1zI",
-            "artist": "CoMETIK",
-        }
-        extract = AsyncMock(return_value=resolved)
-
-        with (
-            patch.object(
-                bot,
-                "search_youtube_music",
-                new=AsyncMock(return_value=music_results),
-            ),
-            patch.object(bot, "extract_ytdl_info", extract),
-        ):
-            result = await bot.extract_first_info(
-                "でいねいめいめい",
-                f"ytsearch{bot.YOUTUBE_SEARCH_CANDIDATES}:"
-                "でいねいめいめい",
-            )
-
-        self.assertIs(result, resolved)
-        extract.assert_awaited_once_with(
-            bot.YTDL_OPTIONS,
-            "https://www.youtube.com/watch?v=CuRIuFRD1zI",
-            "YouTube Music catalog song resolve",
-            job_kind=bot.YtdlJobKind.USER_REQUEST,
-        )
-
-    async def test_top_album_artist_enriches_youtube_fallback(self) -> None:
-        music_results = [
-            {
-                "category": "Top result",
-                "resultType": "album",
-                "title": "THE IDOLM@STER SHINY COLORS ECHOES 08",
-                "artists": [{"name": "CoMETIK"}],
-            }
-        ]
-        entries = [
-            {
-                "id": "CuRIuFRD1zI",
-                "title": "泥濘鳴鳴",
-                "duration": 235,
-                "channel": "コメティック",
-            },
-            {
-                "id": "I-CZXVMPiPg",
-                "title": "【シャニソン】コメティック「泥濘鳴鳴」3DMV",
-                "duration": 148,
-                "channel": "アイドルマスターチャンネル",
-            },
-        ]
-        extract = AsyncMock(return_value={"entries": entries})
-
-        with (
-            patch.object(
-                bot,
-                "search_youtube_music",
-                new=AsyncMock(return_value=music_results),
-            ),
-            patch.object(bot, "extract_ytdl_info", extract),
-        ):
-            result = await bot.extract_first_info(
-                "でいねいめいめい",
-                f"ytsearch{bot.YOUTUBE_SEARCH_CANDIDATES}:"
-                "でいねいめいめい",
-            )
-
-        self.assertEqual(result["id"], "CuRIuFRD1zI")
-        extract.assert_awaited_once_with(
-            bot.YTDL_SEARCH_OPTIONS,
-            f"ytsearch{bot.YOUTUBE_SEARCH_CANDIDATES}:"
-            "でいねいめいめい CoMETIK",
-            "YouTube search",
-            job_kind=bot.YtdlJobKind.USER_REQUEST,
-        )
-
-    async def test_direct_url_keeps_full_extraction_options(self) -> None:
-        url = "https://www.youtube.com/watch?v=abcdefghijk"
-        info = {"id": "abcdefghijk", "title": "Direct song"}
-        extract = AsyncMock(return_value=info)
-        music_search = AsyncMock()
-
-        with (
-            patch.object(bot, "extract_ytdl_info", extract),
-            patch.object(bot, "search_youtube_music", new=music_search),
-        ):
-            result = await bot.extract_first_info(url, url)
-
-        self.assertIs(result, info)
-        music_search.assert_not_awaited()
-        extract.assert_awaited_once_with(
-            bot.YTDL_OPTIONS,
-            url,
-            "YouTube search",
-            job_kind=bot.YtdlJobKind.USER_REQUEST,
-        )
-
-    async def test_text_track_defers_stream_resolution_until_playback(self) -> None:
-        info = {
-            "id": "abcdefghijk",
-            "title": "Selected song",
-            "duration": 180,
-            "webpage_url": "https://www.youtube.com/watch?v=abcdefghijk",
-        }
-
-        with (
-            patch.object(
-                bot,
-                "extract_first_info",
-                new=AsyncMock(return_value=info),
-            ),
-            patch.object(
-                bot,
-                "resolve_track_stream",
-                new=AsyncMock(),
-            ) as resolve_stream,
-        ):
-            track = await bot.extract_track("selected song", "tester")
-
-        resolve_stream.assert_not_awaited()
-        self.assertIsNone(track.stream_url)
-        self.assertEqual(
-            track.source_url,
-            "https://www.youtube.com/watch?v=abcdefghijk",
-        )
-
-    async def test_auto_fallback_search_uses_flat_options(self) -> None:
-        seed = bot.Track(
-            title="Seed Song",
-            webpage_url="https://example.test/seed",
-            requester="tester",
-            source_url="https://example.test/seed",
-        )
-        candidate = {
-            "id": "candidate01",
-            "title": "Candidate Song",
-            "duration": 180,
-        }
-        extract = AsyncMock(return_value={"entries": [candidate]})
-
-        with patch.object(bot, "extract_ytdl_info", extract):
-            tracks = await bot.extract_auto_tracks_from_seed(seed, "tester", 2)
-
-        self.assertEqual([track.title for track in tracks], ["Seed Song", "Candidate Song"])
-        extract.assert_awaited_once_with(
-            bot.YTDL_SEARCH_OPTIONS,
-            "ytsearch6:Seed Song radio mix",
-            "auto fallback search",
-            job_kind=bot.YtdlJobKind.USER_REQUEST,
-        )
-
-    async def test_auto_style_intent_comes_from_seed_title_without_query_scoring(
-        self,
-    ) -> None:
-        seed = bot.Track(
-            title="Seed Song Cover",
-            webpage_url="https://example.test/seed",
-            requester="tester",
-            source_url="https://example.test/seed",
-        )
-        entries = [
-            {
-                "id": "aaaaaaaaaaa",
-                "title": "Artist A - Candidate Cover",
-                "duration": 240,
-            },
-            {
-                "id": "bbbbbbbbbbb",
-                "title": "Artist B - Plain Candidate",
-                "duration": 240,
-            },
-        ]
-
-        with patch.object(
-            bot,
-            "extract_ytdl_info",
-            new=AsyncMock(return_value={"entries": entries}),
-        ):
-            tracks = await bot.extract_auto_tracks_from_seed(
-                seed,
-                "자동재생",
-                3,
-                job_kind=bot.YtdlJobKind.AUTOPLAY,
-            )
-
-        self.assertEqual(
-            [track.title for track in tracks],
-            [
-                "Seed Song Cover",
-                "Artist A - Candidate Cover",
-                "Artist B - Plain Candidate",
-            ],
-        )
-        self.assertEqual(getattr(tracks[1], "_autoplay_score"), 60)
-
-    async def test_background_autoplay_excludes_covers_without_cover_intent(
-        self,
-    ) -> None:
-        seed = bot.Track(
-            title="Seed Song",
-            webpage_url="https://example.test/seed",
-            requester="tester",
-            source_url="https://example.test/seed",
-        )
-        entries = [
-            {
-                "id": "aaaaaaaaaaa",
-                "title": "Artist A - Candidate (Self Cover)",
-                "duration": 240,
-            },
-            {
-                "id": "bbbbbbbbbbb",
-                "title": "Artist B - Plain Candidate",
-                "duration": 240,
-            },
-            {
-                "id": "ccccccccccc",
-                "title": "Artist C - Cover Me",
-                "duration": 240,
-            },
-        ]
-
-        for job_kind, expected in (
-            (
-                bot.YtdlJobKind.AUTOPLAY,
-                ["Seed Song", "Artist B - Plain Candidate", "Artist C - Cover Me"],
-            ),
-            (
-                bot.YtdlJobKind.USER_REQUEST,
-                [
-                    "Seed Song",
-                    "Artist B - Plain Candidate",
-                    "Artist C - Cover Me",
-                    "Artist A - Candidate (Self Cover)",
-                ],
-            ),
-        ):
-            with (
-                self.subTest(job_kind=job_kind),
-                patch.object(
-                    bot,
-                    "extract_ytdl_info",
-                    new=AsyncMock(return_value={"entries": entries}),
-                ),
-                patch.object(bot, "log_autoplay_event") as log_event,
-            ):
-                tracks = await bot.extract_auto_tracks_from_seed(
-                    seed,
-                    "자동재생",
-                    4,
-                    job_kind=job_kind,
-                )
-
-                self.assertEqual([track.title for track in tracks], expected)
-                statuses = {
-                    record["title"]: record["status"]
-                    for record in log_event.call_args.kwargs["candidates"]
-                }
-                self.assertEqual(
-                    statuses["Artist A - Candidate (Self Cover)"],
-                    "cover_excluded"
-                    if job_kind == bot.YtdlJobKind.AUTOPLAY
-                    else "candidate",
-                )
-
-    async def test_manual_auto_passes_original_query_as_style_context(self) -> None:
-        seed_info = {
-            "id": "abcdefghijk",
-            "title": "Seed Song",
-            "webpage_url": "https://www.youtube.com/watch?v=abcdefghijk",
-        }
-        related_tracks = [make_track("related")]
-
-        with (
-            patch.object(
-                bot,
-                "extract_first_info",
-                new=AsyncMock(return_value=seed_info),
-            ),
-            patch.object(
-                bot,
-                "extract_auto_tracks_from_seed",
-                new=AsyncMock(return_value=related_tracks),
-            ) as related,
-        ):
-            tracks = await bot.extract_auto_tracks(
-                "Seed Song cover",
-                "tester",
-                3,
-            )
-
-        self.assertIs(tracks, related_tracks)
-        self.assertEqual(related.await_args.kwargs["style_query"], "Seed Song cover")
-
-    async def test_auto_supplemental_search_uses_flat_options(self) -> None:
-        seed = bot.Track(
-            title="Seed Song",
-            webpage_url="https://www.youtube.com/watch?v=abcdefghijk",
-            requester="tester",
-            source_url="https://www.youtube.com/watch?v=abcdefghijk",
-        )
-        supplemental = {
-            "id": "candidate01",
-            "title": "Candidate Song",
-            "duration": 180,
-        }
-        extract = AsyncMock(
-            side_effect=[
-                {"entries": [{"id": "abcdefghijk", "title": "Seed Song"}]},
-                {"entries": [supplemental]},
-            ]
-        )
-
-        with patch.object(bot, "extract_ytdl_info", extract):
-            tracks = await bot.extract_auto_tracks_from_seed(seed, "tester", 2)
-
-        self.assertEqual([track.title for track in tracks], ["Seed Song", "Candidate Song"])
-        self.assertEqual(extract.await_count, 2)
-        self.assertEqual(
-            extract.await_args_list[0].args[0]["playlistend"],
-            2,
-        )
-        self.assertEqual(
-            extract.await_args_list[0].kwargs["job_kind"],
-            bot.YtdlJobKind.USER_REQUEST,
-        )
-        self.assertEqual(extract.await_args_list[1].args[0], bot.YTDL_SEARCH_OPTIONS)
-        self.assertEqual(
-            extract.await_args_list[1].args[2],
-            "auto supplemental search",
-        )
-        self.assertEqual(
-            extract.await_args_list[1].kwargs["job_kind"],
-            bot.YtdlJobKind.USER_REQUEST,
-        )
-
-    async def test_auto_supplemental_reranks_before_cross_batch_dedup(
-        self,
-    ) -> None:
-        seed = bot.Track(
-            title="Seed Song",
-            webpage_url="https://www.youtube.com/watch?v=abcdefghijk",
-            requester="tester",
-            source_url="https://www.youtube.com/watch?v=abcdefghijk",
-        )
-        radio_short = {
-            "id": "aaaaaaaaaaa",
-            "title": "Artist - Song Short Version",
-            "duration": 80,
-            "artist": "Artist",
-            "track": "Song",
-        }
-        supplemental_official = {
-            "id": "bbbbbbbbbbb",
-            "title": "Artist - Song Full Version Official MV",
-            "duration": 240,
-            "artist": "Artist",
-            "track": "Song",
-            "channel": "Artist Official",
-        }
-        supplemental_other = {
-            "id": "ccccccccccc",
-            "title": "Other Artist - Other Song",
-            "duration": 240,
-        }
-        extract = AsyncMock(
-            side_effect=[
-                {"entries": [radio_short]},
-                {"entries": [supplemental_official, supplemental_other]},
-            ]
-        )
-
-        with patch.object(bot, "extract_ytdl_info", extract):
-            tracks = await bot.extract_auto_tracks_from_seed(seed, "tester", 3)
-
-        self.assertEqual(
-            [track.title for track in tracks],
-            [
-                "Seed Song",
-                "Artist - Song Full Version Official MV",
-                "Other Artist - Other Song",
-            ],
-        )
-        self.assertEqual(extract.await_count, 2)
-
-    async def test_background_autoplay_does_not_run_supplemental_search(
-        self,
-    ) -> None:
-        seed = bot.Track(
-            title="Seed Song",
-            webpage_url="https://www.youtube.com/watch?v=abcdefghijk",
-            requester="tester",
-            source_url="https://www.youtube.com/watch?v=abcdefghijk",
-        )
-        extract = AsyncMock(
-            return_value={
-                "entries": [{"id": "abcdefghijk", "title": "Seed Song"}],
-            }
-        )
-
-        with patch.object(bot, "extract_ytdl_info", extract):
-            tracks = await bot.extract_auto_tracks_from_seed(
-                seed,
-                "자동재생",
-                10,
-                job_kind=bot.YtdlJobKind.AUTOPLAY,
-            )
-
-        self.assertEqual(tracks, [seed])
-        extract.assert_awaited_once()
-        self.assertEqual(extract.await_args.args[0]["playlistend"], 10)
-        self.assertEqual(
-            extract.await_args.kwargs["job_kind"],
-            bot.YtdlJobKind.AUTOPLAY,
-        )
-        self.assertEqual(
-            extract.await_args.kwargs["minimum_interval_seconds"],
-            bot.AUTOPLAY_MIN_INTERVAL_SECONDS,
-        )
-
-    async def test_background_autoplay_does_not_fallback_after_empty_radio(
-        self,
-    ) -> None:
-        seed = bot.Track(
-            title="Seed Song",
-            webpage_url="https://www.youtube.com/watch?v=abcdefghijk",
-            requester="tester",
-            source_url="https://www.youtube.com/watch?v=abcdefghijk",
-        )
-        extract = AsyncMock(return_value={"entries": []})
-
-        with patch.object(bot, "extract_ytdl_info", extract):
-            tracks = await bot.extract_auto_tracks_from_seed(
-                seed,
-                "자동재생",
-                10,
-                job_kind=bot.YtdlJobKind.AUTOPLAY,
-            )
-
-        self.assertEqual(tracks, [seed])
-        extract.assert_awaited_once()
-        self.assertEqual(extract.await_args.args[2], "YouTube radio mix")
-
-    async def test_background_autoplay_does_not_fallback_after_radio_error(
-        self,
-    ) -> None:
-        seed = bot.Track(
-            title="Seed Song",
-            webpage_url="https://www.youtube.com/watch?v=abcdefghijk",
-            requester="tester",
-            source_url="https://www.youtube.com/watch?v=abcdefghijk",
-        )
-        extract = AsyncMock(side_effect=RuntimeError("radio failed"))
-
-        with (
-            patch.object(bot, "extract_ytdl_info", extract),
-            self.assertRaisesRegex(RuntimeError, "radio failed"),
-        ):
-            await bot.extract_auto_tracks_from_seed(
-                seed,
-                "자동재생",
-                10,
-                job_kind=bot.YtdlJobKind.AUTOPLAY,
-            )
-
-        extract.assert_awaited_once()
-        self.assertEqual(extract.await_args.args[2], "YouTube radio mix")
-
-    async def test_user_auto_count_is_not_limited_by_background_refill(self) -> None:
-        seed = bot.Track(
-            title="Seed Song",
-            webpage_url="https://www.youtube.com/watch?v=seedtrack01",
-            requester="tester",
-            source_url="https://www.youtube.com/watch?v=seedtrack01",
-        )
-        entries = [
-            {
-                "id": f"track{index:06d}",
-                "title": f"Candidate {index}",
-                "duration": 180,
-            }
-            for index in range(24)
-        ]
-        extract = AsyncMock(return_value={"entries": entries})
-
-        with (
-            patch.object(bot, "MAX_AUTO_TRACKS", 25),
-            patch.object(bot, "MAX_BULK_TRACKS", 10),
-            patch.object(bot, "AUTOPLAY_REFILL_CANDIDATES", 5),
-            patch.object(bot, "extract_ytdl_info", extract),
-        ):
-            tracks = await bot.extract_auto_tracks_from_seed(seed, "tester", 25)
-
-        self.assertEqual(len(tracks), 25)
-        self.assertEqual(extract.await_args.args[0]["playlistend"], 25)
-        self.assertEqual(
-            extract.await_args.kwargs["job_kind"],
-            bot.YtdlJobKind.USER_REQUEST,
-        )
-
-    async def test_background_auto_fallback_uses_refill_candidate_count(self) -> None:
-        seed = bot.Track(
-            title="Seed Song",
-            webpage_url="https://example.test/seed",
-            requester="tester",
-            source_url="https://example.test/seed",
-        )
-        entries = [
-            {
-                "id": f"track{index:06d}",
-                "title": f"Candidate {index}",
-                "duration": 180,
-            }
-            for index in range(4)
-        ]
-        extract = AsyncMock(return_value={"entries": entries})
-
-        with (
-            patch.object(bot, "AUTOPLAY_REFILL_CANDIDATES", 5),
-            patch.object(bot, "extract_ytdl_info", extract),
-        ):
-            tracks = await bot.extract_auto_tracks_from_seed(
-                seed,
-                "tester",
-                5,
-                job_kind=bot.YtdlJobKind.AUTOPLAY,
-            )
-
-        self.assertEqual(len(tracks), 5)
-        extract.assert_awaited_once_with(
-            bot.YTDL_SEARCH_OPTIONS,
-            "ytsearch5:Seed Song radio mix",
-            "auto fallback search",
-            job_kind=bot.YtdlJobKind.AUTOPLAY,
-            minimum_interval_seconds=bot.AUTOPLAY_MIN_INTERVAL_SECONDS,
-        )
-
-    async def test_manual_auto_ranks_candidates_before_returning_tracks(self) -> None:
-        seed = bot.Track(
-            title="Seed Song",
-            webpage_url="https://example.test/seed",
-            requester="tester",
-            source_url="https://example.test/seed",
-        )
-        entries = [
-            {
-                "id": "aaaaaaaaaaa",
-                "title": "Artist - Song Short Version",
-                "duration": 80,
-            },
-            {
-                "id": "bbbbbbbbbbb",
-                "title": "Artist - Song Full Version Official MV",
-                "duration": 240,
-                "channel": "Artist Official",
-            },
-            {
-                "id": "ccccccccccc",
-                "title": "Other Artist - Other Song Cover",
-                "duration": 240,
-            },
-        ]
-
-        with patch.object(
-            bot,
-            "extract_ytdl_info",
-            new=AsyncMock(return_value={"entries": entries}),
-        ):
-            tracks = await bot.extract_auto_tracks_from_seed(seed, "tester", 4)
-
-        self.assertEqual(
-            [track.title for track in tracks],
-            [
-                "Seed Song",
-                "Artist - Song Full Version Official MV",
-                "Other Artist - Other Song Cover",
-                "Artist - Song Short Version",
-            ],
-        )
-        self.assertEqual(getattr(tracks[1], "_autoplay_score"), 158)
-        self.assertEqual(getattr(tracks[1], "_autoplay_source_index"), 1)
-
-    async def test_auto_ranking_keeps_best_duplicate_before_deduplication(
-        self,
-    ) -> None:
-        seed = bot.Track(
-            title="Seed Song",
-            webpage_url="https://example.test/seed",
-            requester="tester",
-            source_url="https://example.test/seed",
-        )
-        entries = [
-            {
-                "id": "aaaaaaaaaaa",
-                "title": "Artist - Song Official Audio",
-                "duration": 240,
-                "channel": "Artist Official",
-            },
-            {
-                "id": "bbbbbbbbbbb",
-                "title": "Artist - Song Official MV",
-                "duration": 240,
-                "channel": "Artist Official",
-            },
-        ]
-
-        with patch.object(
-            bot,
-            "extract_ytdl_info",
-            new=AsyncMock(return_value={"entries": entries}),
-        ):
-            tracks = await bot.extract_auto_tracks_from_seed(seed, "tester", 3)
-
-        self.assertEqual(
-            [track.title for track in tracks],
-            ["Seed Song", "Artist - Song Official MV"],
-        )
-
-    async def test_playlist_request_uses_bulk_priority(self) -> None:
-        url = "https://www.youtube.com/playlist?list=PL1234567890"
-        extract = AsyncMock(
-            return_value={
-                "entries": [
-                    {"id": "abcdefghijk", "title": "Playlist Track"},
-                ]
-            }
-        )
-
-        with patch.object(bot, "extract_ytdl_info", extract):
-            tracks = await bot.extract_tracks(url, "tester", "playlist")
-
-        self.assertEqual([track.title for track in tracks], ["Playlist Track"])
-        extract.assert_awaited_once_with(
-            bot.YTDL_PLAYLIST_OPTIONS,
-            url,
-            "playlist or album search",
-            job_kind=bot.YtdlJobKind.PLAYLIST_ALBUM,
-        )
 
 
 class DiscordHttpResilienceTests(unittest.IsolatedAsyncioTestCase):
@@ -1088,7 +406,7 @@ class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
         tracks = [make_track("seed"), make_track("related")]
 
         with (
-            patch.object(bot, "MAX_AUTO_TRACKS", 25),
+            patch.object(music_extraction, "MAX_AUTO_TRACKS", 25),
             patch.object(
                 bot,
                 "extract_auto_tracks",
@@ -1123,7 +441,7 @@ class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(state.queue), tracks)
         self.assertFalse(state.autoplay_candidate_pool)
         self.assertNotIn(
-            bot.normalize_track_key(pooled),
+            music_track_metadata.normalize_track_key(pooled),
             {entry.value for entry in state.recent_track_keys},
         )
         self.assertFalse(state.recent_playbacks)
@@ -1189,7 +507,7 @@ class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(state.autoplay_task)
         self.assertTrue(refill_task.cancelled())
         self.assertNotIn(
-            bot.normalize_track_key(pooled),
+            music_track_metadata.normalize_track_key(pooled),
             {entry.value for entry in state.recent_track_keys},
         )
         self.assertFalse(state.recent_playbacks)
@@ -1480,7 +798,7 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
     def test_track_keeps_manual_but_ignores_automatic_caption_metadata(
         self,
     ) -> None:
-        track = bot.make_track_from_info(
+        track = music_track_metadata.make_track_from_info(
             {
                 "id": "captions001",
                 "title": "Captioned song",
@@ -1547,7 +865,7 @@ class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
             bot.cancel_queue_message_cleanups(state)
         await asyncio.sleep(0)
         bot.music_states.clear()
-        bot.configured_music_channels.clear()
+        music_config.configured_music_channels.clear()
 
     def make_channel_and_message(self) -> tuple[MagicMock, MagicMock]:
         channel = MagicMock()
@@ -1678,7 +996,8 @@ class EphemeralResponseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         bot.housekeeping_tasks.clear()
         bot.bot_shutdown_started = False
-        bot.auxiliary_workers_closing = False
+        music_extraction.auxiliary_workers_closing = False
+        music_extraction.extraction_shutdown_started = False
         bot.lyrics_executor_closing = False
 
     async def asyncTearDown(self) -> None:
@@ -1688,7 +1007,8 @@ class EphemeralResponseTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*tasks, return_exceptions=True)
         bot.housekeeping_tasks.clear()
         bot.bot_shutdown_started = False
-        bot.auxiliary_workers_closing = False
+        music_extraction.auxiliary_workers_closing = False
+        music_extraction.extraction_shutdown_started = False
         bot.lyrics_executor_closing = False
         for state in bot.music_states.values():
             bot.cancel_queue_message_cleanups(state)
@@ -2082,8 +1402,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(order, ["update-start", "defer", "idle"])
             self.assertEqual(len(remote_edits), 2)
-            self.assertNotEqual(remote_edits[0]["embed"].title, bot.IDLE_PANEL_TITLE)
-            self.assertEqual(remote_edits[1]["embed"].title, bot.IDLE_PANEL_TITLE)
+            self.assertNotEqual(remote_edits[0]["embed"].title, music_discord_display.IDLE_PANEL_TITLE)
+            self.assertEqual(remote_edits[1]["embed"].title, music_discord_display.IDLE_PANEL_TITLE)
             final_view = remote_edits[1]["view"]
             self.assertIs(state.control_view, final_view)
             self.assertTrue(dispatched_owner.is_finished())
@@ -3036,8 +2356,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             {entry.value for entry in case.state.recent_track_keys},
             {
-                bot.normalize_track_key(first_auto),
-                bot.normalize_track_key(second_auto),
+                music_track_metadata.normalize_track_key(first_auto),
+                music_track_metadata.normalize_track_key(second_auto),
             },
         )
         self.assertFalse(case.state.recent_playbacks)
@@ -3332,7 +2652,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             **_kwargs: object,
         ) -> None:
             if (
-                embed.title == bot.PLAYING_PANEL_TITLE
+                embed.title == music_discord_display.PLAYING_PANEL_TITLE
                 and not playing_edit_started.is_set()
             ):
                 playing_edit_sources.append(source)
@@ -3418,7 +2738,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(idle_pending_before_release)
         self.assertEqual(
             remote_titles,
-            [bot.PLAYING_PANEL_TITLE, bot.IDLE_PANEL_TITLE],
+            [music_discord_display.PLAYING_PANEL_TITLE, music_discord_display.IDLE_PANEL_TITLE],
         )
         self.assertEqual(message.edit.await_count, 1)
         channel.send.assert_not_awaited()
@@ -3937,7 +3257,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         def assert_idle_panel(kwargs: dict[str, object]) -> None:
-            self.assertEqual(kwargs["embed"].title, bot.IDLE_PANEL_TITLE)
+            self.assertEqual(kwargs["embed"].title, music_discord_display.IDLE_PANEL_TITLE)
             idle_view = kwargs["view"]
             self.assertIsInstance(idle_view, bot.MusicControlView)
             self.assertTrue(
@@ -4099,7 +3419,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
 
         def assert_idle_panel(kwargs: dict[str, object]) -> None:
             self.assertIsNone(kwargs["content"])
-            self.assertEqual(kwargs["embed"].title, bot.IDLE_PANEL_TITLE)
+            self.assertEqual(kwargs["embed"].title, music_discord_display.IDLE_PANEL_TITLE)
             idle_view = kwargs["view"]
             self.assertIsInstance(idle_view, bot.MusicControlView)
             self.assertTrue(
@@ -4833,8 +4153,8 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(button.disabled)
         self.assertTrue(await view.interaction_check(interaction))
         with (
-            patch.object(bot, "extract_ytdl_info", new=AsyncMock()) as extract,
-            patch.object(bot, "search_youtube_music", new=AsyncMock()) as search,
+            patch.object(music_extraction, "extract_ytdl_info", new=AsyncMock()) as extract,
+            patch.object(music_extraction, "search_youtube_music", new=AsyncMock()) as search,
             patch.object(bot, "delete_interaction_response_later") as delete_later,
             patch.object(bot, "create_housekeeping_task"),
         ):
@@ -5556,7 +4876,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
             [await_call.args[2] for await_call in extract.await_args_list],
             [15, bot.AUTOPLAY_REFILL_CANDIDATES],
         )
-        sleep.assert_awaited_once_with(bot.AUTOPLAY_RETRY_DELAYS_SECONDS[0])
+        sleep.assert_awaited_once_with(music_autoplay_policy.AUTOPLAY_RETRY_DELAYS_SECONDS[0])
 
     async def test_refill_resets_retry_delay_after_successful_append(self) -> None:
         guild_id = 562
@@ -5602,8 +4922,8 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [await_call.args[0] for await_call in sleep.await_args_list],
             [
-                bot.AUTOPLAY_RETRY_DELAYS_SECONDS[0],
-                bot.AUTOPLAY_RETRY_DELAYS_SECONDS[0],
+                music_autoplay_policy.AUTOPLAY_RETRY_DELAYS_SECONDS[0],
+                music_autoplay_policy.AUTOPLAY_RETRY_DELAYS_SECONDS[0],
             ],
         )
 
@@ -5722,7 +5042,8 @@ class HousekeepingTaskTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         bot.housekeeping_tasks.clear()
         bot.bot_shutdown_started = False
-        bot.auxiliary_workers_closing = False
+        music_extraction.auxiliary_workers_closing = False
+        music_extraction.extraction_shutdown_started = False
         bot.lyrics_executor_closing = False
         bot.bot._discord_close_task = None
 
@@ -5733,7 +5054,8 @@ class HousekeepingTaskTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*tasks, return_exceptions=True)
         bot.housekeeping_tasks.clear()
         bot.bot_shutdown_started = False
-        bot.auxiliary_workers_closing = False
+        music_extraction.auxiliary_workers_closing = False
+        music_extraction.extraction_shutdown_started = False
         bot.lyrics_executor_closing = False
         discord_close_task = bot.bot._discord_close_task
         if discord_close_task is not None and not discord_close_task.done():
@@ -5906,8 +5228,9 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         bot.housekeeping_tasks.clear()
         bot.auxiliary_operation_tasks.clear()
-        bot.auxiliary_worker_tasks.clear()
-        bot.auxiliary_workers_closing = False
+        music_extraction.auxiliary_worker_tasks.clear()
+        music_extraction.auxiliary_workers_closing = False
+        music_extraction.extraction_shutdown_started = False
         bot.lyrics_executor_closing = False
         bot.lyrics_executor_shutdown_task = None
         bot.bot_shutdown_started = False
@@ -5922,7 +5245,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         tasks = list(
             bot.housekeeping_tasks
             | bot.auxiliary_operation_tasks
-            | bot.auxiliary_worker_tasks
+            | music_extraction.auxiliary_worker_tasks
             | bot.voice_operation_tasks
         )
         for task in tasks:
@@ -5930,9 +5253,10 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*tasks, return_exceptions=True)
         bot.housekeeping_tasks.clear()
         bot.auxiliary_operation_tasks.clear()
-        bot.auxiliary_worker_tasks.clear()
+        music_extraction.auxiliary_worker_tasks.clear()
         bot.voice_operation_tasks.clear()
-        bot.auxiliary_workers_closing = False
+        music_extraction.auxiliary_workers_closing = False
+        music_extraction.extraction_shutdown_started = False
         shutdown_task = bot.lyrics_executor_shutdown_task
         if shutdown_task is not None and not shutdown_task.done():
             shutdown_task.cancel()
@@ -5965,12 +5289,12 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         self.assertFalse(shutdown.done())
-        self.assertIn(worker, bot.auxiliary_worker_tasks)
+        self.assertIn(worker, music_extraction.auxiliary_worker_tasks)
         release.set()
         await shutdown
 
         self.assertTrue(worker.done())
-        self.assertFalse(bot.auxiliary_worker_tasks)
+        self.assertFalse(music_extraction.auxiliary_worker_tasks)
 
     async def test_shutdown_removes_done_worker_before_done_callback_runs(
         self,
@@ -5984,9 +5308,9 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await completed.wait()
 
         self.assertTrue(worker.done())
-        self.assertIn(worker, bot.auxiliary_worker_tasks)
+        self.assertIn(worker, music_extraction.auxiliary_worker_tasks)
 
-        original_wait = bot.wait_for_task_completion_despite_cancellation
+        original_wait = music_extraction.wait_for_task_completion_despite_cancellation
         wait_count = 0
 
         async def wait_once(task: asyncio.Task) -> tuple[bool, BaseException | None]:
@@ -5997,14 +5321,14 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             return await original_wait(task)
 
         with patch.object(
-            bot,
+            music_extraction,
             "wait_for_task_completion_despite_cancellation",
             new=wait_once,
         ):
             await bot.shutdown_auxiliary_workers()
 
         self.assertEqual(wait_count, 1)
-        self.assertFalse(bot.auxiliary_worker_tasks)
+        self.assertFalse(music_extraction.auxiliary_worker_tasks)
 
     async def test_cancelled_auxiliary_shutdown_still_waits_for_worker(self) -> None:
         started = asyncio.Event()
@@ -6035,7 +5359,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await shutdown
 
         self.assertTrue(worker.done())
-        self.assertFalse(bot.auxiliary_worker_tasks)
+        self.assertFalse(music_extraction.auxiliary_worker_tasks)
 
     async def test_lyrics_executor_shutdown_is_idempotent(self) -> None:
         calls: list[tuple[bool, bool]] = []
@@ -6427,8 +5751,8 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(),
         ) as submit:
             with self.assertRaises(asyncio.CancelledError):
-                await bot.extract_ytdl_info(
-                    bot.YTDL_SEARCH_OPTIONS,
+                await music_extraction.extract_ytdl_info(
+                    music_extraction.YTDL_SEARCH_OPTIONS,
                     "ytsearch1:closing",
                     "closing",
                     job_kind=bot.YtdlJobKind.AUTOPLAY,
@@ -6551,18 +5875,18 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await release_wait.wait()
 
         with (
-            patch.object(bot, "auxiliary_network_semaphore", semaphore),
+            patch.object(music_extraction, "auxiliary_network_semaphore", semaphore),
             patch.object(bot.asyncio, "to_thread", new=to_thread),
-            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
+            patch.object(music_extraction, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
             patch.object(
-                bot,
+                music_extraction,
                 "wait_for_youtube_music_interval",
                 side_effect=interval_wait,
             ),
         ):
-            search = asyncio.create_task(bot.search_youtube_music("closing"))
+            search = asyncio.create_task(music_extraction.search_youtube_music("closing"))
             await wait_started.wait()
-            bot.begin_auxiliary_worker_shutdown()
+            music_extraction.begin_auxiliary_worker_shutdown()
             release_wait.set()
             with self.assertRaises(RuntimeError):
                 await search
@@ -6586,17 +5910,17 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await release_wait.wait()
 
         with (
-            patch.object(bot, "auxiliary_network_semaphore", semaphore),
+            patch.object(music_extraction, "auxiliary_network_semaphore", semaphore),
             patch.object(bot.asyncio, "to_thread", new=to_thread),
-            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
+            patch.object(music_extraction, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
             patch.object(
-                bot,
+                music_extraction,
                 "wait_for_youtube_music_interval",
                 side_effect=interval_wait,
             ),
         ):
             search = asyncio.create_task(
-                bot.search_youtube_music("shutdown waiter")
+                music_extraction.search_youtube_music("shutdown waiter")
             )
             await wait_started.wait()
             bot.begin_bot_shutdown()
@@ -6667,121 +5991,6 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(bot.auxiliary_operation_tasks)
 
 
-class YouTubeMusicProtectionTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self) -> None:
-        bot.youtube_music_cache.clear()
-        bot.youtube_music_client = None
-        bot.youtube_music_last_request_started_at = 0.0
-        music_ytdl.ytdl_last_request_started_at = 0.0
-        music_ytdl.youtube_circuit_open_until = 0.0
-        music_ytdl.youtube_circuit_reason = None
-
-    async def asyncTearDown(self) -> None:
-        bot.youtube_music_cache.clear()
-        bot.youtube_music_client = None
-        bot.youtube_music_last_request_started_at = 0.0
-        music_ytdl.ytdl_last_request_started_at = 0.0
-        music_ytdl.youtube_circuit_open_until = 0.0
-        music_ytdl.youtube_circuit_reason = None
-
-    async def test_repeated_music_query_uses_cache(self) -> None:
-        payload = [
-            {
-                "resultType": "song",
-                "videoId": "CuRIuFRD1zI",
-                "title": "泥濘鳴鳴",
-            }
-        ]
-        to_thread = AsyncMock(return_value=payload)
-
-        with (
-            patch.object(bot.asyncio, "to_thread", new=to_thread),
-            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
-            patch.object(bot, "YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS", 0.0),
-            patch.object(bot, "YTDL_CACHE_TTL_SECONDS", 600),
-        ):
-            first = await bot.search_youtube_music("でいねいめいめい")
-            first[0]["title"] = "caller mutation"
-            second = await bot.search_youtube_music("でいねいめいめい")
-
-        to_thread.assert_awaited_once()
-        self.assertEqual(second[0]["title"], "泥濘鳴鳴")
-
-    async def test_empty_music_results_are_cached(self) -> None:
-        to_thread = AsyncMock(return_value=[])
-
-        with (
-            patch.object(bot.asyncio, "to_thread", new=to_thread),
-            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
-            patch.object(bot, "YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS", 0.0),
-            patch.object(bot, "YTDL_CACHE_TTL_SECONDS", 600),
-        ):
-            first = await bot.search_youtube_music("missing song")
-            second = await bot.search_youtube_music("missing song")
-
-        self.assertEqual(first, [])
-        self.assertEqual(second, [])
-        to_thread.assert_awaited_once()
-
-    async def test_disabled_music_search_does_not_start_worker(self) -> None:
-        to_thread = AsyncMock()
-
-        with (
-            patch.object(bot.asyncio, "to_thread", new=to_thread),
-            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", False),
-        ):
-            results = await bot.search_youtube_music("sample")
-
-        self.assertEqual(results, [])
-        to_thread.assert_not_awaited()
-
-    async def test_music_search_uses_its_own_rate_limiter(self) -> None:
-        to_thread = AsyncMock(return_value=[])
-
-        with (
-            patch.object(bot.asyncio, "to_thread", new=to_thread),
-            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
-            patch.object(
-                bot,
-                "wait_for_youtube_music_interval",
-                new=AsyncMock(),
-            ) as music_wait,
-            patch.object(
-                music_ytdl,
-                "wait_for_ytdl_interval",
-                new=AsyncMock(),
-            ) as ytdl_wait,
-        ):
-            await bot.search_youtube_music("independent limiter")
-
-        music_wait.assert_awaited_once_with()
-        ytdl_wait.assert_not_awaited()
-
-    async def test_music_search_rechecks_circuit_after_rate_limit_wait(self) -> None:
-        semaphore = asyncio.Semaphore(1)
-        to_thread = AsyncMock(return_value=[])
-
-        async def open_circuit_during_wait() -> None:
-            music_ytdl.youtube_circuit_open_until = music_ytdl.time.monotonic() + 60
-            music_ytdl.youtube_circuit_reason = "test circuit"
-
-        with (
-            patch.object(bot, "auxiliary_network_semaphore", semaphore),
-            patch.object(bot.asyncio, "to_thread", new=to_thread),
-            patch.object(bot, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
-            patch.object(
-                bot,
-                "wait_for_youtube_music_interval",
-                side_effect=open_circuit_during_wait,
-            ),
-            self.assertRaises(music_ytdl.YouTubeCircuitOpenError),
-        ):
-            await bot.search_youtube_music("circuit opens while waiting")
-
-        to_thread.assert_not_awaited()
-        self.assertEqual(semaphore._value, 1)
-
-
 class LocalMusicTestModeTests(unittest.IsolatedAsyncioTestCase):
     async def test_local_audio_mode_never_calls_ytdl(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6790,7 +5999,7 @@ class LocalMusicTestModeTests(unittest.IsolatedAsyncioTestCase):
             mode = LocalMusicMode(audio_path, bulk_tracks=2)
 
             with patch.object(
-                bot,
+                music_extraction,
                 "extract_ytdl_info",
                 new=AsyncMock(),
             ) as extract:
@@ -6803,7 +6012,7 @@ class LocalMusicTestModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(single.stream_url, str(audio_path))
         self.assertEqual(len(bulk), 2)
         self.assertEqual(len(auto), 3)
-        self.assertEqual(len({bot.normalize_track_key(track) for track in auto}), 3)
+        self.assertEqual(len({music_track_metadata.normalize_track_key(track) for track in auto}), 3)
 
 
 class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
@@ -8331,7 +7540,8 @@ class QueueRangeDeleteViewTests(unittest.IsolatedAsyncioTestCase):
 class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         bot.bot_shutdown_started = False
-        bot.auxiliary_workers_closing = False
+        music_extraction.auxiliary_workers_closing = False
+        music_extraction.extraction_shutdown_started = False
         bot.lyrics_executor_closing = False
         bot.voice_operation_tasks.clear()
         bot.bot._discord_close_task = None
@@ -8345,7 +7555,8 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*tasks, return_exceptions=True)
         bot.voice_operation_tasks.clear()
         bot.bot_shutdown_started = False
-        bot.auxiliary_workers_closing = False
+        music_extraction.auxiliary_workers_closing = False
+        music_extraction.extraction_shutdown_started = False
         bot.lyrics_executor_closing = False
         discord_close_task = bot.bot._discord_close_task
         if discord_close_task is not None and not discord_close_task.done():
@@ -10380,7 +9591,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(state.current, first)
         self.assertEqual(list(state.queue), [second])
         self.assertIn(
-            bot.normalize_track_key(first),
+            music_track_metadata.normalize_track_key(first),
             {entry.value for entry in state.recent_track_keys},
         )
         self.assertEqual(
@@ -10429,7 +9640,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(bot, "ffmpeg_is_available", return_value=True),
-            patch.object(bot, "extract_ytdl_info", new=AsyncMock()) as extract,
+            patch.object(music_extraction, "extract_ytdl_info", new=AsyncMock()) as extract,
             patch.object(
                 bot.discord,
                 "FFmpegOpusAudio",
@@ -10858,7 +10069,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         track.stream_url = "https://example.test/audio"
         track.stream_resolved_at = bot.time.monotonic()
 
-        with patch.object(bot, "extract_ytdl_info", new=AsyncMock()) as extract:
+        with patch.object(music_extraction, "extract_ytdl_info", new=AsyncMock()) as extract:
             await bot.resolve_track_stream(track)
 
         extract.assert_not_awaited()
@@ -10866,7 +10077,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_stream_url_is_refreshed(self) -> None:
         track = make_track("stale")
         track.stream_url = "https://example.test/old-audio"
-        track.stream_resolved_at = bot.time.monotonic() - bot.STREAM_URL_MAX_AGE_SECONDS
+        track.stream_resolved_at = bot.time.monotonic() - music_extraction.STREAM_URL_MAX_AGE_SECONDS
         resolved = {
             "title": "refreshed",
             "webpage_url": track.webpage_url,
@@ -10876,14 +10087,14 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with patch.object(
-            bot,
+            music_extraction,
             "extract_ytdl_info",
             new=AsyncMock(return_value=resolved),
         ) as extract:
             await bot.resolve_track_stream(track)
 
         extract.assert_awaited_once_with(
-            bot.YTDL_OPTIONS,
+            music_extraction.YTDL_OPTIONS,
             track.source_url,
             "audio stream resolve",
             job_kind=bot.YtdlJobKind.PLAYBACK_STREAM,
@@ -10907,7 +10118,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(bot, "ytdl_scheduler", scheduler),
             patch.object(music_ytdl, "run_ytdl_worker", side_effect=worker),
-            patch.object(bot, "YTDL_EXTRACT_TIMEOUT_SECONDS", 0.01),
+            patch.object(music_extraction, "YTDL_EXTRACT_TIMEOUT_SECONDS", 0.01),
         ):
             blocker = asyncio.create_task(
                 scheduler.submit(
@@ -10921,7 +10132,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
             )
             await worker_started.wait()
             with self.assertRaises(asyncio.TimeoutError):
-                await bot.extract_ytdl_info(
+                await music_extraction.extract_ytdl_info(
                     {},
                     "test",
                     "blocked extraction",
@@ -11241,6 +10452,26 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(state.current)
         self.assertEqual(list(state.queue), [])
         show_idle_panel.assert_awaited_once_with(guild_id, state)
+
+
+class BotImportTests(unittest.TestCase):
+    def test_every_name_imported_from_project_modules_is_used(self) -> None:
+        # Tests read moved names from their owning module, so bot.py only
+        # imports what its own code uses.
+        tree = ast.parse(Path(bot.__file__).read_text(encoding="utf-8"))
+        used_names = {
+            node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+        }
+        imported_names = {
+            alias.asname or alias.name
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom)
+            and node.module
+            and node.module.startswith("music_")
+            for alias in node.names
+        }
+
+        self.assertEqual(imported_names - used_names, set())
 
 
 if __name__ == "__main__":

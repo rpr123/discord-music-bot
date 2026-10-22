@@ -8,34 +8,7 @@ import bot
 import music_models
 
 
-PUBLIC_IDENTITY_NAMES = (
-    "Track",
-    "GuildMusicState",
-    "remove_queued_track",
-    "remove_queued_track_by_id",
-    "remove_queued_track_range_by_ids",
-    "remove_queued_tracks_before_id",
-    "MAX_PLAYBACK_ATTEMPTS",
-    "invalidate_track_stream",
-    "requeue_track_after_playback_error",
-    "reset_track_playback_attempts",
-    "reset_track_playback_state",
-)
-
-
 class MusicModelTests(unittest.TestCase):
-    def test_bot_reexports_music_model_names(self) -> None:
-        for name in PUBLIC_IDENTITY_NAMES:
-            with self.subTest(name=name):
-                self.assertIs(
-                    getattr(bot, name),
-                    getattr(music_models, name),
-                )
-        self.assertEqual(
-            bot.AUTOPLAY_HISTORY_SIZE,
-            music_models.AUTOPLAY_HISTORY_SIZE,
-        )
-
     def test_module_has_only_the_expected_import_dependencies(self) -> None:
         source = Path(music_models.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)

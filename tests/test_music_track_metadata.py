@@ -6,29 +6,7 @@ import bot
 import music_track_metadata
 
 
-MOVED_FUNCTION_NAMES = (
-    "get_video_id",
-    "normalize_track_key",
-    "get_track_video_id",
-    "get_track_identity_keys",
-    "get_resolved_stream_url",
-    "get_audio_codec",
-    "get_thumbnail_url",
-    "get_entry_url",
-    "get_manual_subtitles",
-    "make_track_from_info",
-)
-
-
 class MusicTrackMetadataTests(unittest.TestCase):
-    def test_bot_reexports_moved_track_metadata_functions(self) -> None:
-        for name in MOVED_FUNCTION_NAMES:
-            with self.subTest(name=name):
-                self.assertIs(
-                    getattr(bot, name),
-                    getattr(music_track_metadata, name),
-                )
-
     def test_module_has_only_the_expected_import_dependencies(self) -> None:
         source = Path(music_track_metadata.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)

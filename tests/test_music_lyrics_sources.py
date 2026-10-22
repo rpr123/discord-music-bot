@@ -19,44 +19,7 @@ def make_track(title: str) -> bot.Track:
     )
 
 
-MOVED_NAMES = (
-    "LRC_METADATA_RE",
-    "LRC_TIMESTAMP_RE",
-    "LYRICS_DURATION_MATCH_TOLERANCE_SECONDS",
-    "LYRICS_NATIVE_SCRIPT_MIN_RATIO",
-    "LYRICS_NATIVE_SCRIPT_SCORE_WINDOW",
-    "LyricsLookupError",
-    "extract_original_lyrics",
-    "get_lyrics_search_terms",
-    "get_lyrics_title_aliases",
-    "lyrics_native_script_ratio",
-    "lyrics_record_score",
-    "normalize_lyrics_match_text",
-    "lookup_track_lyrics",
-    "request_lyrics_records",
-    "request_youtube_subtitle",
-    "select_lyrics_record",
-    "VTT_TAG_RE",
-    "VTT_TIMESTAMP_LINE_RE",
-    "YouTubeSubtitleError",
-    "extract_json3_lyrics",
-    "extract_vtt_lyrics",
-    "get_manual_subtitle_candidates",
-    "get_subtitle_candidates",
-    "normalize_subtitle_text",
-    "select_manual_subtitle",
-)
-
-
 class MusicLyricsSourcesTests(unittest.TestCase):
-    def test_bot_reexports_moved_lyrics_source_names(self) -> None:
-        for name in MOVED_NAMES:
-            with self.subTest(name=name):
-                self.assertIs(
-                    getattr(bot, name),
-                    getattr(music_lyrics_sources, name),
-                )
-
     def test_module_has_only_the_expected_import_dependencies(self) -> None:
         source = Path(music_lyrics_sources.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)

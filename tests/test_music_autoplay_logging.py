@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import bot
 import music_autoplay_logging as diagnostics
+import music_extraction
 from music_models import GuildMusicState, Track
 
 
@@ -81,7 +82,7 @@ class AutoplayLoggingTests(unittest.IsolatedAsyncioTestCase):
         ]
         with (
             patch.object(bot, "get_state", return_value=state),
-            patch.object(bot, "extract_ytdl_info", new=AsyncMock(return_value={"entries": entries})),
+            patch.object(music_extraction, "extract_ytdl_info", new=AsyncMock(return_value={"entries": entries})),
             patch.object(bot, "update_control_panel", new=AsyncMock()),
         ):
             await bot.refill_autoplay_queue(999, state.playback_generation, seed)
@@ -113,7 +114,7 @@ class AutoplayLoggingTests(unittest.IsolatedAsyncioTestCase):
             {"id": "aaaaaaaaaaa", "title": "first", "duration": 200},
             {"id": "bbbbbbbbbbb", "title": "second", "duration": 200},
         ]
-        with patch.object(bot, "extract_ytdl_info", new=AsyncMock(return_value={"entries": entries})):
+        with patch.object(music_extraction, "extract_ytdl_info", new=AsyncMock(return_value={"entries": entries})):
             result = await bot.extract_auto_tracks_from_seed(
                 seed, "tester", 2, job_kind=bot.YtdlJobKind.AUTOPLAY,
             )

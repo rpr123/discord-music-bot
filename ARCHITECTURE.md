@@ -4,12 +4,13 @@
 
 ## 현재 의존 방향
 
-`bot.py`는 Discord 진입점이자 composition root이며, 이벤트와 UI뿐 아니라 음성 재생, queue commit, 자동재생, 가사 게시와 shutdown을 잇는 런타임 구현도 포함합니다. 따라서 단순한 wiring 파일로 보거나, 반대로 파일 크기만으로 하나의 이동 경계를 정하면 안 됩니다.
+`bot.py`는 Discord 진입점이자 composition root이며, 이벤트와 UI뿐 아니라 음성 재생, queue commit, 자동재생 refill, 가사 게시와 shutdown을 잇는 런타임 구현도 포함합니다. YouTube 검색·추출은 `music_extraction.py`가 맡습니다. 따라서 단순한 wiring 파일로 보거나, 반대로 파일 크기만으로 하나의 이동 경계를 정하면 안 됩니다.
 
 Production supporting module들은 더 낮은 수준의 supporting module을 단방향으로 import할 수 있지만, 현재 production dependency graph에서는 `bot.py`를 역-import하지 않습니다. 주요 project-local import 방향은 다음과 같습니다.
 
 - `bot` → 모든 `music_*` supporting module
 - `music_ytdl` → `music_config`
+- `music_extraction` → `music_autoplay_logging`, `music_config`, `music_models`, `music_request_parsing`, `music_search_scoring`, `music_track_metadata`, `music_ytdl`
 - `music_audio_buffer` → `music_config`
 - `music_discord_display` → `music_config`, `music_models`
 - `music_search_scoring` → `music_config`, `music_discord_display`, `music_request_parsing`
@@ -26,7 +27,7 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 
 | 파일 | 현재 책임 |
 | --- | --- |
-| `bot.py` | Discord client와 event/command/view, 신청 추출과 queue commit, 음성 연결·재생·재시도, 자동재생 refill, panel·가사 lifecycle, process shutdown 조정 |
+| `bot.py` | Discord client와 event/command/view, 신청 처리와 queue commit, 음성 연결·재생·재시도, 자동재생 refill, panel·가사 lifecycle, process shutdown 조정 |
 | `music_config.py` | `.env`와 설정값 파싱, yt-dlp·FFmpeg 옵션, logger, 길드별 channel/control message/autoplay 설정의 JSON 저장 |
 | `music_models.py` | `Track`, `GuildMusicState`, autoplay/recent history entry와 queue·stream·retry에 가까운 mutation helper |
 | `music_discord_display.py` | Discord 응답·삭제 helper와 track/player/queue/recent/lyrics embed 및 첨부 파일 생성 |
@@ -34,6 +35,7 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 | `music_search_scoring.py` | 제목·아티스트 정규화, YouTube Music result 변환, 일반 YouTube 후보 점수화와 query 해석 |
 | `music_track_metadata.py` | yt-dlp info에서 video·stream·codec·thumbnail·subtitle metadata 추출, `Track` 생성과 identity key 구성 |
 | `music_ytdl.py` | yt-dlp cache·rate limit·circuit breaker, priority job scheduling, timeout·cancellation과 subprocess 정리 |
+| `music_extraction.py` | yt-dlp 조회 wrapper, YouTube Music client·cache·rate limit, 곡·앨범·재생목록·Radio 추출과 재생 직전 stream resolve, 보조 network slot과 그 operation/worker task 수명 |
 | `music_audio_buffer.py` | FFmpeg Opus source를 별도 thread로 미리 읽어 두고 20ms 간격으로 내보내며, 버퍼가 비면 무음으로 기다렸다가 이어서 재생 |
 | `ytdl_worker.py` | 격리 subprocess에서 `yt_dlp.YoutubeDL.extract_info`를 실행하고 JSON 결과 또는 오류 반환 |
 | `music_autoplay_policy.py` | 최근곡 TTL/history, current·queue·recent 중복 제외, 후보 선택·pool 관리, seed·refill·retry 정책 |
@@ -44,7 +46,8 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 
 ### Process-scoped runtime state
 
-- `bot.py`는 Discord client, shutdown flag, YouTube Music client/cache/rate lock, 보조 network semaphore와 operation/worker task set, subtitle rate state, lyrics executor, voice operation과 housekeeping task를 소유합니다.
+- `bot.py`는 Discord client, shutdown flag, subtitle rate state, lyrics executor, voice operation과 housekeeping task를 소유합니다.
+- `music_extraction.py`는 YouTube Music client/cache/rate lock, 보조 network semaphore와 operation/worker task set, 추출 shutdown flag를 소유합니다. 가사의 수동 자막 조회도 이 보조 network slot을 함께 씁니다. `bot.begin_bot_shutdown`이 `begin_extraction_shutdown`을 호출해 추출 쪽을 함께 닫습니다.
 - `music_ytdl.py`는 process-wide priority scheduler, active worker/job, cache/rate state와 YouTube circuit state를 소유합니다.
 
 Process-scoped 상태가 모두 `bot.py`에 있다는 가정으로 소유권을 나누면 안 됩니다.
@@ -76,9 +79,9 @@ Process-scoped 상태가 모두 `bot.py`에 있다는 가정으로 소유권을 
 ## 핵심 런타임 흐름
 
 1. `on_message`가 설정된 music channel의 사용자 신청을 받고 음성 연결 조건을 확인한 뒤 `enqueue_tracks`를 호출합니다.
-2. `enqueue_tracks`는 요청 종류를 파싱하고 YouTube Music metadata, 일반 YouTube fallback 또는 playlist/radio 추출을 선택합니다. 추출 결과는 `music_track_metadata`를 거쳐 `Track`이 됩니다.
+2. `enqueue_tracks`는 요청 종류를 파싱하고 `music_extraction`의 곡·playlist·auto 추출을 호출합니다. 추출은 YouTube Music metadata, 일반 YouTube fallback 또는 playlist/radio 조회를 선택하고, 결과는 `music_track_metadata`를 거쳐 `Track`이 됩니다.
 3. 검색 전후 playback generation을 확인하고, 성공한 수동 신청은 진행 중인 autoplay refill과 숨은 후보를 정리한 뒤 `GuildMusicState.lock` 안에서 queue에 commit됩니다.
-4. `schedule_play_next`와 pending advance 상태가 여러 completion callback을 하나의 다음 재생으로 합칩니다. `play_next`는 queue에서 current를 정하고 재생 직전에 stream을 resolve한 뒤 FFmpeg source를 `BufferedOpusAudio`로 감싸 voice client에 전달합니다.
+4. `schedule_play_next`와 pending advance 상태가 여러 completion callback을 하나의 다음 재생으로 합칩니다. `play_next`는 queue에서 current를 정하고 재생 직전에 `resolve_track_stream`으로 stream을 resolve한 뒤 FFmpeg source를 `BufferedOpusAudio`로 감싸 voice client에 전달합니다.
 5. 재생이 시작되면 실제 recent playback을 기록하고 panel을 갱신합니다. Voice completion callback은 repeat, retry, stop과 다음 advance를 결정합니다.
 6. `start_noncritical_tasks`는 current identity와 generation을 다시 확인하면서 autoplay refill과 lyrics publish를 서로 다른 지연 뒤 시작합니다.
 7. Autoplay는 pool 후보를 current·queue·recent 기준으로 다시 검증해 먼저 사용하고, 적격 후보가 없을 때만 radio extraction을 수행합니다.
@@ -89,14 +92,14 @@ Process-scoped 상태가 모두 `bot.py`에 있다는 가정으로 소유권을 
 - 긴 network·executor 작업 전체를 guild state lock 안에서 수행하지 않습니다. Await 이후 queue/current를 변경하기 전에는 generation, current identity 또는 target 존재 여부를 다시 확인합니다.
 - `GuildMusicState.lock`, `voice_connect_lock`, `control_panel_lock`은 각각 일반 재생 상태 commit, voice 연결·해제, persistent panel 조정을 담당합니다.
 - Task finalizer는 자신이 여전히 state field의 owner일 때만 해당 참조를 비웁니다. 이전 task가 늦게 끝나 새 task의 소유권을 지우면 안 됩니다.
-- Shutdown은 새 작업을 차단한 뒤 guild background task, voice operation, auxiliary operation, yt-dlp scheduler와 worker, lyrics executor, housekeeping task와 Discord client를 각 owner를 통해 정리합니다.
+- Shutdown은 새 작업을 차단한 뒤 guild background task, voice operation, auxiliary operation(`music_extraction`), yt-dlp scheduler와 worker, lyrics executor, housekeeping task와 Discord client를 각 owner를 통해 정리합니다.
 
 ## 구조 변경을 검토할 때
 
 - 행 수나 인접한 함수 범위가 아니라 하나의 책임과 mutable state owner를 먼저 정합니다.
 - 동작만 옮기고 관련 mutable state를 원래 모듈에 남기는 이동은 피합니다.
 - 새 owner가 `bot`을 역-import하거나 import-back, callback bundle, 순환 의존을 요구하는지 확인합니다.
-- Patch는 symbol이 정의된 곳이 아니라 실행 코드가 실제 lookup하는 namespace에 적용합니다. Symbol 이동 전 `patch.object(bot, ...)`, re-export identity와 import contract test를 검색합니다.
+- Patch는 symbol이 정의된 곳이 아니라 실행 코드가 실제 lookup하는 namespace에 적용합니다. Symbol 이동 전 `patch.object(bot, ...)`와 import contract test를 검색합니다. `bot.py`는 자신이 실제로 쓰는 이름만 import하며(`BotImportTests`), 테스트가 읽기만 하는 이름은 owner module에서 직접 가져옵니다.
 - Pure policy·parsing·source behavior의 단위 테스트는 새 owner의 테스트로 이동하거나 추가할 수 있습니다. Discord wiring, cancellation, lock ordering과 guild lifecycle을 검증하는 integration test는 runtime owner에 남깁니다.
 - 사용자에게 보이는 신청, queue, 재생, panel, lyrics, autoplay와 shutdown 동작이 유지되는지 실패·취소·경합 경로까지 검증합니다.
 

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import bot as music_bot
+from music_config import MAX_BULK_TRACKS
 
 
 class LocalMusicMode:
@@ -15,7 +16,7 @@ class LocalMusicMode:
         if not resolved_path.is_file():
             raise ValueError(f"Local test audio file was not found: {resolved_path}")
         self.audio_path = resolved_path
-        self.bulk_tracks = max(1, min(bulk_tracks, music_bot.MAX_BULK_TRACKS))
+        self.bulk_tracks = max(1, min(bulk_tracks, MAX_BULK_TRACKS))
         self.track_counter = itertools.count(1)
 
     def make_track(
