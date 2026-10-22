@@ -1,22 +1,22 @@
 # Discord Music Bot
 
-Python 기반 디스코드 음악 봇입니다. 음악 신청 전용 채널에서는 곡명이나 YouTube URL만 메시지로 보내도 바로 재생 대기열에 추가되고, 상시 컨트롤 패널에서 재생을 제어할 수 있습니다.
+Python 기반 디스코드 음악 봇입니다. 음악 신청 전용 채널에 곡명이나 YouTube URL만 메시지로 보내면 바로 재생 대기열에 추가되고, 상시 컨트롤 패널에서 재생을 제어할 수 있습니다.
 
 개인 운영용 봇의 현재 구현과 검증 절차를 함께 기록합니다. 모듈 책임, 의존 방향과 상태 소유권은 [ARCHITECTURE.md](ARCHITECTURE.md)에서 확인할 수 있습니다.
 
 ## 기능
 
-- `/setupmusic` 음악 신청 전용 텍스트 채널 생성 또는 지정
+- `/setupmusic`으로 음악 신청 전용 텍스트 채널 생성 또는 지정
 - 전용 채널에 `아이유 좋은날`, `https://youtube.com/...`처럼 메시지만 보내서 재생
-- 전용 채널에 `album: 앨범명`, `playlist: 플레이리스트명`처럼 보내서 통째로 추가
-- 전용 채널에 `auto: 곡명`, `auto12: 곡명`, `auto 12: 곡명`처럼 보내서 관련 곡 여러 개 추가
-- 컨트롤 패널에서 자동재생을 켜면 대기열이 1곡 이하일 때 관련 곡을 한 곡씩 계속 보충
+- `album: 앨범명`, `playlist: 플레이리스트명`으로 앨범·재생목록을 통째로 추가하고, YouTube 재생목록 링크도 여러 곡을 한 번에 추가
+- `auto: 곡명`, `auto12: 곡명`, `auto 12: 곡명`으로 관련 곡 여러 개 추가
+- 컨트롤 패널에서 자동재생을 켜면 대기열이 5곡보다 적을 때 관련 곡을 계속 보충
 - 곡명과 `auto` 시드는 YouTube Music 카탈로그를 먼저 확인하고 일반 YouTube를 fallback으로 사용
-- YouTube 재생목록 링크를 보내면 여러 곡을 한 번에 대기열에 추가
-- 전용 채널에 항상 유지되는 컨트롤 패널에서 재생 상태와 다음 곡을 확인하고 재생/일시정지, 스킵, 마지막 신청곡으로 이동, 정지, 반복, 셔플, 대기열 관리, 최근 재생곡 열람
+- 전용 채널에 항상 유지되는 컨트롤 패널에서 재생 상태와 다음 곡 확인, 재생/일시정지, 스킵, 마지막 신청곡으로 이동, 정지, 반복, 셔플, 대기열 관리, 최근 재생곡 열람
 - 현재 곡의 원문 가사를 별도 메시지로 자동 표시하고 곡이 바뀌면 같은 메시지를 갱신
 - 음성 채널에서 사람이 모두 나가면 재생과 대기열을 정리하고 자동 퇴장
-- 곡 검색과 추가는 전용 채널 메시지로만 처리
+
+곡 검색과 추가는 전용 채널 메시지로만 처리합니다.
 
 ## 준비물
 
@@ -25,7 +25,7 @@ Python 기반 디스코드 음악 봇입니다. 음악 신청 전용 채널에�
 3. Deno 2.3 이상
 4. Discord Developer Portal에서 만든 봇 토큰
 
-봇 권한은 서버 초대 URL을 만들 때 `applications.commands`, `bot`, `Connect`, `Speak`, `Use Voice Activity`, `View Channels`, `Send Messages`, `Embed Links`, `Read Message History`, `Manage Channels`, `Manage Messages`를 포함하세요.
+봇 초대 URL을 만들 때 `applications.commands`, `bot`, `Connect`, `Speak`, `Use Voice Activity`, `View Channels`, `Send Messages`, `Embed Links`, `Read Message History`, `Manage Channels`, `Manage Messages` 권한을 포함하세요.
 
 초대 권한이 있어도 채널이나 카테고리 권한에서 봇 역할이 막혀 있으면 `Missing Permissions` 오류가 납니다. 음악 신청 채널과 명령어를 사용하는 채널에서 봇 역할에 `View Channel`, `Send Messages`, `Embed Links`, `Read Message History`, `Manage Messages`가 허용되어 있는지 확인하세요.
 
@@ -41,7 +41,9 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-`requirements.txt`는 YouTube JavaScript 챌린지 스크립트를 포함하도록 `yt-dlp[default]`를 설치하고, YouTube Music 카탈로그 검색을 위해 `ytmusicapi`를 설치합니다. Deno도 설치한 뒤 `deno --version`으로 확인하세요. Ubuntu에서는 다음처럼 설치할 수 있습니다.
+`requirements.txt`는 YouTube JavaScript 챌린지 스크립트를 포함하도록 `yt-dlp[default]`를, YouTube Music 카탈로그 검색을 위해 `ytmusicapi`를 설치합니다. Deno도 설치한 뒤 `deno --version`으로 확인하세요.
+
+Ubuntu:
 
 ```bash
 sudo apt update
@@ -51,21 +53,7 @@ export PATH="$HOME/.deno/bin:$PATH"
 deno --version
 ```
 
-FFmpeg가 PATH에 없다면 설치한 `ffmpeg.exe` 경로를 `.env`의 `FFMPEG_PATH`에 넣어 주세요.
-
-Windows에서 FFmpeg를 설치하는 가장 간단한 방법:
-
-```powershell
-winget install Gyan.FFmpeg
-```
-
-설치 후 새 터미널을 열고 아래 명령으로 확인하세요.
-
-```powershell
-ffmpeg -version
-```
-
-위 명령이 안 되면 `.env`에 직접 경로를 넣어 주세요.
+Windows에서는 `winget install Gyan.FFmpeg`로 FFmpeg를 설치하고, 새 터미널에서 `ffmpeg -version`으로 확인하세요. FFmpeg가 PATH에 없다면 `.env`에 경로를 직접 넣습니다.
 
 ```env
 FFMPEG_PATH=C:\ffmpeg\bin\ffmpeg.exe
@@ -77,60 +65,74 @@ FFMPEG_PATH=C:\ffmpeg\bin\ffmpeg.exe
 Copy-Item .env.example .env
 ```
 
-그리고 `.env`를 열어 `DISCORD_TOKEN`을 실제 봇 토큰으로 바꾸세요.
+`.env`를 열어 `DISCORD_TOKEN`을 실제 봇 토큰으로 바꾸세요. 개발 중에는 `DEV_GUILD_ID`에 테스트 서버 ID를 넣으면 슬래시 명령어가 바로 갱신됩니다. 비워두면 전역 명령어로 등록되며 디스코드 반영에 시간이 걸릴 수 있습니다.
 
-개발 중에는 `DEV_GUILD_ID`에 테스트 서버 ID를 넣으면 슬래시 명령어가 바로 갱신됩니다. 비워두면 전역 명령어로 등록되며, 디스코드 반영에 시간이 걸릴 수 있습니다.
+나머지 설정은 모두 선택 사항이며 `.env.example`에 기본값과 함께 있습니다. 각 설정이 쓰이는 동작은 [동작 방식](#동작-방식)에서 설명합니다.
 
-곡명은 YouTube Music 카탈로그에서 먼저 찾습니다. 정식 `song`의 영상 ID가 제공되면 그 음원을 바로 재생하고, 예시처럼 비로그인 Music 검색에서 앨범만 보이면 앨범의 아티스트를 원래 검색어에 보강해 일반 YouTube에서 정식 음원을 찾습니다. Music 조회 실패나 빈 결과에는 기존 일반 YouTube 검색으로 자동 전환됩니다.
+### 채널과 메시지
 
-```env
-MUSIC_CHANNEL_SILENT=true
-MUSIC_CHANNEL_DELETE_REQUESTS=true
-MUSIC_FEEDBACK_DELETE_SECONDS=10
-EPHEMERAL_RESPONSE_DELETE_SECONDS=15
-QUEUE_DELETE_RESPONSE_DELETE_SECONDS=30
-LYRICS_API_URL=https://lrclib.net/api/search
-LYRICS_REQUEST_TIMEOUT_SECONDS=10
-# YOUTUBE_COOKIES_FILE=./cookies.txt
-YTDL_EXTRACT_TIMEOUT_SECONDS=45
-YTDL_MAX_CONCURRENT_EXTRACTIONS=1
-YTDL_MIN_INTERVAL_SECONDS=6
-AUTOPLAY_MIN_INTERVAL_SECONDS=15
-YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS=6
-YTDL_CACHE_TTL_SECONDS=180
-YTDL_CACHE_MAX_ENTRIES=16
-AUTOPLAY_START_DELAY_SECONDS=10
-LYRICS_START_DELAY_SECONDS=3
-IDLE_VOICE_DISCONNECT_DELAY_SECONDS=300
-YOUTUBE_SEARCH_CANDIDATES=10
-YOUTUBE_MUSIC_SEARCH_ENABLED=true
-YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS=1
-YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS=5
-YOUTUBE_MUSIC_LANGUAGE=en
-# YOUTUBE_MUSIC_LOCATION=KR
-# YOUTUBE_MUSIC_AUTH_FILE=./ytmusic-auth.json
-# YOUTUBE_MUSIC_OAUTH_CLIENT_ID=
-# YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET=
-YOUTUBE_CIRCUIT_BREAKER_SECONDS=1800
-STREAM_URL_MAX_AGE_SECONDS=900
-MAX_BULK_TRACKS=50
-DEFAULT_AUTO_TRACKS=8
-MAX_AUTO_TRACKS=25
-AUTOPLAY_REFILL_CANDIDATES=25
-AUTOPLAY_HISTORY_TTL_SECONDS=43200
-```
+| 설정 | 기본값 | 의미 |
+| --- | --- | --- |
+| `MUSIC_CHANNEL_ID` | 비어 있음 | 메시지 신청에 쓸 채널을 고정. 보통은 비워 두고 `/setupmusic` 사용 |
+| `MUSIC_CHANNEL_NAME` | `music` | `/setupmusic`이 새로 만드는 채널 이름 |
+| `MUSIC_CHANNELS_FILE` | `music_channels.json` | 서버별 전용 채널·패널·자동재생 설정 저장 파일 |
+| `MUSIC_CHANNEL_SILENT` | `true` | 전용 채널에서 봇이 보내는 메시지를 조용한 메시지로 전송 |
+| `MUSIC_CHANNEL_DELETE_REQUESTS` | `true` | 사용자가 보낸 신청 메시지를 처리 후 삭제 |
+| `MUSIC_FEEDBACK_DELETE_SECONDS` | `10` | 메시지 신청의 곡 추가 확인 메시지 삭제 시간 |
+| `EPHEMERAL_RESPONSE_DELETE_SECONDS` | `15` | 슬래시 명령어·버튼의 개인 응답 삭제 시간 |
+| `QUEUE_DELETE_RESPONSE_DELETE_SECONDS` | `30` | 대기열 관리 메시지를 마지막 삭제 후 정리하는 시간 |
+| `IDLE_VOICE_DISCONNECT_DELAY_SECONDS` | `300` | 재생이 끝나고 대기열이 빈 뒤 음성 채널에서 나가는 시간. `0`이면 끔 |
 
-`MUSIC_CHANNEL_SILENT=true`이면 음악 신청 전용 채널에서 봇이 보내는 검색/대기열/Now playing 메시지를 조용한 메시지로 보냅니다. 사용자가 직접 보낸 곡 신청 메시지의 알림이나 각자의 채널 음소거 상태는 디스코드 클라이언트 설정 영역이라 봇이 강제로 바꿀 수 없습니다.
+### 검색과 YouTube 요청
 
-`MUSIC_CHANNEL_DELETE_REQUESTS=true`이면 전용 채널에서 사용자가 보낸 곡 신청 메시지를 처리 후 삭제합니다. 검색 실패나 음성 채널 미입장처럼 재생을 시작하지 못한 경우에도 요청 메시지는 정리됩니다.
+| 설정 | 기본값 | 의미 |
+| --- | --- | --- |
+| `YOUTUBE_MUSIC_SEARCH_ENABLED` | `true` | YouTube Music 카탈로그 우선 검색 |
+| `YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS` | `1` | Music 조회 사이 최소 간격 |
+| `YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS` | `5` | Music 조회 제한 시간 |
+| `YOUTUBE_MUSIC_LANGUAGE` / `YOUTUBE_MUSIC_LOCATION` | `en` / 비어 있음 | Music 조회 언어와 지역 |
+| `YOUTUBE_MUSIC_AUTH_FILE`, `YOUTUBE_MUSIC_OAUTH_CLIENT_ID`, `YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET` | 비어 있음 | ytmusicapi 인증 파일과 OAuth 클라이언트 |
+| `YOUTUBE_SEARCH_CANDIDATES` | `10` | 일반 YouTube fallback에서 비교할 후보 수(최대 20) |
+| `YTDL_EXTRACT_TIMEOUT_SECONDS` | `45` | yt-dlp 작업 하나를 기다리는 최대 시간 |
+| `YTDL_MAX_CONCURRENT_EXTRACTIONS` | `1` | 동시에 실행할 yt-dlp 작업 수 |
+| `YTDL_MIN_INTERVAL_SECONDS` | `6` | 일반 yt-dlp 작업 사이 최소 간격 |
+| `AUTOPLAY_MIN_INTERVAL_SECONDS` | `15` | 백그라운드 자동재생 조회 사이 최소 간격 |
+| `YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS` | `6` | 수동 자막 조회 사이 최소 간격 |
+| `YTDL_CACHE_TTL_SECONDS` / `YTDL_CACHE_MAX_ENTRIES` | `180` / `16` | 검색 결과 메모리 캐시 유지 시간과 개수 |
+| `YOUTUBE_CIRCUIT_BREAKER_SECONDS` | `1800` | 429·봇 확인 오류 뒤 새 YouTube 요청을 막는 시간 |
+| `STREAM_URL_MAX_AGE_SECONDS` | `900` | 이보다 오래 대기한 곡은 재생 직전에 스트림 주소를 새로 받음 |
+| `YOUTUBE_COOKIES_FILE` | 비어 있음 | 로그인이 필요한 콘텐츠용 `cookies.txt` |
 
-`MUSIC_FEEDBACK_DELETE_SECONDS=10`이면 메시지로 곡을 신청했을 때 나오는 임시 추가 확인 메시지를 10초 뒤 삭제합니다. 슬래시 명령어와 버튼의 일반 개인 응답은 신청자에게만 보이며 `EPHEMERAL_RESPONSE_DELETE_SECONDS=15`초 뒤 정리됩니다. 대기열 관리 메시지는 곡을 삭제할 때마다 만료 시간이 다시 계산되고, 마지막 삭제로부터 `QUEUE_DELETE_RESPONSE_DELETE_SECONDS=30`초 뒤 삭제됩니다.
+### 대기열과 자동재생
 
-마지막 곡이 끝나거나 정지 버튼으로 재생을 멈춘 뒤 대기열도 비어 있으면 `IDLE_VOICE_DISCONNECT_DELAY_SECONDS`가 지난 후 봇이 음성 채널에서 자동으로 나갑니다. 기본값은 `300`초(5분)이며, 그 전에 새 곡이 추가되거나 재생되면 기존 타이머를 취소합니다. 일시정지는 재생 중으로 취급해 타이머를 시작하지 않습니다. `0`으로 설정하면 사람이 남아 있는 동안의 유휴 자동 퇴장을 끌 수 있습니다. 사람이 모두 나간 빈 음성 채널에서 3초 뒤 나가는 기존 동작은 이 설정과 별개로 유지됩니다.
+| 설정 | 기본값 | 의미 |
+| --- | --- | --- |
+| `MAX_BULK_TRACKS` | `50` | 앨범·재생목록을 한 번에 추가할 최대 곡 수 |
+| `DEFAULT_AUTO_TRACKS` / `MAX_AUTO_TRACKS` | `8` / `25` | `auto:` 요청의 기본·최대 곡 수 |
+| `AUTOPLAY_REFILL_CANDIDATES` | `25` | 자동재생 보충이 한 번에 받는 YouTube Radio 후보 수 |
+| `AUTOPLAY_HISTORY_TTL_SECONDS` | `43200` | 자동재생 중복 방지와 최근 재생 목록의 보관 시간(12시간) |
+| `AUTOPLAY_START_DELAY_SECONDS` | `10` | 곡 시작 뒤 자동재생 보충을 시작하기까지의 지연 |
 
-곡이 재생된 뒤 `LYRICS_START_DELAY_SECONDS`가 지나면 LRCLIB에서 현재 곡을 찾아 전용 채널에 별도의 원문 가사 메시지를 자동으로 보냅니다. LRCLIB에 결과가 없거나 조회에 실패하면 해당 YouTube 영상에서 제공하는 수동 자막을 한 번 더 확인하며, 자동 생성 자막은 가사로 사용하지 않습니다. 두 출처 모두 결과가 없으면 원문 메시지에는 `미제공`으로 표시합니다. 자막 정보는 재생을 위해 이미 조회한 영상 정보에서 재사용하므로 별도의 영상 재검색은 하지 않습니다. 이후 곡이 바뀔 때는 원문 메시지를 수정하고, 재생목록이 완전히 끝나거나 정지·퇴장할 때 메시지를 삭제합니다. 같은 곡의 로마자판과 원문 문자판이 함께 검색되면 원문 문자판을 우선합니다. Discord 메시지 길이 제한을 넘는 가사는 같은 메시지의 UTF-8 텍스트 파일로 전체 원문을 첨부합니다. LRCLIB가 과부하(HTTP 503)나 요청 제한(429)을 반환하면 2초, 5초, 10초, 15초 간격으로 다시 시도합니다. 제목이 `곡명 - 아티스트` 순서여도 채널명이나 YouTube 아티스트 정보와 맞는 쪽을 아티스트로 보고, 판단할 수 없으면 곡명만으로 찾은 뒤 반대 순서로 한 번 더 찾습니다. `/` 구분자도 인식하며, YouTube가 여러 아티스트를 나열하면 첫 아티스트로 검색합니다. 아티스트가 일치하지 않는 결과는 영상 제목이 주로 일본어·한국어 같은 비라틴 문자인데 가사가 그렇지 않으면 다른 곡으로 보고 사용하지 않습니다. `LYRICS_REQUEST_TIMEOUT_SECONDS`는 LRCLIB 요청 하나를 기다리는 최대 시간이며, 재시도를 포함한 한 곡의 LRCLIB 조회는 이 값의 6배(기본 60초) 안에서 끝냅니다. `YOUTUBE_LYRICS_FALLBACK=false`로 수동 자막 fallback을 끌 수 있습니다.
+### 가사
 
-`YTDL_MIN_INTERVAL_SECONDS=6`은 일반 yt-dlp 작업 사이에 최소 6초를 둡니다. 백그라운드 자동재생 조회에는 더 보수적인 `AUTOPLAY_MIN_INTERVAL_SECONDS=15`를 적용하며, 사용자가 직접 실행한 검색과 `autoN:` 요청은 기존 간격을 사용합니다. yt-dlp 작업은 기본 한 개의 worker가 처리하며, 재생 직전 스트림 해석, 사용자 검색, 앨범·재생목록, 자동재생 순서로 대기 작업을 선택합니다. 현재 곡의 재생에 필요한 스트림 URL 해석은 이 간격을 기다리지 않으며, 아직 요청 간격을 기다리는 자동재생 작업보다 먼저 실행됩니다. 자동재생 보충은 재생 시작 후 `AUTOPLAY_START_DELAY_SECONDS`가 지난 뒤 실행됩니다. 가사는 `LYRICS_START_DELAY_SECONDS` 뒤에 시작해 FFmpeg·자동재생·가사 조회가 곡 전환 순간에 한꺼번에 몰리지 않게 합니다. 가벼운 YouTube Music 메타데이터와 YouTube 수동 자막 조회는 yt-dlp worker와 분리된 한 개의 보조 네트워크 슬롯을 사용합니다. Music 조회는 별도의 `YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS=1`을, 수동 자막은 `YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS=6`을 사용하므로 느린 자막 요청이 재생용 스트림 해석을 막지 않습니다. Music 결과와 일반 검색 결과는 `YTDL_CACHE_TTL_SECONDS` 동안 메모리에서 재사용하며, 기본 캐시 수는 저사양 서버에 맞춰 16개로 제한합니다. 일반 YouTube fallback은 `YOUTUBE_SEARCH_CANDIDATES`개의 가벼운 결과에서 제목 일치도, Music에서 얻은 아티스트, 길이, `Full Version`, `Short Ver.`, `Game MV` 같은 표시를 비교해 풀 버전을 우선합니다. 선택된 영상의 스트림은 실제 재생 직전에 준비하므로 오래 대기한 스트림 URL을 다시 받는 요청도 줄어듭니다. 직접 URL을 보냈거나 검색어에 `short`, `game mv`, `live`, `cover`, `off vocal` 같은 버전을 명시한 경우에는 Music 카탈로그를 건너뛰고 그 요청을 우선합니다. 후보 수는 최대 20입니다. 429 또는 봇 확인 오류가 감지되면 `YOUTUBE_CIRCUIT_BREAKER_SECONDS` 동안 새 YouTube 요청을 즉시 거절해 차단을 더 악화시키지 않습니다. 자동재생 검색 실패도 1분, 2분, 5분, 15분, 30분 순서로 간격을 늘려 재시도합니다.
+| 설정 | 기본값 | 의미 |
+| --- | --- | --- |
+| `LYRICS_API_URL` | `https://lrclib.net/api/search` | LRCLIB 검색 주소 |
+| `LYRICS_REQUEST_TIMEOUT_SECONDS` | `10` | LRCLIB 요청 하나의 제한 시간. 재시도를 포함한 한 곡 조회는 이 값의 6배 안에서 끝남 |
+| `LYRICS_START_DELAY_SECONDS` | `3` | 곡 시작 뒤 가사 조회를 시작하기까지의 지연 |
+| `YOUTUBE_LYRICS_FALLBACK` | `true` | LRCLIB 결과가 없을 때 YouTube 수동 자막 사용 |
+
+### 로그와 기타
+
+| 설정 | 기본값 | 의미 |
+| --- | --- | --- |
+| `FFMPEG_PATH` | PATH의 `ffmpeg` | FFmpeg 실행 파일 경로 |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `AUTOPLAY_LOG_ENABLED` | `true` | 자동재생 검색·선택 JSONL 기록 |
+| `AUTOPLAY_LOG_FILE` | `logs/autoplay.jsonl` | 자동재생 기록 파일 |
+| `AUTOPLAY_LOG_MAX_BYTES` / `AUTOPLAY_LOG_BACKUP_COUNT` | `5242880` / `3` | 기록 파일 순환 크기(5 MiB)와 보관 개수 |
+
+### YouTube 인증과 차단
 
 YouTube Music의 비로그인 응답은 지역이나 시점에 따라 `songs` 목록을 비워 보낼 수 있습니다. 인증 없이도 앨범·아티스트 힌트와 일반 YouTube fallback은 동작하지만, 카탈로그 결과를 더 안정적으로 받으려면 [ytmusicapi OAuth 설정](https://ytmusicapi.readthedocs.io/en/stable/setup/oauth.html)에 따라 별도 봇 계정으로 인증 파일을 만드세요.
 
@@ -140,61 +142,11 @@ ytmusicapi oauth --file ytmusic-auth.json \
   --client-secret "클라이언트_시크릿"
 ```
 
-생성된 파일을 `YOUTUBE_MUSIC_AUTH_FILE=./ytmusic-auth.json`으로 지정하고 같은 ID와 시크릿을 `YOUTUBE_MUSIC_OAUTH_CLIENT_ID`, `YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET`에 넣습니다. `ytmusic-auth.json`은 `.gitignore`에 포함되어 있으며 GitHub에 올리면 안 됩니다. Music 검색만 끄려면 `YOUTUBE_MUSIC_SEARCH_ENABLED=false`를 사용합니다.
+생성된 파일을 `YOUTUBE_MUSIC_AUTH_FILE=./ytmusic-auth.json`으로 지정하고 같은 ID와 시크릿을 `YOUTUBE_MUSIC_OAUTH_CLIENT_ID`, `YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET`에 넣습니다. `ytmusic-auth.json`은 `.gitignore`에 포함되어 있으며 GitHub에 올리면 안 됩니다.
 
-GCP 같은 클라우드 서버에서 `Sign in to confirm you're not a bot` 오류가 나더라도 쿠키는 일반적인 요청 제한 해결책이 아닙니다. 계정 로그인이 꼭 필요한 콘텐츠에서만 별도 계정의 Netscape `cookies.txt`를 사용하고, GitHub에는 절대 올리지 마세요. Deno/EJS와 요청 제한을 구성해도 429가 계속되면 서버 출구 IP가 차단된 것이므로 다른 IP 또는 네트워크가 필요합니다.
+GCP 같은 클라우드 서버에서 `Sign in to confirm you're not a bot` 오류가 나더라도 쿠키는 일반적인 요청 제한 해결책이 아닙니다. 공개 영상은 쿠키 없이 재생하고, 계정 로그인이 꼭 필요한 콘텐츠에만 별도 계정의 Netscape `cookies.txt`를 `YOUTUBE_COOKIES_FILE`로 지정하세요. 이 파일도 GitHub에 절대 올리지 마세요. Deno/EJS와 요청 제한을 구성해도 429가 계속되면 서버 출구 IP가 차단된 것이므로 다른 IP 또는 네트워크가 필요합니다.
 
-`YTDL_EXTRACT_TIMEOUT_SECONDS`는 검색 한 번을 기다리는 최대 시간입니다. yt-dlp는 별도 작업 프로세스에서 실행되므로 타임아웃이나 취소가 발생하면 남은 작업도 함께 종료됩니다. `YTDL_MAX_CONCURRENT_EXTRACTIONS`는 동시에 실행할 검색 수를 제한해 느린 요청이 누적되는 것을 막습니다. 오래 대기한 곡은 `STREAM_URL_MAX_AGE_SECONDS`가 지나면 재생 직전에 스트림 주소를 새로 받습니다.
-
-`MAX_BULK_TRACKS`는 앨범이나 재생목록을 한 번에 추가할 때 최대 몇 곡까지 대기열에 넣을지 정합니다.
-
-`DEFAULT_AUTO_TRACKS`와 `MAX_AUTO_TRACKS`는 전용 채널의 `auto:` 요청으로 관련 곡을 추가할 때의 기본/최대 개수입니다. `AUTOPLAY_REFILL_CANDIDATES`는 재생 중 백그라운드 보충이 한 후보 목록에서 점수화할 기본 결과 수이며 기본값은 25입니다. YouTube Radio는 25곡까지 한 번의 페이지 요청으로 받으므로 10곡을 받을 때와 요청 수가 같고, 그보다 많으면 추가 요청이 생깁니다. 기본값보다 작게 설정한 경우에는 직전 배치의 유효 후보 중 최근곡 비율이 30% 이상이면 다음 조회만 12개, 60% 이상이면 15개로 늘리고, 비율이 내려가면 다시 설정값으로 돌아갑니다. 한 리필에서 성공한 Radio 조회는 한 번만 하므로 후보가 한 곡뿐이어도 즉시 두 번째 조회를 만들지 않습니다. 후보는 Radio 순서, 길이, 풀·숏·게임·커버·반복 표시, 공식 영상 여부와 실제 라이브 상태를 합산해 정렬하며, 수동 `autoN:` 관련 곡에도 같은 품질 점수를 적용합니다. Cover와 녹화된 Live 버전은 기본 -80점이지만 검색어나 현재 시드가 같은 스타일이면 그 스타일 벌점만 0점이 됩니다. 백그라운드 자동재생은 현재 시드에 Cover 의도가 없으면 Cover 후보를 아예 후보에서 제외하며(`cover_excluded`), 이 때문에 다시 조회하지는 않습니다. 실제 진행·예정·종료 방송의 -200점은 Live 스타일을 원해도 유지합니다. 최저점 컷은 없어 낮은 점수를 이유로 다시 조회하지 않습니다. 한 조회에서 최근에 재생하지 않은 곡이 보관 한도(대기열 1곡 + 후보 풀 6곡)보다 많으면, 점수 1등부터 고정으로 고르지 않고 품질 점수 가중치로 무작위 추출합니다. 점수가 30점 낮을 때마다 뽑힐 확률이 약 e배 줄어들어 앞쪽·공식 영상이 여전히 자주 선택되지만 뒤쪽 후보도 선택될 수 있습니다. 추출한 곡끼리는 점수순으로 대기열과 후보 풀에 들어갑니다. 유효한 YouTube Radio 조회가 비거나 실패해도 같은 시도에서 텍스트 검색을 추가하지 않습니다. 실패하거나 대기곡도 없으면 기존 백오프를 적용하고, 대기곡이 있으면 더 보수적으로 재생 시드가 바뀔 때까지 기다립니다. 영상 ID가 없어 Radio를 만들 수 없을 때만 fallback 검색을 한 번 사용합니다. 한 번 조회한 목록에서 선별한 곡 중 최대 6곡은 길드별 메모리 후보 풀에 보관하고 다음 자동재생 보충에 먼저 재사용하므로, 한 조회로 최대 7곡을 사용합니다. 사용자가 직접 입력한 `auto25:` 같은 요청에는 후보 풀을 적용하지 않습니다. 수동 신청이나 시드 변경으로 사용하지 않은 풀을 버릴 때는 최근곡 밴에 넣지 않습니다. 자동재생 중복 방지는 최근 최대 200곡을 기억하며, 각 기록은 `AUTOPLAY_HISTORY_TTL_SECONDS`(기본 43200초, 12시간)가 지나거나 200곡 한도에서 먼저 밀려나면 다음 후보 검사 때 만료됩니다.
-
-자동재생 검색·선택 기록은 기본적으로 `logs/autoplay.jsonl`에 UTF-8 JSONL(한 줄에 JSON 하나)로 저장합니다. `LOG_LEVEL`과 별개로 동작하며 `AUTOPLAY_LOG_ENABLED=false`로 끌 수 있습니다. `AUTOPLAY_LOG_FILE`로 경로를 지정하고, `AUTOPLAY_LOG_MAX_BYTES`(기본 5 MiB)와 `AUTOPLAY_LOG_BACKUP_COUNT`(기본 3개)로 순환 보관합니다. 기본 보관량은 현재 파일과 `.1`~`.3`을 합쳐 약 20 MiB이며, 오래된 파일은 순환 시 교체됩니다. 로그를 장기 비교할 때는 순환되기 전에 별도로 보관하세요.
-
-- `search_results`: 검색 ID, 시드, Radio/검색 주소, 스타일 의도, 후보 전체의 원래 순위·품질 총점·점수 계산용 메타데이터와 추출 결과(`candidate`, `seed_or_duplicate`, `invalid_video_id`, `cover_excluded`, `candidate_limit`). 수동 `autoN:`도 포함합니다.
-- `selection`: 서버 ID, 검색/캐시 구분, 각 후보의 최근 재생 여부·마지막 재생 후 경과 초·적용 감점·선택 점수와 결과(`queued`, `cached`, `hard_excluded`, `recent_requires_search`, `not_selected`). `search_id`와 `track_id`로 원래 검색 결과와 연결합니다. 새 곡 우선 정책이므로 선택 점수만으로 최종 순서를 해석하지 않습니다.
-
-- `search_failed`: 백그라운드 검색 오류 종류와 다음 재시도 대기 시간.
-
-점수 조정 시 `selection`에서 선택된 곡과 밀린 후보를 비교하고, 같은 `search_id`의 `search_results`에서 제목·길이·채널·방송 상태·스타일을 확인하면 됩니다. `schema_version`과 `policy_version`도 기록합니다. 이 로그는 대기열 선택 기록이며 실제 청취 완료 기록은 아닙니다. 요청자 정보, 인증 정보와 재생용 스트림 URL은 저장하지 않습니다. 파일 기록 실패로 재생을 중단하지 않습니다.
-
-재생은 Opus 형식을 우선 선택하고 가능한 경우 재인코딩 없이 Discord로 전달합니다. 재생 중에는 음악 스트리밍 앱처럼 최대 10초 분량을 미리 읽어 두고, 20ms 프레임을 일정한 간격으로 보냅니다. 처음과 버퍼가 바닥난 뒤에는 2초 분량이 쌓일 때까지 무음을 보내며 기다렸다가 멈춘 위치부터 이어서 재생하므로, YouTube 스트림이 잠깐 멈춰도 소리가 끊기거나 밀린 소리를 몰아 보내 빨라지지 않습니다. 서버가 잠깐 멈춰 프레임이 늦어진 경우에도 밀린 프레임을 몰아 보내지 않고 그 시점부터 다시 일정하게 보냅니다. 버퍼가 바닥났던 시간은 `Audio buffer ran dry` 로그로 남습니다. 공용 `BOT_VOLUME` 처리는 CPU 절약을 위해 제거했으며, 음량은 각 사용자가 Discord에서 봇을 우클릭해 사용자 음량으로 조절합니다.
-
-## 개발 및 검증
-
-GitHub Actions는 Python 3.11의 clean checkout에서 다음 명령을 실행합니다.
-
-```bash
-python -m pip install -r requirements.txt
-python -m pip check
-python -m compileall -q .
-python -m unittest discover -s tests -q
-```
-
-단위 테스트에는 Discord token이나 YouTube credential이 필요하지 않습니다. Discord, YouTube, LRCLIB와 subprocess 경계를 mock해 parsing, policy, orchestration, cancellation을 검증하며, 실제 외부 서비스와의 호환성을 보증하는 live integration test는 아닙니다.
-
-실제 Discord 연결과 FFmpeg 재생 흐름을 YouTube 검색 대신 로컬 음원으로 점검하려면 바로 다음 개발 하네스를 사용하세요.
-
-## 로컬 음원으로 Discord 흐름 테스트
-
-짧은 로컬 음원을 사용하면 일반 곡, `album:`, `playlist:`와 수동 `autoN:` 신청을 실제 YouTube 추출 대신 로컬 트랙으로 시험할 수 있습니다. 이 하네스는 실제 Discord 연결과 FFmpeg를 사용하므로 봇 token과 테스트 서버가 필요합니다.
-
-지속 자동재생의 radio refill 경로는 로컬 구현으로 교체하지 않습니다. YouTube 요청 없이 점검하려면 컨트롤 패널의 자동재생을 끈 상태로 사용하세요.
-
-```bash
-ffmpeg -f lavfi -i "sine=frequency=440:duration=15" test-tone.wav
-```
-
-일반 봇 대신 별도 개발용 진입점을 실행하세요.
-
-```bash
-python -m devtools.local_music_bot ./test-tone.wav --bulk-tracks 3
-```
-
-이 프로세스에서는 위 신청 경로에 번호가 붙은 로컬 테스트 트랙이 생성됩니다. 일반 `python bot.py` 실행에는 테스트 코드나 테스트 설정이 적용되지 않습니다.
-
-## 실행
+## 실행과 사용법
 
 ```powershell
 python bot.py
@@ -218,18 +170,146 @@ auto 12: lofi chill
 https://www.youtube.com/playlist?list=...
 ```
 
-`/setupmusic`을 실행하면 전용 채널에 컨트롤 패널이 하나 만들어지고 봇을 재시작해도 같은 메시지를 다시 사용합니다. 저장된 메시지 ID가 유실된 경우에는 채널 기록에서 기존 패널을 복구합니다. 봇이 시작될 때는 가장 최신 패널 하나만 남기고 전용 채널의 다른 모든 메시지를 삭제합니다. 재생 중에는 다음 곡과 조작 버튼이 표시되고, 모든 곡이 끝나거나 정지하면 패널을 삭제하는 대신 재생 버튼이 비활성화된 “재생 대기 중” 상태로 돌아갑니다. 자동재생과 최근 재생 버튼은 대기 중에도 사용할 수 있습니다. `최근 재생` 버튼은 현재 실행 중 실제 재생을 시작한 이력을 최신순으로 개인에게만 보여 주며, 이 메시지는 60초 뒤 자동으로 지워집니다. 자동재생 중복 방지와 같은 보관 기간(기본 12시간)을 사용해 최대 200회까지 기록하고 최근 50회를 보여 주며, 같은 곡을 다시 재생해도 매번 별도 항목으로 표시합니다. 건너뛰기만 한 자동재생 후보와 신청자 정보는 표시하지 않고, 메모리 기록이므로 봇을 재시작하면 초기화됩니다. 화면 목록과 별개로 자동재생 중복 방지 기록은 같은 곡의 최신 시각 하나만 유지합니다. 자동재생을 켜면 현재 흐름의 마지막 곡을 `auto:`와 같은 방식으로 검색하고 대기열이 1곡 이하일 때마다 한 곡을 추가합니다. 현재 곡·대기열·검색 기준곡은 점수와 무관하게 절대 제외합니다. 최근 재생 이력에 없는 곡을 품질 점수와 무관하게 최근곡보다 먼저 선택하며, 새 곡끼리는 품질 점수가 높을수록 뽑힐 확률이 높은 가중 무작위로 고릅니다. 캐시에 최근곡만 남으면 이를 즉시 재사용하지 않고 현재 시드로 새 후보를 조회합니다. 새 조회에도 최근곡만 있으면 가장 오래전에 재생한 곡을 선택해 재생을 이어갑니다. 최근곡의 마지막 재생 시각이 같으면 품질 점수를 비교합니다. 직전 배치의 최근곡 비율에 따른 -80/-40/-10점은 선택 점수 기록에 유지되지만 새 곡 우선순위를 뒤집지는 않습니다. 영상 ID가 달라도 곡명이 같고 아티스트 표기 중 하나라도 일치하면 MV, 공식 음원, 가사 영상을 같은 곡으로 봅니다. 아티스트 표기는 제목 속 이름(`初星学園 「곡명」`의 `初星学園`, 괄호 안 별칭 포함), YouTube Music 아티스트 목록, 채널명을 모두 비교하고, `TVアニメ「작품명」…「곡명」`처럼 작품명 뒤에 오는 따옴표는 곡명으로 보지 않습니다. Live, Remix, Cover는 별도 버전으로 유지합니다. 안전하게 사용할 후보가 없지만 다음 곡이 이미 대기 중이면 외부 검색 없이 재생 기준이 바뀔 때까지 기다렸다가 새 기준으로 다시 보충하고, 대기곡도 없거나 검색이 일시적으로 실패하면 자동재생을 끄거나 음성 채널에서 나갈 때까지 간격을 두고 다시 시도합니다.
-
-`마지막 곡 재생` 버튼은 현재 곡과 가장 최근에 직접 신청한 곡 앞의 대기 곡을 한 번에 건너뜁니다. 처리 중 자동재생 곡이 뒤에 추가되더라도 클릭할 때 선택한 신청곡이 다음에 재생되며, 직접 신청한 대기 곡이 없으면 실제 마지막 대기 곡으로 이동합니다. 대기열 삭제 버튼을 누르면 곡 하나를 골라 삭제할 수 있습니다. 구간 삭제 버튼에서는 시작 곡과 끝 곡을 각각 선택해 양 끝을 포함한 구간 전체를 한 번에 삭제합니다. 대기열 관리 메시지는 마지막 삭제 30초 뒤, 메시지 신청의 곡 추가 확인은 10초 뒤 자동 삭제됩니다.
-
 재생 중인 봇을 조작하거나 새 곡을 신청하려면 봇과 같은 음성 채널에 있어야 합니다. 봇이 재생 중일 때 다른 음성 채널의 요청으로 이동하지 않습니다.
 
-전용 채널, 컨트롤 패널 메시지 ID, 자동재생 ON/OFF 설정은 `music_channels.json`에 서버별로 저장됩니다. 기존 채널 ID만 들어 있는 형식도 그대로 읽고, 다음 저장 때 새 형식으로 바뀝니다. 이 파일은 로컬 설정이라 Git에는 올리지 않도록 `.gitignore`에 넣어 두었습니다.
+음량은 각 사용자가 Discord에서 봇을 우클릭해 사용자 음량으로 조절합니다. 공용 `BOT_VOLUME` 처리는 CPU 절약을 위해 제거했습니다.
+
+### 컨트롤 패널
+
+- `/setupmusic`을 실행하면 전용 채널에 컨트롤 패널이 하나 만들어지고, 봇을 재시작해도 같은 메시지를 다시 사용합니다. 저장된 메시지 ID가 유실되면 채널 기록에서 기존 패널을 복구합니다.
+- 봇이 시작될 때는 가장 최신 패널 하나만 남기고 전용 채널의 다른 메시지를 모두 삭제합니다.
+- 재생 중에는 다음 곡과 조작 버튼이 표시됩니다. 모든 곡이 끝나거나 정지하면 패널을 지우지 않고 재생 버튼이 비활성화된 “재생 대기 중” 상태로 돌아갑니다. 자동재생과 최근 재생 버튼은 대기 중에도 사용할 수 있습니다.
+- `마지막 곡 재생`은 현재 곡과 가장 최근에 직접 신청한 곡 앞의 대기 곡을 한 번에 건너뜁니다. 처리 중 자동재생 곡이 뒤에 추가되더라도 클릭할 때 선택한 신청곡이 다음에 재생되며, 직접 신청한 대기 곡이 없으면 실제 마지막 대기 곡으로 이동합니다.
+- 대기열 삭제 버튼으로 곡 하나를 골라 삭제할 수 있습니다. 구간 삭제에서는 시작 곡과 끝 곡을 골라 양 끝을 포함한 구간 전체를 한 번에 삭제합니다.
+- `최근 재생`은 현재 실행 중 실제 재생을 시작한 이력을 최신순으로 개인에게만 보여 주고 60초 뒤 지웁니다. `AUTOPLAY_HISTORY_TTL_SECONDS`(기본 12시간) 동안 최대 200회를 기록하고 최근 50회를 보여 주며, 같은 곡을 다시 재생해도 매번 별도 항목으로 표시합니다. 건너뛰기만 한 자동재생 후보와 신청자 정보는 표시하지 않고, 메모리 기록이므로 봇을 재시작하면 초기화됩니다.
+
+### 메시지 정리와 자동 퇴장
+
+- `MUSIC_CHANNEL_SILENT=true`이면 전용 채널에서 봇이 보내는 검색·대기열·Now playing 메시지를 조용한 메시지로 보냅니다. 사용자가 직접 보낸 신청 메시지의 알림이나 각자의 채널 음소거 상태는 디스코드 클라이언트 설정이라 봇이 바꿀 수 없습니다.
+- `MUSIC_CHANNEL_DELETE_REQUESTS=true`이면 신청 메시지를 처리 후 삭제합니다. 검색 실패나 음성 채널 미입장처럼 재생을 시작하지 못한 경우에도 삭제합니다.
+- 메시지 신청의 곡 추가 확인은 10초 뒤, 슬래시 명령어와 버튼의 개인 응답은 15초 뒤 삭제됩니다. 대기열 관리 메시지는 곡을 삭제할 때마다 만료 시간을 다시 계산해 마지막 삭제 30초 뒤 삭제됩니다.
+- 마지막 곡이 끝나거나 정지한 뒤 대기열도 비어 있으면 `IDLE_VOICE_DISCONNECT_DELAY_SECONDS`(기본 5분) 뒤 음성 채널에서 나갑니다. 그 전에 새 곡이 추가되거나 재생되면 타이머를 취소하고, 일시정지는 재생 중으로 취급합니다. `0`이면 사람이 남아 있는 동안에는 나가지 않습니다.
+- 사람이 모두 나간 음성 채널에서는 위 설정과 별개로 3초 뒤 나갑니다.
+
+### 저장되는 설정
+
+전용 채널, 컨트롤 패널 메시지 ID, 자동재생 ON/OFF는 `music_channels.json`에 서버별로 저장됩니다. 기존 채널 ID만 들어 있는 형식도 그대로 읽고 다음 저장 때 새 형식으로 바꿉니다. 이 파일은 로컬 설정이라 `.gitignore`에 들어 있습니다. 대기열, 현재 곡과 최근 재생 기록은 저장하지 않습니다.
+
+## 동작 방식
+
+### 곡 검색
+
+- 곡명은 YouTube Music 카탈로그에서 먼저 찾습니다. 정식 `song`의 영상 ID가 있으면 그 음원을 바로 재생합니다.
+- 비로그인 Music 검색에서 앨범만 보이면 앨범의 아티스트를 원래 검색어에 보강해 일반 YouTube에서 정식 음원을 찾습니다.
+- Music 조회 실패나 빈 결과에는 일반 YouTube 검색으로 자동 전환합니다.
+- 일반 YouTube 검색은 `YOUTUBE_SEARCH_CANDIDATES`개의 가벼운 결과에서 제목 일치도, Music에서 얻은 아티스트, 길이, `Full Version`, `Short Ver.`, `Game MV` 같은 표시를 비교해 풀 버전을 우선합니다.
+- 직접 URL을 보냈거나 검색어에 `short`, `game mv`, `live`, `cover`, `off vocal` 같은 버전을 명시하면 Music 카탈로그를 건너뛰고 그 요청을 우선합니다.
+- 앨범·재생목록 텍스트는 YouTube 재생목록 검색으로 처리하며 `MAX_BULK_TRACKS`곡까지 추가합니다.
+- 선택된 영상의 스트림은 실제 재생 직전에 준비합니다. 대기 중 `STREAM_URL_MAX_AGE_SECONDS`가 지난 곡도 재생 직전에 스트림 주소를 새로 받습니다.
+
+### 자동재생
+
+컨트롤 패널에서 자동재생을 켜면 대기열이 5곡보다 적을 때마다 대기열의 마지막 곡(대기열이 비었으면 현재 곡)을 시드로 `auto:`와 같은 방식의 YouTube Radio 후보를 받아 한 곡씩 채웁니다. 보충은 곡이 시작되고 `AUTOPLAY_START_DELAY_SECONDS` 뒤에 시작합니다.
+
+후보 조회와 후보 풀:
+
+- 한 번에 `AUTOPLAY_REFILL_CANDIDATES`(기본 25)개를 받습니다. YouTube Radio는 25곡까지 한 번의 페이지 요청으로 받으므로 10곡을 받을 때와 요청 수가 같고, 그보다 많으면 추가 요청이 생깁니다.
+- 한 조회에서 최대 7곡을 골라 1곡은 대기열에 넣고 나머지 최대 6곡은 서버별 메모리 후보 풀에 보관합니다. 다음 보충은 풀을 먼저 쓰므로 한 조회로 최대 7곡을 사용합니다.
+- 한 번의 보충에서 Radio 조회는 성공 기준으로 한 번만 합니다. 후보가 한 곡뿐이어도 곧바로 두 번째 조회를 만들지 않습니다.
+- 수동 신청이나 시드 변경으로 쓰지 않은 풀을 버릴 때는 그 곡들을 최근곡으로 기록하지 않습니다. 사용자가 직접 입력한 `auto25:` 같은 요청에는 후보 풀을 쓰지 않습니다.
+- `AUTOPLAY_REFILL_CANDIDATES`를 25보다 작게 설정한 경우, 직전 조회의 유효 후보 중 최근곡 비율이 30% 이상이면 다음 조회만 12개, 60% 이상이면 15개로 늘리고 비율이 내려가면 설정값으로 돌아갑니다.
+
+품질 점수:
+
+- 후보는 Radio 순서, 길이, 풀·숏·게임·커버·반복 표시, 공식 영상 여부와 실제 라이브 상태를 합산해 점수를 매깁니다. 수동 `autoN:`에도 같은 점수를 적용합니다.
+- Cover와 녹화된 Live 버전은 기본 -80점이지만, 검색어나 현재 시드가 같은 스타일이면 그 스타일 벌점은 0점입니다.
+- 백그라운드 자동재생은 시드에 Cover 의도가 없으면 Cover 후보를 아예 제외합니다(`cover_excluded`). 이 때문에 다시 조회하지는 않습니다.
+- 실제 진행·예정·종료 방송은 Live 스타일을 원해도 -200점입니다.
+- 최저점 컷은 없어 낮은 점수를 이유로 다시 조회하지 않습니다.
+
+선택 규칙:
+
+- 현재 곡, 대기열, 시드와 같은 곡은 점수와 무관하게 항상 제외합니다.
+- 최근 재생 이력에 없는 곡을 점수와 무관하게 최근곡보다 먼저 고릅니다. 새 곡이 보관 한도(대기열 1곡 + 풀 6곡)보다 많으면 점수 가중 무작위로 뽑습니다. 점수가 30점 낮을 때마다 뽑힐 확률이 약 e배 줄어 앞쪽·공식 영상이 자주 선택되지만 뒤쪽 후보도 나올 수 있습니다. 뽑힌 곡끼리는 점수순으로 대기열과 풀에 들어갑니다.
+- 풀에 최근곡만 남으면 바로 쓰지 않고 현재 시드로 새로 조회합니다. 새 조회에도 최근곡만 있으면 가장 오래전에 재생한 곡을 골라 재생을 이어가고, 마지막 재생 시각이 같으면 점수를 비교합니다.
+- 직전 조회의 최근곡 비율에 따른 -80/-40/-10점은 선택 점수 기록에 남지만 새 곡 우선순위를 뒤집지는 않습니다.
+- 중복 방지는 최근 최대 200곡을 기억하며, 같은 곡은 최신 재생 시각 하나만 유지합니다. 각 기록은 `AUTOPLAY_HISTORY_TTL_SECONDS`가 지나거나 200곡 한도에서 밀려나면 만료됩니다.
+
+같은 곡 판단:
+
+- 영상 ID가 달라도 곡명이 같고 아티스트 표기 중 하나라도 일치하면 MV, 공식 음원, 가사 영상을 같은 곡으로 봅니다.
+- 아티스트 표기는 제목 속 이름(`初星学園 「곡명」`의 `初星学園`, 괄호 안 별칭 포함), YouTube Music 아티스트 목록, 채널명을 모두 비교합니다. `TVアニメ「작품명」…「곡명」`처럼 작품명 뒤에 오는 따옴표는 곡명으로 보지 않습니다.
+- Live, Remix, Cover는 별도 버전으로 유지합니다.
+
+후보가 없거나 실패할 때:
+
+- 유효한 Radio 조회가 비거나 실패해도 같은 시도에서 텍스트 검색을 추가하지 않습니다. 영상 ID가 없어 Radio를 만들 수 없을 때만 fallback 검색을 한 번 씁니다.
+- 쓸 후보가 없지만 다음 곡이 이미 대기 중이면 외부 검색 없이 재생 기준이 바뀔 때까지 기다렸다가 새 기준으로 다시 보충합니다.
+- 대기곡도 없거나 검색이 실패하면 1분, 2분, 5분, 15분, 30분 순서로 간격을 늘리며 자동재생을 끄거나 음성 채널에서 나갈 때까지 다시 시도합니다.
+
+### 가사
+
+- 곡이 재생되고 `LYRICS_START_DELAY_SECONDS` 뒤 LRCLIB에서 현재 곡을 찾아 전용 채널에 원문 가사 메시지를 보냅니다. 곡이 바뀌면 같은 메시지를 수정하고, 재생목록이 끝나거나 정지·퇴장하면 삭제합니다.
+- LRCLIB에 결과가 없거나 조회에 실패하면 해당 영상의 YouTube 수동 자막을 한 번 더 확인합니다. 자동 생성 자막은 쓰지 않으며, 재생할 때 이미 조회한 영상 정보를 재사용하므로 영상을 다시 검색하지 않습니다. 두 출처 모두 없으면 `미제공`으로 표시합니다. `YOUTUBE_LYRICS_FALLBACK=false`로 자막 fallback을 끌 수 있습니다.
+- 제목이 `곡명 - 아티스트` 순서여도 채널명이나 YouTube 아티스트 정보와 맞는 쪽을 아티스트로 봅니다. 판단할 수 없으면 곡명만으로 찾은 뒤 반대 순서로 한 번 더 찾습니다. `/` 구분자도 인식하고, 아티스트가 여러 명이면 첫 아티스트로 검색합니다.
+- 같은 곡의 로마자판과 원문 문자판이 함께 검색되면 원문 문자판을 우선합니다. 아티스트가 일치하지 않는 결과는 영상 제목이 주로 일본어·한국어 같은 비라틴 문자인데 가사가 그렇지 않으면 다른 곡으로 보고 버립니다.
+- LRCLIB가 과부하(HTTP 503)나 요청 제한(429)을 반환하면 2초, 5초, 10초, 15초 간격으로 다시 시도합니다. 한 곡의 LRCLIB 조회는 재시도를 포함해 `LYRICS_REQUEST_TIMEOUT_SECONDS`의 6배(기본 60초) 안에서 끝냅니다.
+- Discord 메시지 길이 제한을 넘는 가사는 같은 메시지에 UTF-8 텍스트 파일로 전체 원문을 첨부합니다.
+
+### 재생과 버퍼
+
+- Opus 형식을 우선 선택하고, 가능하면 재인코딩 없이 Discord로 전달합니다.
+- 재생 중에는 음악 스트리밍 앱처럼 최대 10초 분량을 미리 읽어 두고 20ms 프레임을 일정한 간격으로 보냅니다.
+- 곡 시작과 버퍼가 바닥난 뒤에는 2초 분량이 쌓일 때까지 무음을 보내며 기다렸다가 멈춘 위치부터 이어서 재생합니다. YouTube 스트림이 잠깐 멈춰도 소리가 끊기거나 밀린 소리를 몰아 보내 빨라지지 않습니다.
+- 서버가 잠깐 멈춰 프레임이 늦어져도 밀린 프레임을 몰아 보내지 않고 그 시점부터 다시 일정하게 보냅니다.
+- 버퍼가 바닥났던 시간은 `Audio buffer ran dry` 로그로 남습니다.
+
+### YouTube 요청 관리
+
+- yt-dlp는 별도 작업 프로세스에서 실행되며, 타임아웃이나 취소가 발생하면 남은 작업도 함께 종료합니다. 기본 한 개의 worker가 재생 직전 스트림 해석, 사용자 검색, 앨범·재생목록, 자동재생 순서로 대기 작업을 고릅니다.
+- 일반 작업 사이에는 `YTDL_MIN_INTERVAL_SECONDS`, 백그라운드 자동재생 조회에는 더 보수적인 `AUTOPLAY_MIN_INTERVAL_SECONDS`를 둡니다. 사용자가 직접 실행한 검색과 `autoN:` 요청은 일반 간격을 씁니다.
+- 현재 곡 재생에 필요한 스트림 해석은 간격을 기다리지 않고, 간격을 기다리는 자동재생 작업보다 먼저 실행됩니다.
+- 곡이 시작되면 가사는 `LYRICS_START_DELAY_SECONDS`, 자동재생은 `AUTOPLAY_START_DELAY_SECONDS` 뒤에 시작해 FFmpeg·자동재생·가사 조회가 곡 전환 순간에 몰리지 않게 합니다.
+- YouTube Music 메타데이터와 수동 자막 조회는 yt-dlp worker와 분리된 보조 네트워크 슬롯 하나를 쓰고 각자의 간격을 따르므로, 느린 자막 요청이 재생용 스트림 해석을 막지 않습니다.
+- Music 결과와 일반 검색 결과는 `YTDL_CACHE_TTL_SECONDS` 동안 메모리에서 재사용하며, 저사양 서버에 맞춰 기본 16개로 제한합니다.
+- 429 또는 봇 확인 오류가 감지되면 `YOUTUBE_CIRCUIT_BREAKER_SECONDS` 동안 새 YouTube 요청을 즉시 거절해 차단을 더 악화시키지 않습니다.
+
+### 자동재생 로그
+
+자동재생 검색·선택 기록은 기본적으로 `logs/autoplay.jsonl`에 UTF-8 JSONL(한 줄에 JSON 하나)로 저장합니다. `LOG_LEVEL`과 별개로 동작하며 `AUTOPLAY_LOG_ENABLED=false`로 끌 수 있습니다. 기본 보관량은 현재 파일과 `.1`~`.3`을 합쳐 약 20 MiB이며, 오래된 파일은 순환 시 교체되므로 장기 비교할 기록은 따로 보관하세요.
+
+- `search_results`: 검색 ID, 시드, Radio/검색 주소, 스타일 의도, 후보 전체의 원래 순위·품질 총점·점수 계산용 메타데이터와 추출 결과(`candidate`, `seed_or_duplicate`, `invalid_video_id`, `cover_excluded`, `candidate_limit`). 수동 `autoN:`도 포함합니다.
+- `selection`: 서버 ID, 검색/캐시 구분, 각 후보의 최근 재생 여부·마지막 재생 후 경과 초·적용 감점·선택 점수와 결과(`queued`, `cached`, `hard_excluded`, `recent_requires_search`, `not_selected`). `search_id`와 `track_id`로 원래 검색 결과와 연결합니다. 새 곡 우선 정책이므로 선택 점수만으로 최종 순서를 해석하지 않습니다.
+- `search_failed`: 백그라운드 검색 오류 종류와 다음 재시도 대기 시간.
+
+점수를 조정할 때는 `selection`에서 선택된 곡과 밀린 후보를 비교하고, 같은 `search_id`의 `search_results`에서 제목·길이·채널·방송 상태·스타일을 확인하면 됩니다. `schema_version`과 `policy_version`도 기록합니다. 이 로그는 대기열 선택 기록이며 실제 청취 완료 기록은 아닙니다. 요청자 정보, 인증 정보와 재생용 스트림 URL은 저장하지 않으며, 파일 기록에 실패해도 재생을 중단하지 않습니다.
+
+## 개발 및 검증
+
+GitHub Actions는 Python 3.11의 clean checkout에서 다음 명령을 실행합니다.
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip check
+python -m compileall -q .
+python -m unittest discover -s tests -q
+```
+
+단위 테스트에는 Discord token이나 YouTube credential이 필요하지 않습니다. Discord, YouTube, LRCLIB와 subprocess 경계를 mock해 parsing, policy, orchestration, cancellation을 검증하며, 실제 외부 서비스와의 호환성을 보증하는 live integration test는 아닙니다.
+
+### 로컬 음원으로 Discord 흐름 테스트
+
+실제 Discord 연결과 FFmpeg 재생 흐름을 YouTube 검색 없이 점검하려면 개발 하네스를 사용하세요. 일반 곡, `album:`, `playlist:`와 수동 `autoN:` 신청을 로컬 트랙으로 시험할 수 있으며, 봇 token과 테스트 서버가 필요합니다. 지속 자동재생의 Radio 보충 경로는 로컬 구현으로 바꾸지 않으므로 컨트롤 패널의 자동재생을 끈 상태로 사용하세요.
+
+```bash
+ffmpeg -f lavfi -i "sine=frequency=440:duration=15" test-tone.wav
+python -m devtools.local_music_bot ./test-tone.wav --bulk-tracks 3
+```
+
+이 프로세스에서는 위 신청 경로에 번호가 붙은 로컬 테스트 트랙이 생성됩니다. 일반 `python bot.py` 실행에는 테스트 코드나 테스트 설정이 적용되지 않습니다.
 
 ## 참고
 
 - 음악 재생은 `yt-dlp`와 `FFmpeg`를 사용합니다.
-- 곡명과 `auto` 시드는 동일한 YouTube Music 우선 검색을 사용합니다. 앨범·재생목록 텍스트는 기존 YouTube 재생목록 검색으로 처리합니다.
-- 공개 영상은 쿠키 없이 먼저 시도하고, 계정이 필요한 콘텐츠에만 `YOUTUBE_COOKIES_FILE`을 사용하세요. 쿠키는 YouTube의 서버 IP 제한을 해제하지 않습니다.
 - YouTube 쪽 변경으로 재생이 갑자기 실패하면 `python -m pip install --upgrade yt-dlp`로 업데이트해 보세요.
-- 봇 토큰은 절대 GitHub나 채팅에 올리지 마세요.
+- 봇 토큰, `cookies.txt`, `ytmusic-auth.json`은 절대 GitHub나 채팅에 올리지 마세요.

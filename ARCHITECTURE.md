@@ -14,8 +14,9 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 - `music_discord_display` → `music_config`, `music_models`
 - `music_search_scoring` → `music_config`, `music_discord_display`, `music_request_parsing`
 - `music_track_metadata` → `music_models`, `music_search_scoring`
-- `music_autoplay_policy` → `music_config`, `music_models`, `music_track_metadata`
-- `music_lyrics_sources` → `music_config`, `music_models`, `music_search_scoring`
+- `music_autoplay_logging` → `music_config`
+- `music_autoplay_policy` → `music_autoplay_logging`, `music_config`, `music_models`, `music_track_metadata`
+- `music_lyrics_sources` → `music_config`, `music_models`, `music_search_scoring`, `music_track_metadata`
 - `music_config`, `music_models`, `music_request_parsing`은 다른 project module을 import하지 않는 기반 계층
 - `ytdl_worker`는 main bot module과 분리된 subprocess 진입점
 
