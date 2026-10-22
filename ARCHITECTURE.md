@@ -10,7 +10,6 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 
 - `bot` → 모든 `music_*` supporting module
 - `music_ytdl` → `music_config`
-- `music_audio_diagnostics` → `music_config`
 - `music_discord_display` → `music_config`, `music_models`
 - `music_search_scoring` → `music_config`, `music_discord_display`, `music_request_parsing`
 - `music_track_metadata` → `music_models`, `music_search_scoring`
@@ -36,7 +35,6 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 | `ytdl_worker.py` | 격리 subprocess에서 `yt_dlp.YoutubeDL.extract_info`를 실행하고 JSON 결과 또는 오류 반환 |
 | `music_autoplay_policy.py` | 최근곡 TTL/history, current·queue·recent 중복 제외, 후보 선택·pool 관리, seed·refill·retry 정책 |
 | `music_autoplay_logging.py` | 검색·선택 JSONL 기록, 용량 제한 순환 파일과 공개 곡 메타데이터 요약 |
-| `music_audio_diagnostics.py` | 재생 source를 감싸 늦은 음성 프레임을 감지하고 그 순간의 CPU·메모리·yt-dlp 작업 상태를 JSONL로 기록 |
 | `music_lyrics_sources.py` | LRCLIB 조회·선택과 YouTube 수동 subtitle 후보 선택·다운로드·JSON3/VTT 파싱 |
 
 ## 상태 소유권

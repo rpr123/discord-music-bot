@@ -159,15 +159,6 @@ GCP 같은 클라우드 서버에서 `Sign in to confirm you're not a bot` 오�
 
 점수 조정 시 `selection`에서 선택된 곡과 밀린 후보를 비교하고, 같은 `search_id`의 `search_results`에서 제목·길이·채널·방송 상태·스타일을 확인하면 됩니다. `schema_version`과 `policy_version`도 기록합니다. 이 로그는 대기열 선택 기록이며 실제 청취 완료 기록은 아닙니다. 요청자 정보, 인증 정보와 재생용 스트림 URL은 저장하지 않습니다. 파일 기록 실패로 재생을 중단하지 않습니다.
 
-재생 중 음성 프레임이 늦게 나가면 `logs/audio-lag.jsonl`에 기록합니다. Discord 음성은 20ms 프레임을 일정하게 보내야 하는데, 프레임이 `AUDIO_LAG_THRESHOLD_MS`(기본 100ms) 이상 늦으면 끊기거나 밀린 프레임을 몰아 보내 빨라진 것처럼 들립니다. `AUDIO_LAG_LOG_ENABLED=false`로 끌 수 있고 1 MiB × 4개 파일로 순환합니다. 1초 안에 연속으로 늦으면 첫 건만 기록하고 나머지는 다음 기록의 `suppressed_since_last`에 개수로 남깁니다.
-
-- `late_ms`: 예정보다 늦은 시간, `position_seconds`: 곡 안의 위치
-- `source_wait_ms`와 `cause_hint`: 늦은 시간 대부분을 FFmpeg 데이터 대기에 썼으면 `stream`(YouTube 스트림 멈춤), 아니면 `scheduling`(전송 스레드가 CPU를 제때 받지 못함)
-- `cpu`: 직전 약 1~2초 동안의 사용·유휴·I/O 대기·`steal_percent`(클라우드가 가져간 CPU, 공유 코어 VM의 상한 초과 신호), `mem_available_mb`, `load_1m`. Linux가 아니면 `null`입니다.
-- `ytdl_workers`: 그 순간 실행 중이던 yt-dlp 작업 종류(`autoplay`, `playback_stream` 등)
-
-증상이 들렸는데 그 시각에 기록이 없으면 서버 이후 구간(서버→Discord→청취자 네트워크) 문제일 가능성이 큽니다. 일시정지 버튼으로 멈춘 시간은 지연으로 기록하지 않지만, 음성 연결이 끊겼다 다시 연결된 시간은 기록될 수 있습니다.
-
 재생은 Opus 형식을 우선 선택하고 가능한 경우 재인코딩 없이 Discord로 전달합니다. 공용 `BOT_VOLUME` 처리는 CPU 절약을 위해 제거했으며, 음량은 각 사용자가 Discord에서 봇을 우클릭해 사용자 음량으로 조절합니다.
 
 ## 개발 및 검증

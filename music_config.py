@@ -107,13 +107,6 @@ AUTOPLAY_LOG_FILE = resolve_project_path(
 )
 AUTOPLAY_LOG_MAX_BYTES = parse_positive_int_env("AUTOPLAY_LOG_MAX_BYTES", 5 * 1024 * 1024)
 AUTOPLAY_LOG_BACKUP_COUNT = parse_positive_int_env("AUTOPLAY_LOG_BACKUP_COUNT", 3)
-AUDIO_LAG_LOG_ENABLED = os.getenv("AUDIO_LAG_LOG_ENABLED", "true").lower() not in {
-    "0", "false", "no", "off",
-}
-AUDIO_LAG_LOG_FILE = resolve_project_path(
-    os.getenv("AUDIO_LAG_LOG_FILE", "logs/audio-lag.jsonl")
-)
-AUDIO_LAG_THRESHOLD_MS = parse_positive_int_env("AUDIO_LAG_THRESHOLD_MS", 100)
 AUTOPLAY_HISTORY_TTL_SECONDS = parse_positive_int_env(
     "AUTOPLAY_HISTORY_TTL_SECONDS", 12 * 60 * 60
 )

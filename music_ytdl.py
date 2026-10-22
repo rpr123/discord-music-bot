@@ -29,8 +29,6 @@ ytdl_cache: OrderedDict[tuple[str, str], tuple[float, dict]] = OrderedDict()
 ytdl_last_request_started_at = 0.0
 youtube_circuit_open_until = 0.0
 youtube_circuit_reason: str | None = None
-# Job kinds of live worker subprocesses, read by the audio thread's lag log.
-running_ytdl_job_kinds: list[str] = []
 
 YOUTUBE_BLOCK_ERROR_MARKERS = (
     "http error 429",
@@ -263,10 +261,6 @@ class YtdlQueueJob:
     defer_requested: bool = False
 
 
-def get_running_ytdl_job_kinds() -> tuple[str, ...]:
-    return tuple(running_ytdl_job_kinds)
-
-
 async def run_ytdl_worker(
     options: dict,
     query: str,
@@ -283,7 +277,6 @@ async def run_ytdl_worker(
     started_at = time.monotonic()
     status = "failure"
     response_bytes = 0
-    worker_registered = False
     try:
         process_options: dict[str, object] = {}
         if os.name == "posix":
@@ -297,8 +290,6 @@ async def run_ytdl_worker(
             stderr=asyncio.subprocess.PIPE,
             **process_options,
         )
-        running_ytdl_job_kinds.append(job_kind)
-        worker_registered = True
         request = json.dumps(
             {"options": options, "query": query},
             ensure_ascii=False,
@@ -345,8 +336,6 @@ async def run_ytdl_worker(
         status = "success"
         return info
     finally:
-        if worker_registered:
-            running_ytdl_job_kinds.remove(job_kind)
         elapsed = time.monotonic() - started_at
         log = logger.warning if status in {"failure", "timeout"} else logger.info
         log(

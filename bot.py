@@ -19,7 +19,6 @@ import discord
 import requests
 from discord import app_commands
 from discord.ext import commands
-from music_audio_diagnostics import LagMonitoredAudioSource, reset_audio_lag_timing
 from music_autoplay_logging import describe_autoplay_track, log_autoplay_event
 from music_autoplay_policy import (
     AUTOPLAY_QUEUE_TARGET,
@@ -264,7 +263,6 @@ from music_ytdl import (
     cache_ytdl_info,
     ensure_youtube_circuit_closed,
     get_cached_ytdl_info,
-    get_running_ytdl_job_kinds,
     get_ytdl_cache_key,
     stamp_ytdl_info,
     trip_youtube_circuit,
@@ -1460,7 +1458,6 @@ class MusicControlView(discord.ui.View):
             return
 
         if voice.is_paused():
-            reset_audio_lag_timing(voice.source)
             voice.resume()
         elif voice.is_playing():
             voice.pause()
@@ -4245,16 +4242,12 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                     not used_opus_copy,
                     max(0, attempt_number - 1),
                 )
-                source = LagMonitoredAudioSource(
-                    discord.FFmpegOpusAudio(
-                        track.stream_url,
-                        bitrate=128,
-                        codec="copy" if used_opus_copy else None,
-                        executable=FFMPEG_EXECUTABLE,
-                        **FFMPEG_OPTIONS,
-                    ),
-                    title=track.title,
-                    get_ytdl_job_kinds=get_running_ytdl_job_kinds,
+                source = discord.FFmpegOpusAudio(
+                    track.stream_url,
+                    bitrate=128,
+                    codec="copy" if used_opus_copy else None,
+                    executable=FFMPEG_EXECUTABLE,
+                    **FFMPEG_OPTIONS,
                 )
             except asyncio.CancelledError:
                 raise
