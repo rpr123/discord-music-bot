@@ -10,6 +10,7 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 
 - `bot` → 모든 `music_*` supporting module
 - `music_ytdl` → `music_config`
+- `music_audio_buffer` → `music_config`
 - `music_discord_display` → `music_config`, `music_models`
 - `music_search_scoring` → `music_config`, `music_discord_display`, `music_request_parsing`
 - `music_track_metadata` → `music_models`, `music_search_scoring`
@@ -32,6 +33,7 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 | `music_search_scoring.py` | 제목·아티스트 정규화, YouTube Music result 변환, 일반 YouTube 후보 점수화와 query 해석 |
 | `music_track_metadata.py` | yt-dlp info에서 video·stream·codec·thumbnail·subtitle metadata 추출, `Track` 생성과 identity key 구성 |
 | `music_ytdl.py` | yt-dlp cache·rate limit·circuit breaker, priority job scheduling, timeout·cancellation과 subprocess 정리 |
+| `music_audio_buffer.py` | FFmpeg Opus source를 별도 thread로 미리 읽어 두고 20ms 간격으로 내보내며, 버퍼가 비면 무음으로 기다렸다가 이어서 재생 |
 | `ytdl_worker.py` | 격리 subprocess에서 `yt_dlp.YoutubeDL.extract_info`를 실행하고 JSON 결과 또는 오류 반환 |
 | `music_autoplay_policy.py` | 최근곡 TTL/history, current·queue·recent 중복 제외, 후보 선택·pool 관리, seed·refill·retry 정책 |
 | `music_autoplay_logging.py` | 검색·선택 JSONL 기록, 용량 제한 순환 파일과 공개 곡 메타데이터 요약 |
@@ -75,7 +77,7 @@ Process-scoped 상태가 모두 `bot.py`에 있다는 가정으로 소유권을 
 1. `on_message`가 설정된 music channel의 사용자 신청을 받고 음성 연결 조건을 확인한 뒤 `enqueue_tracks`를 호출합니다.
 2. `enqueue_tracks`는 요청 종류를 파싱하고 YouTube Music metadata, 일반 YouTube fallback 또는 playlist/radio 추출을 선택합니다. 추출 결과는 `music_track_metadata`를 거쳐 `Track`이 됩니다.
 3. 검색 전후 playback generation을 확인하고, 성공한 수동 신청은 진행 중인 autoplay refill과 숨은 후보를 정리한 뒤 `GuildMusicState.lock` 안에서 queue에 commit됩니다.
-4. `schedule_play_next`와 pending advance 상태가 여러 completion callback을 하나의 다음 재생으로 합칩니다. `play_next`는 queue에서 current를 정하고 재생 직전에 stream을 resolve한 뒤 FFmpeg source를 voice client에 전달합니다.
+4. `schedule_play_next`와 pending advance 상태가 여러 completion callback을 하나의 다음 재생으로 합칩니다. `play_next`는 queue에서 current를 정하고 재생 직전에 stream을 resolve한 뒤 FFmpeg source를 `BufferedOpusAudio`로 감싸 voice client에 전달합니다.
 5. 재생이 시작되면 실제 recent playback을 기록하고 panel을 갱신합니다. Voice completion callback은 repeat, retry, stop과 다음 advance를 결정합니다.
 6. `start_noncritical_tasks`는 current identity와 generation을 다시 확인하면서 autoplay refill과 lyrics publish를 서로 다른 지연 뒤 시작합니다.
 7. Autoplay는 pool 후보를 current·queue·recent 기준으로 다시 검증해 먼저 사용하고, 적격 후보가 없을 때만 radio extraction을 수행합니다.

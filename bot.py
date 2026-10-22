@@ -19,6 +19,7 @@ import discord
 import requests
 from discord import app_commands
 from discord.ext import commands
+from music_audio_buffer import BufferedOpusAudio
 from music_autoplay_logging import describe_autoplay_track, log_autoplay_event
 from music_autoplay_policy import (
     AUTOPLAY_QUEUE_TARGET,
@@ -4242,12 +4243,15 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                     not used_opus_copy,
                     max(0, attempt_number - 1),
                 )
-                source = discord.FFmpegOpusAudio(
-                    track.stream_url,
-                    bitrate=128,
-                    codec="copy" if used_opus_copy else None,
-                    executable=FFMPEG_EXECUTABLE,
-                    **FFMPEG_OPTIONS,
+                source = BufferedOpusAudio(
+                    discord.FFmpegOpusAudio(
+                        track.stream_url,
+                        bitrate=128,
+                        codec="copy" if used_opus_copy else None,
+                        executable=FFMPEG_EXECUTABLE,
+                        **FFMPEG_OPTIONS,
+                    ),
+                    label=track.title,
                 )
             except asyncio.CancelledError:
                 raise

@@ -10410,6 +10410,7 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
             def play(self, source: object, *, after: object) -> None:
                 self.playing = True
                 self.after = after
+                self.source = source
 
         guild_id = 460
         stream_url = "https://example.test/fresh.opus"
@@ -10429,7 +10430,11 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(bot, "ffmpeg_is_available", return_value=True),
             patch.object(bot, "extract_ytdl_info", new=AsyncMock()) as extract,
-            patch.object(bot.discord, "FFmpegOpusAudio", return_value=MagicMock()),
+            patch.object(
+                bot.discord,
+                "FFmpegOpusAudio",
+                return_value=MagicMock(),
+            ) as ffmpeg_source,
             patch.object(bot, "schedule_noncritical_tasks"),
             patch.object(bot, "schedule_play_next") as schedule_next,
             patch.object(bot, "bot", fake_bot),
@@ -10441,6 +10446,8 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
 
         extract.assert_not_awaited()
+        self.assertIsInstance(voice.source, bot.BufferedOpusAudio)
+        self.assertIs(voice.source._source, ffmpeg_source.return_value)
         self.assertEqual(list(state.queue), [track])
         self.assertEqual(track.stream_url, stream_url)
         self.assertEqual(track.stream_resolved_at, resolved_at)
