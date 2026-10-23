@@ -8556,6 +8556,106 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.gather(handler_task, return_exceptions=True)
                 bot.music_states.pop(guild_id, None)
 
+    async def test_voice_drop_keeps_queue_when_discord_py_rejoins(self) -> None:
+        guild_id = 823
+        guild = MagicMock(id=guild_id, voice_client=None)
+        member = MagicMock(bot=True, id=9501, guild=guild)
+        member.voice = type("MemberVoice", (), {"channel": None})()
+        channel = MagicMock(id=1701)
+        voice = MagicMock(channel=channel)
+        voice.is_connected.return_value = False
+        voice.is_playing.return_value = True
+        voice.is_paused.return_value = False
+        guild.voice_client = voice
+
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        current = make_track("dropped current")
+        queued = make_track("dropped queued")
+        state.current = current
+        state.queue.append(queued)
+        generation = state.playback_generation
+        handler_task = None
+
+        with (
+            patch.object(bot, "show_idle_panel", new=AsyncMock()) as show_idle_panel,
+            patch.object(bot.bot._connection, "user", member),
+        ):
+            try:
+                before = type("VoiceState", (), {"channel": channel})()
+                after = type("VoiceState", (), {"channel": None})()
+                handler_task = asyncio.create_task(
+                    bot.on_voice_state_update(member, before, after)
+                )
+                await asyncio.sleep(0.3)
+                self.assertFalse(handler_task.done())
+
+                member.voice = type("MemberVoice", (), {"channel": channel})()
+                voice.is_connected.return_value = True
+                await asyncio.wait_for(handler_task, timeout=1)
+
+                self.assertIs(state.voice, voice)
+                self.assertIs(state.current, current)
+                self.assertEqual(list(state.queue), [queued])
+                self.assertEqual(state.playback_generation, generation)
+                voice.stop.assert_not_called()
+                show_idle_panel.assert_not_awaited()
+            finally:
+                if handler_task is not None and not handler_task.done():
+                    handler_task.cancel()
+                if handler_task is not None:
+                    await asyncio.gather(handler_task, return_exceptions=True)
+                bot.music_states.pop(guild_id, None)
+
+    async def test_voice_drop_stops_once_discord_py_removes_voice_client(
+        self,
+    ) -> None:
+        guild_id = 824
+        guild = MagicMock(id=guild_id, voice_client=None)
+        member = MagicMock(bot=True, id=9601, guild=guild)
+        member.voice = type("MemberVoice", (), {"channel": None})()
+        channel = MagicMock(id=1801)
+        voice = MagicMock(channel=channel)
+        voice.is_connected.return_value = False
+        voice.is_playing.return_value = True
+        voice.is_paused.return_value = False
+        guild.voice_client = voice
+
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        state.current = make_track("kicked current")
+        state.queue.append(make_track("kicked queued"))
+        generation = state.playback_generation
+        handler_task = None
+
+        with (
+            patch.object(bot, "show_idle_panel", new=AsyncMock()) as show_idle_panel,
+            patch.object(bot.bot._connection, "user", member),
+        ):
+            try:
+                before = type("VoiceState", (), {"channel": channel})()
+                after = type("VoiceState", (), {"channel": None})()
+                handler_task = asyncio.create_task(
+                    bot.on_voice_state_update(member, before, after)
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(handler_task.done())
+
+                guild.voice_client = None
+                await asyncio.wait_for(handler_task, timeout=1)
+
+                self.assertIsNone(state.current)
+                self.assertFalse(state.queue)
+                self.assertEqual(state.playback_generation, generation + 1)
+                voice.stop.assert_called_once_with()
+                show_idle_panel.assert_awaited_once_with(guild_id, state)
+            finally:
+                if handler_task is not None and not handler_task.done():
+                    handler_task.cancel()
+                if handler_task is not None:
+                    await asyncio.gather(handler_task, return_exceptions=True)
+                bot.music_states.pop(guild_id, None)
+
     async def test_external_bot_disconnect_cancels_pending_message_request(
         self,
     ) -> None:
@@ -8639,6 +8739,7 @@ class VoiceConnectionTests(unittest.IsolatedAsyncioTestCase):
                 False,
             ),
             patch.object(bot, "EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS", 60),
+            patch.object(bot, "VOICE_DROP_RECONNECT_GRACE_SECONDS", 0),
             patch.object(bot, "extract_track", side_effect=delayed_extract),
             patch.object(bot, "enqueue_tracks", side_effect=capture_enqueue_result),
             patch.object(
@@ -9943,6 +10044,91 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
             [call.kwargs["codec"] for call in ffmpeg_opus.call_args_list],
             ["copy", None, "copy"],
         )
+
+    async def test_voice_drop_interruption_replays_track_after_reconnect(
+        self,
+    ) -> None:
+        replay_started = asyncio.Event()
+        play_titles: list[str] = []
+
+        class FakeVoice:
+            def __init__(self) -> None:
+                self.connected = True
+                self.playing = False
+                self.stop_calls = 0
+
+            def is_connected(self) -> bool:
+                return self.connected
+
+            def is_playing(self) -> bool:
+                return self.playing
+
+            def is_paused(self) -> bool:
+                return False
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+                self.playing = False
+
+            def play(self, source: object, *, after: object) -> None:
+                assert state.current is not None
+                play_titles.append(state.current.title)
+                # discord.py aborts the player without an error and leaves
+                # it reporting is_playing() when the connection drops.
+                self.playing = True
+                if len(play_titles) == 1:
+                    self.connected = False
+                    after(None)
+                else:
+                    replay_started.set()
+
+        guild_id = 465
+        track = make_track("interrupted")
+        track.stream_url = "https://example.test/interrupted.opus"
+        track.stream_resolved_at = bot.time.monotonic()
+        track.audio_codec = "opus"
+        next_track = make_track("next-track")
+        voice = FakeVoice()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        state.queue.extend([track, next_track])
+        fake_bot = MagicMock()
+        fake_bot.loop = asyncio.get_running_loop()
+
+        with (
+            patch.object(bot, "ffmpeg_is_available", return_value=True),
+            patch.object(bot, "resolve_track_stream", new=AsyncMock()),
+            patch.object(
+                bot.discord,
+                "FFmpegOpusAudio",
+                side_effect=[MagicMock(), MagicMock()],
+            ),
+            patch.object(bot, "update_control_panel", new=AsyncMock()),
+            patch.object(bot, "show_idle_panel", new=AsyncMock()) as show_idle_panel,
+            patch.object(bot, "schedule_noncritical_tasks"),
+            patch.object(bot, "bot", fake_bot),
+        ):
+            try:
+                first_task, _ = bot.schedule_play_next(guild_id, announce=False)
+                await first_task
+                await asyncio.sleep(0.3)
+
+                self.assertEqual(play_titles, ["interrupted"])
+                self.assertIsNone(state.current)
+                self.assertEqual(list(state.queue), [track, next_track])
+                self.assertEqual(voice.stop_calls, 1)
+
+                voice.connected = True
+                await asyncio.wait_for(replay_started.wait(), timeout=1)
+            finally:
+                if state.advance_task is not None:
+                    await asyncio.gather(state.advance_task, return_exceptions=True)
+                bot.music_states.pop(guild_id, None)
+
+        self.assertEqual(play_titles, ["interrupted", "interrupted"])
+        self.assertIs(state.current, track)
+        self.assertEqual(list(state.queue), [next_track])
+        show_idle_panel.assert_not_awaited()
 
     async def test_repeat_one_keeps_transcode_after_copy_failure(self) -> None:
         third_play_started = asyncio.Event()

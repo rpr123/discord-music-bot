@@ -111,6 +111,7 @@ from music_config import (
     QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
     QUEUE_SELECT_LIMIT,
     VOICE_DISCONNECT_TIMEOUT_SECONDS,
+    VOICE_DROP_RECONNECT_GRACE_SECONDS,
     VOICE_RECONNECT_GRACE_SECONDS,
     YOUTUBE_LYRICS_FALLBACK,
     YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS,
@@ -2139,6 +2140,42 @@ async def wait_for_voice_connection(
     return True
 
 
+async def wait_for_bot_voice_rejoin(
+    member: discord.Member,
+    state: GuildMusicState,
+    voice: discord.VoiceProtocol,
+) -> bool:
+    # A dropped voice connection also reports the bot leaving its channel.
+    # Give discord.py time to rejoin before treating it as a disconnect.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + VOICE_DROP_RECONNECT_GRACE_SECONDS
+    while True:
+        if (
+            bot_shutdown_started
+            or state.voice is not voice
+            or getattr(member.guild, "voice_client", None) is not voice
+        ):
+            return False
+        if (
+            getattr(getattr(member, "voice", None), "channel", None) is not None
+            and voice.is_connected()
+        ):
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.25, remaining))
+
+
+async def advance_after_voice_reconnect(
+    guild_id: int,
+    generation: int,
+    voice: discord.VoiceProtocol,
+) -> None:
+    await wait_for_voice_connection(voice, VOICE_DROP_RECONNECT_GRACE_SECONDS)
+    schedule_play_next_after_current(guild_id, generation)
+
+
 async def discard_stale_voice_client(
     guild: discord.Guild,
     state: GuildMusicState,
@@ -3424,7 +3461,13 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                         source.cleanup()
                         return
 
+                    playback_voice = voice
+
                     def after_playback(error: Exception | None) -> None:
+                        # discord.py ends the player without an error when the
+                        # voice connection drops and does not come back in time.
+                        interrupted = not playback_voice.is_connected()
+
                         def advance() -> None:
                             if (
                                 generation != state.playback_generation
@@ -3434,6 +3477,25 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
 
                             cancel_noncritical_tasks(state)
                             cancel_lyrics_publish(state)
+                            if interrupted:
+                                # The ended player still reports is_playing().
+                                playback_voice.stop()
+                                reset_track_playback_attempts(track)
+                                state.queue.appendleft(track)
+                                state.current = None
+                                logger.warning(
+                                    "Playback of %s was interrupted by a voice "
+                                    "disconnect; replaying it after reconnect",
+                                    track.title,
+                                )
+                                create_housekeeping_task(
+                                    advance_after_voice_reconnect(
+                                        guild_id,
+                                        generation,
+                                        playback_voice,
+                                    )
+                                )
+                                return
                             if error:
                                 retrying = requeue_track_after_playback_error(
                                     state,
@@ -3636,6 +3698,12 @@ async def on_voice_state_update(
         if before.channel is not None and after.channel is None:
             event_voice = state.voice
             if event_voice is None:
+                return
+            if await wait_for_bot_voice_rejoin(member, state, event_voice):
+                logger.info(
+                    "Voice reconnected in guild %s; keeping playback state",
+                    member.guild.id,
+                )
                 return
 
             should_refresh_panel = False

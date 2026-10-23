@@ -176,6 +176,9 @@ IDLE_VOICE_DISCONNECT_DELAY_SECONDS = parse_nonnegative_float_env(
     "IDLE_VOICE_DISCONNECT_DELAY_SECONDS", 300.0
 )
 VOICE_RECONNECT_GRACE_SECONDS = 5.0
+# discord.py leaves and rejoins the channel after a dropped voice connection;
+# its first retry waits up to 2 seconds before a fresh handshake.
+VOICE_DROP_RECONNECT_GRACE_SECONDS = 15.0
 VOICE_DISCONNECT_TIMEOUT_SECONDS = 10.0
 AUTOPLAY_START_DELAY_SECONDS = parse_nonnegative_float_env(
     "AUTOPLAY_START_DELAY_SECONDS", 10.0
