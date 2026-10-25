@@ -370,6 +370,25 @@ class LyricsLookupTests(unittest.TestCase):
             )
         )
 
+    def test_romanized_song_on_native_channel_requests_native_metadata(self) -> None:
+        def track(title: str, uploader: str | None, artist: str | None = None) -> bot.Track:
+            return bot.Track(
+                title=title,
+                webpage_url="https://www.youtube.com/watch?v=S38phza2dn8",
+                requester="tester",
+                source_url="https://www.youtube.com/watch?v=S38phza2dn8",
+                song_name=title,
+                uploader=uploader,
+                artist=artist,
+            )
+
+        get_language = music_lyrics_sources.get_native_metadata_language
+        self.assertEqual(get_language(track("Ano Hana no you ni", "ノクチル", "noctchill")), "ja")
+        self.assertEqual(get_language(track("Blue Moon", "이세계아이돌")), "ko")
+        self.assertIsNone(get_language(track("あの花のように", "ノクチル")))
+        self.assertIsNone(get_language(track("Karma", "Fumage - Topic", "Fumage")))
+        self.assertIsNone(get_language(track("Song", None)))
+
     def test_plain_lyrics_drop_stray_lrc_timestamps(self) -> None:
         record = {
             "instrumental": False,

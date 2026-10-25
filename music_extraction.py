@@ -8,6 +8,7 @@ import time
 import unicodedata
 import uuid
 from collections import OrderedDict
+from typing import Callable, TypeVar
 
 import requests
 from ytmusicapi import YTMusic
@@ -81,8 +82,11 @@ from music_ytdl import (
 )
 
 
+T = TypeVar("T")
+
 youtube_music_client: YTMusic | None = None
 youtube_music_client_lock = threading.Lock()
+localized_youtube_music_clients: dict[str, YTMusic] = {}
 auxiliary_network_semaphore = asyncio.Semaphore(1)
 auxiliary_operation_tasks: set[asyncio.Task] = set()
 auxiliary_worker_tasks: set[asyncio.Task] = set()
@@ -227,49 +231,62 @@ async def extract_ytdl_info(
     return info
 
 
+def create_youtube_music_client(language: str) -> YTMusic:
+    auth_path: str | None = None
+    if YOUTUBE_MUSIC_AUTH_FILE:
+        resolved_auth_path = resolve_project_path(YOUTUBE_MUSIC_AUTH_FILE)
+        if not resolved_auth_path.is_file():
+            raise FileNotFoundError(
+                f"YouTube Music auth file was not found: {resolved_auth_path}"
+            )
+        auth_path = str(resolved_auth_path)
+
+    session = requests.Session()
+    session.request = functools.partial(
+        session.request,
+        timeout=YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS,
+    )
+    oauth_credentials: OAuthCredentials | None = None
+    if YOUTUBE_MUSIC_OAUTH_CLIENT_ID or YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET:
+        if not (
+            YOUTUBE_MUSIC_OAUTH_CLIENT_ID
+            and YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET
+        ):
+            raise ValueError(
+                "YOUTUBE_MUSIC_OAUTH_CLIENT_ID and "
+                "YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET must be set together."
+            )
+        oauth_credentials = OAuthCredentials(
+            client_id=YOUTUBE_MUSIC_OAUTH_CLIENT_ID,
+            client_secret=YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET,
+            session=session,
+        )
+    return YTMusic(
+        auth=auth_path,
+        requests_session=session,
+        language=language,
+        location=YOUTUBE_MUSIC_LOCATION,
+        oauth_credentials=oauth_credentials,
+    )
+
+
 def get_youtube_music_client() -> YTMusic:
     global youtube_music_client
     with youtube_music_client_lock:
-        if youtube_music_client is not None:
-            return youtube_music_client
-
-        auth_path: str | None = None
-        if YOUTUBE_MUSIC_AUTH_FILE:
-            resolved_auth_path = resolve_project_path(YOUTUBE_MUSIC_AUTH_FILE)
-            if not resolved_auth_path.is_file():
-                raise FileNotFoundError(
-                    f"YouTube Music auth file was not found: {resolved_auth_path}"
-                )
-            auth_path = str(resolved_auth_path)
-
-        session = requests.Session()
-        session.request = functools.partial(
-            session.request,
-            timeout=YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS,
-        )
-        oauth_credentials: OAuthCredentials | None = None
-        if YOUTUBE_MUSIC_OAUTH_CLIENT_ID or YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET:
-            if not (
-                YOUTUBE_MUSIC_OAUTH_CLIENT_ID
-                and YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET
-            ):
-                raise ValueError(
-                    "YOUTUBE_MUSIC_OAUTH_CLIENT_ID and "
-                    "YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET must be set together."
-                )
-            oauth_credentials = OAuthCredentials(
-                client_id=YOUTUBE_MUSIC_OAUTH_CLIENT_ID,
-                client_secret=YOUTUBE_MUSIC_OAUTH_CLIENT_SECRET,
-                session=session,
+        if youtube_music_client is None:
+            youtube_music_client = create_youtube_music_client(
+                YOUTUBE_MUSIC_LANGUAGE
             )
-        youtube_music_client = YTMusic(
-            auth=auth_path,
-            requests_session=session,
-            language=YOUTUBE_MUSIC_LANGUAGE,
-            location=YOUTUBE_MUSIC_LOCATION,
-            oauth_credentials=oauth_credentials,
-        )
         return youtube_music_client
+
+
+def get_localized_youtube_music_client(language: str) -> YTMusic:
+    with youtube_music_client_lock:
+        client = localized_youtube_music_clients.get(language)
+        if client is None:
+            client = create_youtube_music_client(language)
+            localized_youtube_music_clients[language] = client
+        return client
 
 
 def get_youtube_music_cache_key(query: str) -> str:
@@ -308,6 +325,61 @@ async def cache_youtube_music_results(query: str, results: list[dict]) -> None:
             youtube_music_cache.popitem(last=False)
 
 
+async def run_youtube_music_request(label: str, request: Callable[[], T]) -> T:
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    try:
+        await asyncio.wait_for(
+            auxiliary_network_semaphore.acquire(),
+            timeout=YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("YouTube Music %s queue timed out", label)
+        raise
+
+    try:
+        ensure_youtube_circuit_closed()
+        await wait_for_youtube_music_interval()
+        ensure_youtube_circuit_closed()
+        ensure_auxiliary_workers_open()
+    except BaseException:
+        auxiliary_network_semaphore.release()
+        raise
+
+    worker = track_auxiliary_worker(
+        asyncio.create_task(asyncio.to_thread(request))
+    )
+
+    def request_finished(task: asyncio.Task[T]) -> None:
+        auxiliary_network_semaphore.release()
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            trip_youtube_circuit(error)
+
+    worker.add_done_callback(request_finished)
+    remaining_timeout = max(
+        0.1,
+        YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS - (loop.time() - started_at),
+    )
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(worker),
+            timeout=remaining_timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "YouTube Music %s timed out after %s seconds",
+            label,
+            YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS,
+        )
+        raise
+    except Exception as error:
+        trip_youtube_circuit(error)
+        raise
+
+
 async def _search_youtube_music_operation(query: str) -> list[dict]:
     if extraction_shutdown_started:
         raise asyncio.CancelledError
@@ -329,59 +401,7 @@ async def _search_youtube_music_operation(query: str) -> list[dict]:
         )
         return [result for result in results if isinstance(result, dict)]
 
-    loop = asyncio.get_running_loop()
-    started_at = loop.time()
-    try:
-        await asyncio.wait_for(
-            auxiliary_network_semaphore.acquire(),
-            timeout=YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("YouTube Music search queue timed out: %s", query)
-        raise
-
-    try:
-        ensure_youtube_circuit_closed()
-        await wait_for_youtube_music_interval()
-        ensure_youtube_circuit_closed()
-        ensure_auxiliary_workers_open()
-    except BaseException:
-        auxiliary_network_semaphore.release()
-        raise
-
-    worker = track_auxiliary_worker(
-        asyncio.create_task(asyncio.to_thread(search))
-    )
-
-    def search_finished(task: asyncio.Task[list[dict]]) -> None:
-        auxiliary_network_semaphore.release()
-        if task.cancelled():
-            return
-        error = task.exception()
-        if error is not None:
-            trip_youtube_circuit(error)
-
-    worker.add_done_callback(search_finished)
-    remaining_timeout = max(
-        0.1,
-        YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS - (loop.time() - started_at),
-    )
-    try:
-        results = await asyncio.wait_for(
-            asyncio.shield(worker),
-            timeout=remaining_timeout,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            "YouTube Music search timed out after %s seconds: %s",
-            YOUTUBE_MUSIC_SEARCH_TIMEOUT_SECONDS,
-            query,
-        )
-        raise
-    except Exception as error:
-        trip_youtube_circuit(error)
-        raise
-
+    results = await run_youtube_music_request(f"search for {query!r}", search)
     await cache_youtube_music_results(query, results)
     logger.info("YouTube Music search done: %s result(s)", len(results))
     return results
@@ -393,6 +413,53 @@ async def search_youtube_music(query: str) -> list[dict]:
     operation_task = track_auxiliary_operation()
     try:
         return await _search_youtube_music_operation(query)
+    finally:
+        auxiliary_operation_tasks.discard(operation_task)
+
+
+def parse_localized_song(playlist: dict, video_id: str) -> tuple[str, str | None] | None:
+    tracks = playlist.get("tracks") if isinstance(playlist, dict) else None
+    if not tracks or not isinstance(tracks[0], dict):
+        return None
+    track = tracks[0]
+    title = track.get("title")
+    if track.get("videoId") != video_id or not isinstance(title, str) or not title:
+        return None
+    artist = next(
+        (
+            artist["name"]
+            for artist in track.get("artists") or []
+            if isinstance(artist, dict) and isinstance(artist.get("name"), str)
+        ),
+        None,
+    )
+    return title, artist
+
+
+async def lookup_localized_song(
+    video_id: str,
+    language: str,
+) -> tuple[str, str | None] | None:
+    """Return the (song, artist) YouTube Music shows for a video in a language."""
+    if extraction_shutdown_started:
+        raise asyncio.CancelledError
+    if not YOUTUBE_MUSIC_SEARCH_ENABLED:
+        return None
+    operation_task = track_auxiliary_operation()
+    try:
+        ensure_youtube_circuit_closed()
+
+        def lookup() -> tuple[str, str | None] | None:
+            playlist = get_localized_youtube_music_client(language).get_watch_playlist(
+                videoId=video_id,
+                limit=1,
+            )
+            return parse_localized_song(playlist, video_id)
+
+        return await run_youtube_music_request(
+            f"{language} song lookup for {video_id}",
+            lookup,
+        )
     finally:
         auxiliary_operation_tasks.discard(operation_task)
 

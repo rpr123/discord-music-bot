@@ -841,6 +841,73 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(track.lyrics_source, "YouTube 수동 자막")
         youtube_lookup.assert_awaited_once_with(track)
 
+    async def test_lrclib_miss_retries_with_native_youtube_music_metadata(self) -> None:
+        track = bot.Track(
+            title="Ano Hana no you ni",
+            webpage_url="https://www.youtube.com/watch?v=S38phza2dn8",
+            requester="tester",
+            source_url="https://www.youtube.com/watch?v=S38phza2dn8",
+            song_name="Ano Hana no you ni",
+            artist="noctchill",
+            uploader="ノクチル",
+            duration=248,
+        )
+        searched: list[tuple[str, str | None, str | None]] = []
+
+        def lookup(candidate: bot.Track) -> str | None:
+            searched.append((candidate.song_name, candidate.artist, candidate.uploader))
+            return "native lyrics" if candidate.song_name == "あの花のように" else None
+
+        with (
+            patch.object(bot, "lookup_track_lyrics", side_effect=lookup),
+            patch.object(
+                bot,
+                "lookup_localized_song",
+                new=AsyncMock(return_value=("あの花のように", "ノクチル")),
+            ) as localized_lookup,
+            patch.object(bot, "get_youtube_manual_lyrics", new=AsyncMock()) as youtube_lookup,
+        ):
+            lyrics = await bot.get_track_lyrics(track)
+
+        self.assertEqual(lyrics, "native lyrics")
+        self.assertEqual(track.lyrics_source, "LRCLIB")
+        self.assertEqual(track.song_name, "Ano Hana no you ni")
+        localized_lookup.assert_awaited_once_with("S38phza2dn8", "ja")
+        self.assertEqual(
+            searched,
+            [
+                ("Ano Hana no you ni", "noctchill", "ノクチル"),
+                ("あの花のように", "ノクチル", "ノクチル"),
+            ],
+        )
+        youtube_lookup.assert_not_awaited()
+
+    async def test_lrclib_failure_skips_native_youtube_music_metadata(self) -> None:
+        track = bot.Track(
+            title="Ano Hana no you ni",
+            webpage_url="https://www.youtube.com/watch?v=S38phza2dn8",
+            requester="tester",
+            source_url="https://www.youtube.com/watch?v=S38phza2dn8",
+            uploader="ノクチル",
+        )
+        with (
+            patch.object(
+                bot,
+                "lookup_track_lyrics",
+                side_effect=bot.LyricsLookupError("HTTP Error 503"),
+            ),
+            patch.object(bot, "lookup_localized_song", new=AsyncMock()) as localized_lookup,
+            patch.object(
+                bot,
+                "get_youtube_manual_lyrics",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            lyrics = await bot.get_track_lyrics(track)
+
+        self.assertIsNone(lyrics)
+        localized_lookup.assert_not_awaited()
+
     async def test_lrclib_hit_does_not_request_youtube_subtitles(self) -> None:
         track = make_track("lrclib")
         with (

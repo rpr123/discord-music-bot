@@ -47,7 +47,7 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 ### Process-scoped runtime state
 
 - `bot.py`는 Discord client, shutdown flag, subtitle rate state, lyrics executor, voice operation과 housekeeping task를 소유합니다.
-- `music_extraction.py`는 YouTube Music client/cache/rate lock, 보조 network semaphore와 operation/worker task set, 추출 shutdown flag를 소유합니다. 가사의 수동 자막 조회도 이 보조 network slot을 함께 씁니다. `bot.begin_bot_shutdown`이 `begin_extraction_shutdown`을 호출해 추출 쪽을 함께 닫습니다.
+- `music_extraction.py`는 YouTube Music client/cache/rate lock, 보조 network semaphore와 operation/worker task set, 추출 shutdown flag를 소유합니다. 가사의 수동 자막 조회와 원어 곡명 조회(`lookup_localized_song`)도 이 보조 network slot을 함께 씁니다. `bot.begin_bot_shutdown`이 `begin_extraction_shutdown`을 호출해 추출 쪽을 함께 닫습니다.
 - `music_ytdl.py`는 process-wide priority scheduler, active worker/job, cache/rate state와 YouTube circuit state를 소유합니다.
 
 Process-scoped 상태가 모두 `bot.py`에 있다는 가정으로 소유권을 나누면 안 됩니다.

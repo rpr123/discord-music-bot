@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import dataclasses
 import functools
 import random
 import shutil
@@ -75,6 +76,7 @@ from music_extraction import (
     extract_auto_tracks_from_seed,
     extract_track,
     extract_tracks,
+    lookup_localized_song,
     parse_auto_request,
     resolve_track_stream,
     shutdown_auxiliary_operations,
@@ -86,12 +88,13 @@ from music_lyrics_sources import (
     LYRICS_LOOKUP_TIMEOUT_SECONDS,
     LyricsLookupError,
     YouTubeSubtitleError,
+    get_native_metadata_language,
     lookup_track_lyrics,
     request_youtube_subtitle,
     select_manual_subtitle,
 )
 from music_request_parsing import parse_music_request
-from music_track_metadata import get_track_identity_keys
+from music_track_metadata import get_track_identity_keys, get_track_video_id
 from music_config import (
     AUTOPLAY_BUTTON_CUSTOM_ID,
     AUTOPLAY_REFILL_CANDIDATES,
@@ -1537,6 +1540,52 @@ async def get_youtube_manual_lyrics(track: Track) -> str | None:
     )
 
 
+async def get_native_metadata_lyrics(track: Track) -> str | None:
+    language = get_native_metadata_language(track)
+    video_id = get_track_video_id(track)
+    if language is None or video_id is None:
+        return None
+    try:
+        song = await lookup_localized_song(video_id, language)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.warning(
+            "YouTube Music %s metadata lookup failed for %s: %s",
+            language,
+            track.title,
+            error,
+        )
+        return None
+    if song is None or song == (track.song_name, track.artist):
+        return None
+
+    song_name, artist = song
+    native_track = dataclasses.replace(
+        track,
+        title=song_name,
+        song_name=song_name,
+        artist=artist,
+    )
+    try:
+        lyrics = await asyncio.wait_for(
+            run_lyrics_job(lookup_track_lyrics, native_track),
+            timeout=LYRICS_LOOKUP_TIMEOUT_SECONDS + 2,
+        )
+    except (asyncio.TimeoutError, LyricsLookupError) as error:
+        logger.warning("LRCLIB lookup failed for %s: %s", song_name, error)
+        return None
+    if lyrics:
+        logger.info(
+            "LRCLIB matched lyrics for %s with %s metadata %s / %s",
+            track.title,
+            language,
+            song_name,
+            artist,
+        )
+    return lyrics
+
+
 async def get_track_lyrics(track: Track) -> str | None:
     if track.lyrics_loaded:
         return track.lyrics
@@ -1549,6 +1598,11 @@ async def get_track_lyrics(track: Track) -> str | None:
         )
     except (asyncio.TimeoutError, LyricsLookupError) as error:
         logger.warning("LRCLIB lookup failed for %s: %s", track.title, error)
+    else:
+        if not lyrics:
+            # English YouTube metadata romanizes many Japanese songs, which
+            # LRCLIB lists under their native title and artist.
+            lyrics = await get_native_metadata_lyrics(track)
 
     if lyrics:
         track.lyrics_source = "LRCLIB"

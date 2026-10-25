@@ -106,6 +106,23 @@ def non_latin_letter_ratio(value: str) -> float:
     return non_latin_letters / len(letters)
 
 
+def get_native_metadata_language(track: Track) -> str | None:
+    """Guess the YouTube Music language that shows a romanized song natively."""
+    if non_latin_letter_ratio(track.song_name or track.title) >= LYRICS_NATIVE_SCRIPT_MIN_RATIO:
+        return None
+    # English metadata romanizes the song but keeps the channel name native,
+    # e.g. "Ano Hana no you ni" by "noctchill" on the "ノクチル" channel.
+    names = " ".join(value for value in (track.uploader, track.artist) if value)
+    character_names = [unicodedata.name(character, "") for character in names]
+    if any(
+        name.startswith(("HIRAGANA", "KATAKANA")) for name in character_names
+    ):
+        return "ja"
+    if any(name.startswith("HANGUL") for name in character_names):
+        return "ko"
+    return None
+
+
 def lyrics_native_script_ratio(record: dict) -> float:
     return non_latin_letter_ratio(extract_original_lyrics(record) or "")
 
