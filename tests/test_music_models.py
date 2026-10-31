@@ -88,7 +88,6 @@ class MusicModelTests(unittest.TestCase):
             )
         )
         first.queue_cleanup_tasks[1] = object()
-        track.manual_subtitles["ko"] = []
 
         self.assertFalse(second.queue)
         self.assertFalse(second.autoplay_candidate_pool)
@@ -96,7 +95,6 @@ class MusicModelTests(unittest.TestCase):
         self.assertFalse(second.recent_video_ids)
         self.assertFalse(second.recent_playbacks)
         self.assertFalse(second.queue_cleanup_tasks)
-        self.assertFalse(self.make_track("other").manual_subtitles)
 
     def test_music_state_locks_and_task_defaults(self) -> None:
         first = music_models.GuildMusicState()
@@ -152,8 +150,6 @@ class MusicModelTests(unittest.TestCase):
                 "lyrics",
                 "lyrics_loaded",
                 "lyrics_source",
-                "manual_subtitles",
-                "subtitle_language",
                 "track_id",
             ),
         )

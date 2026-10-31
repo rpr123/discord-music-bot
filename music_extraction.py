@@ -60,7 +60,6 @@ from music_search_scoring import (
 )
 from music_track_metadata import (
     get_audio_codec,
-    get_manual_subtitles,
     get_resolved_stream_url,
     get_thumbnail_url,
     get_track_identity_keys,
@@ -448,6 +447,7 @@ async def lookup_localized_song(
     operation_task = track_auxiliary_operation()
     try:
         ensure_youtube_circuit_closed()
+        logger.info("YouTube Music %s song lookup start: %s", language, video_id)
 
         def lookup() -> tuple[str, str | None] | None:
             playlist = get_localized_youtube_music_client(language).get_watch_playlist(
@@ -608,10 +608,6 @@ async def resolve_track_stream(track: Track) -> None:
     track.song_name = info.get("track") or info.get("alt_title") or track.song_name
     track.uploader = info.get("uploader") or info.get("channel") or track.uploader
     track.audio_codec = get_audio_codec(info)
-    track.manual_subtitles = get_manual_subtitles(info)
-    track.subtitle_language = (
-        info.get("language") or info.get("original_language") or track.subtitle_language
-    )
 
 
 async def extract_track(

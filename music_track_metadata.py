@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import re
 import time
 import urllib.parse
@@ -243,18 +242,6 @@ def get_entry_url(info: dict, fallback_url: str) -> str:
     return raw_url
 
 
-def get_manual_subtitles(info: dict) -> dict[str, list[dict]]:
-    subtitles = info.get("subtitles")
-    if not isinstance(subtitles, dict):
-        return {}
-
-    return {
-        str(language): [copy.deepcopy(item) for item in formats if isinstance(item, dict)]
-        for language, formats in subtitles.items()
-        if isinstance(formats, list)
-    }
-
-
 def make_track_from_info(
     info: dict,
     requester: str,
@@ -276,8 +263,6 @@ def make_track_from_info(
         song_name=info.get("track") or info.get("alt_title"),
         uploader=info.get("uploader") or info.get("channel"),
         audio_codec=get_audio_codec(info),
-        manual_subtitles=get_manual_subtitles(info),
-        subtitle_language=info.get("language") or info.get("original_language"),
         stream_resolved_at=(
             info.get("_music_bot_extracted_at", time.monotonic())
             if stream_url

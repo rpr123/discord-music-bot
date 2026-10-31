@@ -33,21 +33,21 @@ Production supporting module들은 더 낮은 수준의 supporting module을 단
 | `music_discord_display.py` | Discord 응답·삭제 helper와 track/player/queue/recent/lyrics embed 및 첨부 파일 생성 |
 | `music_request_parsing.py` | YouTube URL·검색·playlist 구분과 album/playlist/auto 요청 파싱 |
 | `music_search_scoring.py` | 제목·아티스트 정규화, YouTube Music result 변환, 일반 YouTube 후보 점수화와 query 해석 |
-| `music_track_metadata.py` | yt-dlp info에서 video·stream·codec·thumbnail·subtitle metadata 추출, `Track` 생성과 identity key 구성 |
+| `music_track_metadata.py` | yt-dlp info에서 video·stream·codec·thumbnail metadata 추출, `Track` 생성과 identity key 구성 |
 | `music_ytdl.py` | yt-dlp cache·rate limit·circuit breaker, priority job scheduling, timeout·cancellation과 subprocess 정리 |
 | `music_extraction.py` | yt-dlp 조회 wrapper, YouTube Music client·cache·rate limit, 곡·앨범·재생목록·Radio 추출과 재생 직전 stream resolve, 보조 network slot과 그 operation/worker task 수명 |
 | `music_audio_buffer.py` | FFmpeg Opus source를 별도 thread로 미리 읽어 두고 20ms 간격으로 내보내며, 버퍼가 비면 무음으로 기다렸다가 이어서 재생 |
 | `ytdl_worker.py` | 격리 subprocess에서 `yt_dlp.YoutubeDL.extract_info`를 실행하고 JSON 결과 또는 오류 반환 |
 | `music_autoplay_policy.py` | 최근곡 TTL/history, current·queue·recent 중복 제외, 후보 선택·pool 관리, seed·refill·retry 정책 |
 | `music_autoplay_logging.py` | 검색·선택 JSONL 기록, 용량 제한 순환 파일과 공개 곡 메타데이터 요약 |
-| `music_lyrics_sources.py` | LRCLIB 조회·선택과 YouTube 수동 subtitle 후보 선택·다운로드·JSON3/VTT 파싱 |
+| `music_lyrics_sources.py` | LRCLIB 조회·선택과 원어 메타데이터 언어 판별 |
 
 ## 상태 소유권
 
 ### Process-scoped runtime state
 
-- `bot.py`는 Discord client, shutdown flag, subtitle rate state, lyrics executor, voice operation과 housekeeping task를 소유합니다.
-- `music_extraction.py`는 YouTube Music client/cache/rate lock, 보조 network semaphore와 operation/worker task set, 추출 shutdown flag를 소유합니다. 가사의 수동 자막 조회와 원어 곡명 조회(`lookup_localized_song`)도 이 보조 network slot을 함께 씁니다. `bot.begin_bot_shutdown`이 `begin_extraction_shutdown`을 호출해 추출 쪽을 함께 닫습니다.
+- `bot.py`는 Discord client, shutdown flag, lyrics executor, voice operation과 housekeeping task를 소유합니다.
+- `music_extraction.py`는 YouTube Music client/cache/rate lock, 보조 network semaphore와 operation/worker task set, 추출 shutdown flag를 소유합니다. 가사의 원어 곡명 조회(`lookup_localized_song`)도 이 보조 network slot을 함께 씁니다. `bot.begin_bot_shutdown`이 `begin_extraction_shutdown`을 호출해 추출 쪽을 함께 닫습니다.
 - `music_ytdl.py`는 process-wide priority scheduler, active worker/job, cache/rate state와 YouTube circuit state를 소유합니다.
 
 Process-scoped 상태가 모두 `bot.py`에 있다는 가정으로 소유권을 나누면 안 됩니다.
@@ -70,7 +70,6 @@ Process-scoped 상태가 모두 `bot.py`에 있다는 가정으로 소유권을 
 - stream URL, resolve 시각, audio codec
 - playback attempt, transcode와 retry 상태
 - 원문 가사 cache와 source
-- manual subtitle metadata
 
 ### Persisted configuration state
 

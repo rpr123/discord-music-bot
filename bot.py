@@ -67,11 +67,8 @@ from music_discord_display import (
     truncate_option_text,
 )
 from music_extraction import (
-    auxiliary_network_semaphore,
-    auxiliary_operation_tasks,
     begin_extraction_shutdown,
     clamp_auto_count,
-    ensure_auxiliary_workers_open,
     extract_auto_tracks,
     extract_auto_tracks_from_seed,
     extract_track,
@@ -81,21 +78,17 @@ from music_extraction import (
     resolve_track_stream,
     shutdown_auxiliary_operations,
     shutdown_auxiliary_workers,
-    track_auxiliary_operation,
-    track_auxiliary_worker,
 )
 from music_lyrics_sources import (
     LYRICS_LOOKUP_TIMEOUT_SECONDS,
     LyricsLookupError,
-    YouTubeSubtitleError,
     get_native_metadata_language,
     lookup_track_lyrics,
-    request_youtube_subtitle,
-    select_manual_subtitle,
 )
 from music_request_parsing import parse_music_request
 from music_track_metadata import get_track_identity_keys, get_track_video_id
 from music_config import (
+    AUDIO_READ_AHEAD,
     AUTOPLAY_BUTTON_CUSTOM_ID,
     AUTOPLAY_REFILL_CANDIDATES,
     AUTOPLAY_START_DELAY_SECONDS,
@@ -107,17 +100,15 @@ from music_config import (
     FFMPEG_EXECUTABLE,
     FFMPEG_OPTIONS,
     IDLE_VOICE_DISCONNECT_DELAY_SECONDS,
-    LYRICS_REQUEST_TIMEOUT_SECONDS,
     LYRICS_START_DELAY_SECONDS,
     MUSIC_CHANNEL_NAME,
     MUSIC_FEEDBACK_DELETE_SECONDS,
+    NATIVE_METADATA_LYRICS,
     QUEUE_DELETE_RESPONSE_DELETE_SECONDS,
     QUEUE_SELECT_LIMIT,
     VOICE_DISCONNECT_TIMEOUT_SECONDS,
     VOICE_DROP_RECONNECT_GRACE_SECONDS,
     VOICE_RECONNECT_GRACE_SECONDS,
-    YOUTUBE_LYRICS_FALLBACK,
-    YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS,
     clear_control_message_id,
     configured_autoplay_enabled,
     get_control_message_id,
@@ -131,8 +122,6 @@ from music_config import (
 from music_ytdl import (
     YouTubeCircuitOpenError,
     YtdlJobKind,
-    ensure_youtube_circuit_closed,
-    trip_youtube_circuit,
     wait_for_task_completion_despite_cancellation,
     ytdl_scheduler,
 )
@@ -141,8 +130,6 @@ T = TypeVar("T")
 AUTOPLAY_SEED_CHANGE_POLL_SECONDS = 5.0
 RECENT_PLAYBACK_BUTTON_CUSTOM_ID = "music:recent_playback"
 
-youtube_subtitle_rate_lock = asyncio.Lock()
-youtube_subtitle_last_request_started_at = 0.0
 lyrics_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="music-lyrics",
@@ -186,16 +173,6 @@ async def shutdown_lyrics_executor() -> None:
         raise shutdown_error
     if cancellation_received:
         raise asyncio.CancelledError
-
-
-async def wait_for_youtube_subtitle_interval() -> None:
-    global youtube_subtitle_last_request_started_at
-    async with youtube_subtitle_rate_lock:
-        elapsed = time.monotonic() - youtube_subtitle_last_request_started_at
-        delay = max(0.0, YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS - elapsed)
-        if delay > 0:
-            await asyncio.sleep(delay)
-        youtube_subtitle_last_request_started_at = time.monotonic()
 
 
 def finish_housekeeping_task(task: asyncio.Task) -> None:
@@ -1442,105 +1419,9 @@ async def run_lyrics_job(function: Callable[..., T], *args: object) -> T:
     )
 
 
-async def _get_selected_youtube_subtitle_operation(
-    track: Track,
-    selected: tuple[str, str, str] | None,
-    *,
-    purpose: str,
-) -> str | None:
-    if bot_shutdown_started:
-        raise asyncio.CancelledError
-    if selected is None:
-        return None
-
-    language, extension, url = selected
-
-    ensure_youtube_circuit_closed()
-    try:
-        await asyncio.wait_for(
-            auxiliary_network_semaphore.acquire(),
-            timeout=LYRICS_REQUEST_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError as error:
-        raise YouTubeSubtitleError("Timed out waiting to fetch YouTube subtitles.") from error
-
-    try:
-        ensure_youtube_circuit_closed()
-        await wait_for_youtube_subtitle_interval()
-        ensure_youtube_circuit_closed()
-        ensure_auxiliary_workers_open()
-    except BaseException:
-        auxiliary_network_semaphore.release()
-        raise
-
-    worker = track_auxiliary_worker(
-        asyncio.create_task(
-            run_lyrics_job(request_youtube_subtitle, url, extension)
-        )
-    )
-
-    def subtitle_finished(task: asyncio.Task[str | None]) -> None:
-        auxiliary_network_semaphore.release()
-        if task.cancelled():
-            return
-        error = task.exception()
-        if error is not None:
-            trip_youtube_circuit(error)
-
-    worker.add_done_callback(subtitle_finished)
-    try:
-        lyrics = await asyncio.wait_for(
-            asyncio.shield(worker),
-            timeout=LYRICS_REQUEST_TIMEOUT_SECONDS + 2,
-        )
-    except Exception as error:
-        trip_youtube_circuit(error)
-        if isinstance(error, YouTubeCircuitOpenError):
-            raise
-        raise YouTubeSubtitleError(str(error)) from error
-
-    if lyrics:
-        logger.info(
-            "YouTube subtitles selected for %s (%s, %s)",
-            track.title,
-            language,
-            purpose,
-        )
-    return lyrics
-
-
-async def get_selected_youtube_subtitle(
-    track: Track,
-    selected: tuple[str, str, str] | None,
-    *,
-    purpose: str,
-) -> str | None:
-    if bot_shutdown_started:
-        raise asyncio.CancelledError
-    if selected is None:
-        return None
-    operation_task = track_auxiliary_operation()
-    try:
-        return await _get_selected_youtube_subtitle_operation(
-            track,
-            selected,
-            purpose=purpose,
-        )
-    finally:
-        auxiliary_operation_tasks.discard(operation_task)
-
-
-async def get_youtube_manual_lyrics(track: Track) -> str | None:
-    if not YOUTUBE_LYRICS_FALLBACK:
-        return None
-    return await get_selected_youtube_subtitle(
-        track,
-        select_manual_subtitle(track),
-        purpose="original lyrics",
-    )
-
-
 async def get_native_metadata_lyrics(track: Track) -> str | None:
+    if not NATIVE_METADATA_LYRICS:
+        return None
     language = get_native_metadata_language(track)
     video_id = get_track_video_id(track)
     if language is None or video_id is None:
@@ -1606,13 +1487,6 @@ async def get_track_lyrics(track: Track) -> str | None:
 
     if lyrics:
         track.lyrics_source = "LRCLIB"
-    else:
-        try:
-            lyrics = await get_youtube_manual_lyrics(track)
-        except (asyncio.TimeoutError, YouTubeSubtitleError, YouTubeCircuitOpenError) as error:
-            logger.warning("YouTube subtitle lookup failed for %s: %s", track.title, error)
-        if lyrics:
-            track.lyrics_source = "YouTube 수동 자막"
 
     track.lyrics = lyrics
     track.lyrics_loaded = True
@@ -3473,16 +3347,15 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                     not used_opus_copy,
                     max(0, attempt_number - 1),
                 )
-                source = BufferedOpusAudio(
-                    discord.FFmpegOpusAudio(
-                        track.stream_url,
-                        bitrate=128,
-                        codec="copy" if used_opus_copy else None,
-                        executable=FFMPEG_EXECUTABLE,
-                        **FFMPEG_OPTIONS,
-                    ),
-                    label=track.title,
+                source = discord.FFmpegOpusAudio(
+                    track.stream_url,
+                    bitrate=128,
+                    codec="copy" if used_opus_copy else None,
+                    executable=FFMPEG_EXECUTABLE,
+                    **FFMPEG_OPTIONS,
                 )
+                if AUDIO_READ_AHEAD:
+                    source = BufferedOpusAudio(source, label=track.title)
             except asyncio.CancelledError:
                 raise
             except Exception:

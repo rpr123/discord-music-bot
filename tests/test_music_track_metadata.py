@@ -26,7 +26,6 @@ class MusicTrackMetadataTests(unittest.TestCase):
             imported_modules,
             {
                 "__future__",
-                "copy",
                 "music_models",
                 "music_search_scoring",
                 "re",
@@ -224,11 +223,6 @@ class MusicTrackMetadataTests(unittest.TestCase):
         )
 
     def test_make_track_from_info_preserves_extracted_metadata(self) -> None:
-        subtitle = {
-            "ext": "vtt",
-            "url": "https://example.test/subtitle",
-            "metadata": {"source": "manual"},
-        }
         info = {
             "id": "abcdefghijk",
             "title": "Song title",
@@ -239,9 +233,6 @@ class MusicTrackMetadataTests(unittest.TestCase):
             "artist": "Artist",
             "track": "Song title",
             "uploader": "Artist - Topic",
-            "subtitles": {"ja": [subtitle]},
-            "automatic_captions": {"ko": [{"url": "ignored"}]},
-            "language": "ja",
             "_music_bot_extracted_at": 123.5,
         }
 
@@ -251,7 +242,6 @@ class MusicTrackMetadataTests(unittest.TestCase):
             "fallback",
             requester_id=42,
         )
-        subtitle["metadata"]["source"] = "changed"
 
         self.assertEqual(track.title, "Song title")
         self.assertEqual(
@@ -268,13 +258,7 @@ class MusicTrackMetadataTests(unittest.TestCase):
         self.assertEqual(track.song_name, "Song title")
         self.assertEqual(track.uploader, "Artist - Topic")
         self.assertEqual(track.audio_codec, "opus")
-        self.assertEqual(track.subtitle_language, "ja")
         self.assertEqual(track.stream_resolved_at, 123.5)
-        self.assertEqual(
-            track.manual_subtitles["ja"][0]["metadata"]["source"],
-            "manual",
-        )
-        self.assertNotIn("ko", track.manual_subtitles)
 
     def test_flat_entries_do_not_expose_an_unresolved_stream_url(self) -> None:
         info = {

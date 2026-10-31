@@ -50,8 +50,6 @@ class Track:
     lyrics: str | None = None
     lyrics_loaded: bool = False
     lyrics_source: str | None = None
-    manual_subtitles: dict[str, list[dict]] = field(default_factory=dict)
-    subtitle_language: str | None = None
     track_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 

@@ -795,52 +795,6 @@ class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
-    def test_track_keeps_manual_but_ignores_automatic_caption_metadata(
-        self,
-    ) -> None:
-        track = music_track_metadata.make_track_from_info(
-            {
-                "id": "captions001",
-                "title": "Captioned song",
-                "webpage_url": "https://www.youtube.com/watch?v=captions001",
-                "subtitles": {
-                    "ja": [{"ext": "json3", "url": "https://example.com/manual"}]
-                },
-                "automatic_captions": {
-                    "en": [{"ext": "json3", "url": "https://example.com/auto-en"}],
-                    "ko": [
-                        {
-                            "ext": "json3",
-                            "url": "https://example.com/auto?lang=ja&tlang=ko",
-                        }
-                    ],
-                },
-                "language": "ja",
-            },
-            "tester",
-            "https://www.youtube.com/watch?v=captions001",
-        )
-
-        self.assertEqual(set(track.manual_subtitles), {"ja"})
-        self.assertFalse(hasattr(track, "korean_automatic_subtitles"))
-        self.assertEqual(track.subtitle_language, "ja")
-
-    async def test_lrclib_miss_falls_back_to_youtube_manual_subtitles(self) -> None:
-        track = make_track("fallback")
-        with (
-            patch.object(bot, "lookup_track_lyrics", return_value=None),
-            patch.object(
-                bot,
-                "get_youtube_manual_lyrics",
-                new=AsyncMock(return_value="manual captions"),
-            ) as youtube_lookup,
-        ):
-            lyrics = await bot.get_track_lyrics(track)
-
-        self.assertEqual(lyrics, "manual captions")
-        self.assertEqual(track.lyrics_source, "YouTube 수동 자막")
-        youtube_lookup.assert_awaited_once_with(track)
-
     async def test_lrclib_miss_retries_with_native_youtube_music_metadata(self) -> None:
         track = bot.Track(
             title="Ano Hana no you ni",
@@ -865,7 +819,6 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
                 "lookup_localized_song",
                 new=AsyncMock(return_value=("あの花のように", "ノクチル")),
             ) as localized_lookup,
-            patch.object(bot, "get_youtube_manual_lyrics", new=AsyncMock()) as youtube_lookup,
         ):
             lyrics = await bot.get_track_lyrics(track)
 
@@ -880,7 +833,24 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
                 ("あの花のように", "ノクチル", "ノクチル"),
             ],
         )
-        youtube_lookup.assert_not_awaited()
+
+    async def test_native_metadata_lyrics_can_be_disabled(self) -> None:
+        track = bot.Track(
+            title="Ano Hana no you ni",
+            webpage_url="https://www.youtube.com/watch?v=S38phza2dn8",
+            requester="tester",
+            source_url="https://www.youtube.com/watch?v=S38phza2dn8",
+            uploader="ノクチル",
+        )
+        with (
+            patch.object(bot, "NATIVE_METADATA_LYRICS", False),
+            patch.object(bot, "lookup_track_lyrics", return_value=None),
+            patch.object(bot, "lookup_localized_song", new=AsyncMock()) as localized_lookup,
+        ):
+            lyrics = await bot.get_track_lyrics(track)
+
+        self.assertIsNone(lyrics)
+        localized_lookup.assert_not_awaited()
 
     async def test_lrclib_failure_skips_native_youtube_music_metadata(self) -> None:
         track = bot.Track(
@@ -897,32 +867,28 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=bot.LyricsLookupError("HTTP Error 503"),
             ),
             patch.object(bot, "lookup_localized_song", new=AsyncMock()) as localized_lookup,
-            patch.object(
-                bot,
-                "get_youtube_manual_lyrics",
-                new=AsyncMock(return_value=None),
-            ),
         ):
             lyrics = await bot.get_track_lyrics(track)
 
         self.assertIsNone(lyrics)
         localized_lookup.assert_not_awaited()
 
-    async def test_lrclib_hit_does_not_request_youtube_subtitles(self) -> None:
+    async def test_lrclib_hit_sets_lyrics_source(self) -> None:
         track = make_track("lrclib")
-        with (
-            patch.object(bot, "lookup_track_lyrics", return_value="lrclib lyrics"),
-            patch.object(
-                bot,
-                "get_youtube_manual_lyrics",
-                new=AsyncMock(),
-            ) as youtube_lookup,
-        ):
+        with patch.object(bot, "lookup_track_lyrics", return_value="lrclib lyrics"):
             lyrics = await bot.get_track_lyrics(track)
 
         self.assertEqual(lyrics, "lrclib lyrics")
         self.assertEqual(track.lyrics_source, "LRCLIB")
-        youtube_lookup.assert_not_awaited()
+
+    async def test_lrclib_miss_leaves_lyrics_empty(self) -> None:
+        track = make_track("missing")
+        with patch.object(bot, "lookup_track_lyrics", return_value=None):
+            lyrics = await bot.get_track_lyrics(track)
+
+        self.assertIsNone(lyrics)
+        self.assertTrue(track.lyrics_loaded)
+        self.assertIsNone(track.lyrics_source)
 
 
 class LyricsMessageTests(unittest.IsolatedAsyncioTestCase):
@@ -5294,7 +5260,7 @@ class HousekeepingTaskTests(unittest.IsolatedAsyncioTestCase):
 class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         bot.housekeeping_tasks.clear()
-        bot.auxiliary_operation_tasks.clear()
+        music_extraction.auxiliary_operation_tasks.clear()
         music_extraction.auxiliary_worker_tasks.clear()
         music_extraction.auxiliary_workers_closing = False
         music_extraction.extraction_shutdown_started = False
@@ -5311,7 +5277,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         tasks = list(
             bot.housekeeping_tasks
-            | bot.auxiliary_operation_tasks
+            | music_extraction.auxiliary_operation_tasks
             | music_extraction.auxiliary_worker_tasks
             | bot.voice_operation_tasks
         )
@@ -5319,7 +5285,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         bot.housekeeping_tasks.clear()
-        bot.auxiliary_operation_tasks.clear()
+        music_extraction.auxiliary_operation_tasks.clear()
         music_extraction.auxiliary_worker_tasks.clear()
         bot.voice_operation_tasks.clear()
         music_extraction.auxiliary_workers_closing = False
@@ -5350,7 +5316,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return "done"
 
-        worker = bot.track_auxiliary_worker(asyncio.create_task(work()))
+        worker = music_extraction.track_auxiliary_worker(asyncio.create_task(work()))
         await started.wait()
         shutdown = asyncio.create_task(bot.shutdown_auxiliary_workers())
         await asyncio.sleep(0)
@@ -5371,7 +5337,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         async def work() -> None:
             completed.set()
 
-        worker = bot.track_auxiliary_worker(asyncio.create_task(work()))
+        worker = music_extraction.track_auxiliary_worker(asyncio.create_task(work()))
         await completed.wait()
 
         self.assertTrue(worker.done())
@@ -5411,7 +5377,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 raise
             return "done"
 
-        worker = bot.track_auxiliary_worker(asyncio.create_task(work()))
+        worker = music_extraction.track_auxiliary_worker(asyncio.create_task(work()))
         await started.wait()
         shutdown = asyncio.create_task(bot.shutdown_auxiliary_workers())
         await asyncio.sleep(0)
@@ -6005,57 +5971,7 @@ class AuxiliaryWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(results[0], RuntimeError)
         to_thread.assert_not_awaited()
         self.assertEqual(semaphore._value, 1)
-        self.assertFalse(bot.auxiliary_operation_tasks)
-
-    async def test_shutdown_waits_for_subtitle_pre_worker_operation(self) -> None:
-        wait_started = asyncio.Event()
-        cancellation_seen = asyncio.Event()
-        release_wait = asyncio.Event()
-        semaphore = asyncio.Semaphore(1)
-        lyrics_job = AsyncMock(return_value="lyrics")
-        track = make_track("subtitle-shutdown")
-
-        async def interval_wait() -> None:
-            wait_started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                cancellation_seen.set()
-                await release_wait.wait()
-
-        with (
-            patch.object(bot, "auxiliary_network_semaphore", semaphore),
-            patch.object(bot, "run_lyrics_job", new=lyrics_job),
-            patch.object(
-                bot,
-                "wait_for_youtube_subtitle_interval",
-                side_effect=interval_wait,
-            ),
-        ):
-            subtitle = asyncio.create_task(
-                bot.get_selected_youtube_subtitle(
-                    track,
-                    ("ko", "json3", "https://example.test/subtitle"),
-                    purpose="shutdown",
-                )
-            )
-            await wait_started.wait()
-            bot.begin_bot_shutdown()
-            shutdown = asyncio.create_task(
-                bot.shutdown_auxiliary_operations()
-            )
-            await cancellation_seen.wait()
-
-            self.assertFalse(shutdown.done())
-            self.assertEqual(semaphore._value, 0)
-            release_wait.set()
-            results = await asyncio.gather(subtitle, return_exceptions=True)
-            await shutdown
-
-        self.assertIsInstance(results[0], RuntimeError)
-        lyrics_job.assert_not_awaited()
-        self.assertEqual(semaphore._value, 1)
-        self.assertFalse(bot.auxiliary_operation_tasks)
+        self.assertFalse(music_extraction.auxiliary_operation_tasks)
 
 
 class LocalMusicTestModeTests(unittest.IsolatedAsyncioTestCase):
@@ -9770,6 +9686,44 @@ class PlaybackSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ffmpeg_opus.call_args.kwargs["codec"], "copy")
         self.assertEqual(ffmpeg_opus.call_args.kwargs["bitrate"], 128)
         schedule_background.assert_called_once_with(guild_id, first)
+
+    async def test_audio_read_ahead_can_be_disabled(self) -> None:
+        class FakeVoice:
+            def is_connected(self) -> bool:
+                return True
+
+            def is_playing(self) -> bool:
+                return False
+
+            def is_paused(self) -> bool:
+                return False
+
+            def play(self, source: object, *, after: object) -> None:
+                self.source = source
+
+        guild_id = 461
+        track = make_track("plain")
+        track.stream_url = "https://example.test/fresh.opus"
+        track.stream_resolved_at = bot.time.monotonic()
+        track.audio_codec = "opus"
+        voice = FakeVoice()
+        state = bot.get_state(guild_id)
+        state.voice = voice
+        state.queue.append(track)
+
+        with (
+            patch.object(bot, "AUDIO_READ_AHEAD", False),
+            patch.object(bot, "ffmpeg_is_available", return_value=True),
+            patch.object(
+                bot.discord,
+                "FFmpegOpusAudio",
+                return_value=MagicMock(),
+            ) as ffmpeg_source,
+            patch.object(bot, "schedule_noncritical_tasks"),
+        ):
+            await bot.play_next(guild_id, announce=False)
+
+        self.assertIs(voice.source, ffmpeg_source.return_value)
 
     async def test_repeat_one_preserves_a_fresh_stream_url(self) -> None:
         class FakeVoice:

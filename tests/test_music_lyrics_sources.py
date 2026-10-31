@@ -39,7 +39,6 @@ class MusicLyricsSourcesTests(unittest.TestCase):
             imported_modules,
             {
                 "__future__",
-                "html",
                 "json",
                 "music_config",
                 "music_models",
@@ -52,24 +51,6 @@ class MusicLyricsSourcesTests(unittest.TestCase):
                 "urllib.parse",
                 "urllib.request",
             },
-        )
-
-    def test_candidates_ignore_malformed_and_unsupported_formats(self) -> None:
-        candidates = music_lyrics_sources.get_subtitle_candidates(
-            {
-                "ja": [
-                    {"ext": "srt", "url": "https://example.test/unsupported"},
-                    None,
-                    {"ext": "JSON3", "url": "https://example.test/json3"},
-                    {"ext": "vtt", "url": ""},
-                ],
-                "en": "not-a-list",
-            }
-        )
-
-        self.assertEqual(
-            candidates,
-            [("ja", "json3", "https://example.test/json3", 30)],
         )
 
     def test_title_aliases_include_full_and_split_script_variants(self) -> None:
@@ -526,53 +507,4 @@ class LyricsLookupTests(unittest.TestCase):
                     "plainLyrics": "should not be shown",
                 }
             )
-        )
-
-
-class LyricsSourceParsingTests(unittest.TestCase):
-    def test_json3_manual_subtitles_are_converted_to_plain_lyrics(self) -> None:
-        payload = json.dumps(
-            {
-                "events": [
-                    {"segs": [{"utf8": "君の声が"}, {"utf8": "聞こえる"}]},
-                    {"segs": [{"utf8": "夜を越えて"}]},
-                    {"segs": [{"utf8": "夜を越えて"}]},
-                ]
-            }
-        )
-
-        self.assertEqual(
-            music_lyrics_sources.extract_json3_lyrics(payload),
-            "君の声が聞こえる\n夜を越えて",
-        )
-
-    def test_invalid_json3_document_is_rejected(self) -> None:
-        with self.assertRaises(music_lyrics_sources.YouTubeSubtitleError):
-            music_lyrics_sources.extract_json3_lyrics("[]")
-
-    def test_vtt_manual_subtitles_drop_timestamps_and_markup(self) -> None:
-        payload = (
-            "WEBVTT\n\n"
-            "00:00:01.000 --> 00:00:03.000\n"
-            "<c>First &amp; second</c>\n\n"
-            "00:00:03.000 --> 00:00:05.000\n"
-            "Next line\n"
-        )
-
-        self.assertEqual(
-            music_lyrics_sources.extract_vtt_lyrics(payload),
-            "First & second\nNext line",
-        )
-
-    def test_original_language_manual_subtitle_is_preferred(self) -> None:
-        track = make_track("captioned")
-        track.subtitle_language = "ja"
-        track.manual_subtitles = {
-            "en": [{"ext": "json3", "url": "https://example.com/en"}],
-            "ja": [{"ext": "vtt", "url": "https://example.com/ja"}],
-        }
-
-        self.assertEqual(
-            music_lyrics_sources.select_manual_subtitle(track),
-            ("ja", "vtt", "https://example.com/ja"),
         )

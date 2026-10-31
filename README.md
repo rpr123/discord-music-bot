@@ -97,7 +97,6 @@ Copy-Item .env.example .env
 | `YTDL_MAX_CONCURRENT_EXTRACTIONS` | `1` | 동시에 실행할 yt-dlp 작업 수 |
 | `YTDL_MIN_INTERVAL_SECONDS` | `6` | 일반 yt-dlp 작업 사이 최소 간격 |
 | `AUTOPLAY_MIN_INTERVAL_SECONDS` | `15` | 백그라운드 자동재생 조회 사이 최소 간격 |
-| `YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS` | `6` | 수동 자막 조회 사이 최소 간격 |
 | `YTDL_CACHE_TTL_SECONDS` / `YTDL_CACHE_MAX_ENTRIES` | `180` / `16` | 검색 결과 메모리 캐시 유지 시간과 개수 |
 | `YOUTUBE_CIRCUIT_BREAKER_SECONDS` | `1800` | 429·봇 확인 오류 뒤 새 YouTube 요청을 막는 시간 |
 | `STREAM_URL_MAX_AGE_SECONDS` | `900` | 이보다 오래 대기한 곡은 재생 직전에 스트림 주소를 새로 받음 |
@@ -120,13 +119,14 @@ Copy-Item .env.example .env
 | `LYRICS_API_URL` | `https://lrclib.net/api/search` | LRCLIB 검색 주소 |
 | `LYRICS_REQUEST_TIMEOUT_SECONDS` | `10` | LRCLIB 요청 하나의 제한 시간. 재시도를 포함한 한 곡 조회는 이 값의 6배 안에서 끝남 |
 | `LYRICS_START_DELAY_SECONDS` | `3` | 곡 시작 뒤 가사 조회를 시작하기까지의 지연 |
-| `YOUTUBE_LYRICS_FALLBACK` | `true` | LRCLIB 결과가 없을 때 YouTube 수동 자막 사용 |
+| `NATIVE_METADATA_LYRICS` | `true` | 로마자 곡명을 YouTube Music의 일본어·한국어 메타데이터로 다시 찾기 |
 
 ### 로그와 기타
 
 | 설정 | 기본값 | 의미 |
 | --- | --- | --- |
 | `FFMPEG_PATH` | PATH의 `ffmpeg` | FFmpeg 실행 파일 경로 |
+| `AUDIO_READ_AHEAD` | `true` | 재생 중 최대 10초 미리 읽기. 끄면 FFmpeg 출력을 바로 보냄 |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `AUTOPLAY_LOG_ENABLED` | `true` | 자동재생 검색·선택 JSONL 기록 |
 | `AUTOPLAY_LOG_FILE` | `logs/autoplay.jsonl` | 자동재생 기록 파일 |
@@ -250,8 +250,8 @@ https://www.youtube.com/playlist?list=...
 ### 가사
 
 - 곡이 재생되고 `LYRICS_START_DELAY_SECONDS` 뒤 LRCLIB에서 현재 곡을 찾아 전용 채널에 원문 가사 메시지를 보냅니다. 곡이 바뀌면 같은 메시지를 수정하고, 재생목록이 끝나거나 정지·퇴장하면 삭제합니다.
-- 곡명이 로마자인데 채널·아티스트 이름에 가나(또는 한글)가 있으면, LRCLIB에서 못 찾았을 때 YouTube Music에 일본어(또는 한국어)로 그 영상의 곡명·아티스트를 한 번 물어 LRCLIB를 다시 찾습니다. 영어 메타데이터가 `Ano Hana no you ni / noctchill`처럼 로마자로 오지만 LRCLIB에는 `あの花のように / ノクチル`로 올라가 있기 때문입니다. LRCLIB 조회가 실패(503 등)한 경우에는 하지 않습니다.
-- LRCLIB에 결과가 없거나 조회에 실패하면 해당 영상의 YouTube 수동 자막을 한 번 더 확인합니다. 자동 생성 자막은 쓰지 않으며, 재생할 때 이미 조회한 영상 정보를 재사용하므로 영상을 다시 검색하지 않습니다. 두 출처 모두 없으면 `미제공`으로 표시합니다. `YOUTUBE_LYRICS_FALLBACK=false`로 자막 fallback을 끌 수 있습니다.
+- 곡명이 로마자인데 채널·아티스트 이름에 가나(또는 한글)가 있으면, LRCLIB에서 못 찾았을 때 YouTube Music에 일본어(또는 한국어)로 그 영상의 곡명·아티스트를 한 번 물어 LRCLIB를 다시 찾습니다. 영어 메타데이터가 `Ano Hana no you ni / noctchill`처럼 로마자로 오지만 LRCLIB에는 `あの花のように / ノクチル`로 올라가 있기 때문입니다. LRCLIB 조회가 실패(503 등)한 경우에는 하지 않습니다. `NATIVE_METADATA_LYRICS=false`로 끌 수 있습니다.
+- LRCLIB에서 찾지 못하면 `미제공`으로 표시합니다. YouTube 자막은 가사로 쓰지 않습니다.
 - 제목이 `곡명 - 아티스트` 순서여도 채널명이나 YouTube 아티스트 정보와 맞는 쪽을 아티스트로 봅니다. 판단할 수 없으면 곡명만으로 찾은 뒤 반대 순서로 한 번 더 찾습니다. `/` 구분자도 인식하고, 아티스트가 여러 명이면 첫 아티스트로 검색합니다.
 - 같은 곡의 로마자판과 원문 문자판이 함께 검색되면 원문 문자판을 우선합니다. 아티스트가 일치하지 않는 결과는 영상 제목이 주로 일본어·한국어 같은 비라틴 문자인데 가사가 그렇지 않으면 다른 곡으로 보고 버립니다.
 - LRCLIB가 과부하(HTTP 503)나 요청 제한(429)을 반환하면 2초, 5초, 10초, 15초 간격으로 다시 시도합니다. 한 곡의 LRCLIB 조회는 재시도를 포함해 `LYRICS_REQUEST_TIMEOUT_SECONDS`의 6배(기본 60초) 안에서 끝냅니다.
@@ -264,6 +264,7 @@ https://www.youtube.com/playlist?list=...
 - 곡 시작과 버퍼가 바닥난 뒤에는 2초 분량이 쌓일 때까지 무음을 보내며 기다렸다가 멈춘 위치부터 이어서 재생합니다. YouTube 스트림이 잠깐 멈춰도 소리가 끊기거나 밀린 소리를 몰아 보내 빨라지지 않습니다.
 - 서버가 잠깐 멈춰 프레임이 늦어져도 밀린 프레임을 몰아 보내지 않고 그 시점부터 다시 일정하게 보냅니다.
 - 버퍼가 바닥났던 시간은 `Audio buffer ran dry` 로그로 남습니다.
+- `AUDIO_READ_AHEAD=false`면 미리 읽기 없이 FFmpeg 출력을 discord.py에 바로 넘깁니다.
 
 ### YouTube 요청 관리
 
@@ -271,7 +272,7 @@ https://www.youtube.com/playlist?list=...
 - 일반 작업 사이에는 `YTDL_MIN_INTERVAL_SECONDS`, 백그라운드 자동재생 조회에는 더 보수적인 `AUTOPLAY_MIN_INTERVAL_SECONDS`를 둡니다. 사용자가 직접 실행한 검색과 `autoN:` 요청은 일반 간격을 씁니다.
 - 현재 곡 재생에 필요한 스트림 해석은 간격을 기다리지 않고, 간격을 기다리는 자동재생 작업보다 먼저 실행됩니다.
 - 곡이 시작되면 가사는 `LYRICS_START_DELAY_SECONDS`, 자동재생은 `AUTOPLAY_START_DELAY_SECONDS` 뒤에 시작해 FFmpeg·자동재생·가사 조회가 곡 전환 순간에 몰리지 않게 합니다.
-- YouTube Music 메타데이터와 수동 자막 조회는 yt-dlp worker와 분리된 보조 네트워크 슬롯 하나를 쓰고 각자의 간격을 따르므로, 느린 자막 요청이 재생용 스트림 해석을 막지 않습니다.
+- YouTube Music 메타데이터 조회는 yt-dlp worker와 분리된 보조 네트워크 슬롯 하나를 쓰므로, 느린 메타데이터 요청이 재생용 스트림 해석을 막지 않습니다.
 - Music 결과와 일반 검색 결과는 `YTDL_CACHE_TTL_SECONDS` 동안 메모리에서 재사용하며, 저사양 서버에 맞춰 기본 16개로 제한합니다.
 - 429 또는 봇 확인 오류가 감지되면 `YOUTUBE_CIRCUIT_BREAKER_SECONDS` 동안 새 YouTube 요청을 즉시 거절해 차단을 더 악화시키지 않습니다.
 

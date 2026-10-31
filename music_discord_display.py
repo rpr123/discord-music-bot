@@ -331,7 +331,7 @@ def make_lyrics_embed(track: Track, description: str) -> discord.Embed:
     if artist:
         embed.set_author(name=truncate_text(artist, 200))
 
-    source = track.lyrics_source or "LRCLIB → YouTube 수동 자막"
+    source = track.lyrics_source or "LRCLIB"
     embed.set_footer(text=f"{source} · 원문 가사")
     return embed
 

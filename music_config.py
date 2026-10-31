@@ -123,7 +123,13 @@ LYRICS_API_URL = os.getenv("LYRICS_API_URL", "https://lrclib.net/api/search")
 LYRICS_REQUEST_TIMEOUT_SECONDS = parse_positive_int_env(
     "LYRICS_REQUEST_TIMEOUT_SECONDS", 10
 )
-YOUTUBE_LYRICS_FALLBACK = os.getenv("YOUTUBE_LYRICS_FALLBACK", "true").lower() not in {
+NATIVE_METADATA_LYRICS = os.getenv("NATIVE_METADATA_LYRICS", "true").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+AUDIO_READ_AHEAD = os.getenv("AUDIO_READ_AHEAD", "true").lower() not in {
     "0",
     "false",
     "no",
@@ -135,10 +141,6 @@ YTDL_MAX_CONCURRENT_EXTRACTIONS = parse_positive_int_env(
 )
 STREAM_URL_MAX_AGE_SECONDS = parse_positive_int_env("STREAM_URL_MAX_AGE_SECONDS", 900)
 YTDL_MIN_INTERVAL_SECONDS = parse_nonnegative_float_env("YTDL_MIN_INTERVAL_SECONDS", 6.0)
-YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS = parse_nonnegative_float_env(
-    "YOUTUBE_SUBTITLE_MIN_INTERVAL_SECONDS",
-    YTDL_MIN_INTERVAL_SECONDS,
-)
 YTDL_CACHE_TTL_SECONDS = parse_positive_int_env("YTDL_CACHE_TTL_SECONDS", 180)
 YTDL_CACHE_MAX_ENTRIES = parse_positive_int_env("YTDL_CACHE_MAX_ENTRIES", 16)
 YOUTUBE_SEARCH_CANDIDATES = min(
