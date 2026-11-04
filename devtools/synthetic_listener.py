@@ -94,6 +94,25 @@ async def do_nothing(*args, **kwargs) -> None:
     return None
 
 
+LYRICS_SEARCHING = "가사를 찾고 있어요..."
+
+
+async def log_lyrics_result(
+    guild_id, state, track, description: str, *, attachment_lyrics=None
+) -> None:
+    # Stands in for the Discord lyrics message so each lookup's outcome is kept.
+    if description == LYRICS_SEARCHING:
+        return
+    lyrics = track.lyrics or ""
+    logger.info(
+        "Synthetic lyrics result: found=%s source=%s lines=%s title=%s",
+        "yes" if lyrics else "no",
+        track.lyrics_source or "-",
+        len(lyrics.splitlines()),
+        track.title,
+    )
+
+
 def last_real_playback_at() -> float | None:
     try:
         with CONSOLE_LOG.open("rb") as log:
@@ -134,8 +153,8 @@ def pick_seed_title() -> str:
 def install() -> None:
     music_bot.bot = MagicMock()
     music_bot.bot.loop = asyncio.get_running_loop()
+    music_bot.upsert_lyrics_message = log_lyrics_result
     for name in (
-        "upsert_lyrics_message",
         "clear_lyrics_message",
         "update_control_panel",
         "show_idle_panel",

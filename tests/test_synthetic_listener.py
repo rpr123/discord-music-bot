@@ -1,5 +1,7 @@
+import asyncio
 import threading
 import unittest
+from types import SimpleNamespace
 
 from devtools import synthetic_listener
 
@@ -48,6 +50,33 @@ class FakeVoiceTests(unittest.TestCase):
 
         self.assertEqual(self.play(source), [None])
         self.assertEqual(source.frames, 0)
+
+
+class LyricsResultLogTests(unittest.TestCase):
+    def log_for(self, lyrics: str | None, source: str | None, description: str):
+        track = SimpleNamespace(title="Song", lyrics=lyrics, lyrics_source=source)
+        with self.assertLogs("music-bot", level="INFO") as logs:
+            synthetic_listener.logger.info("marker")
+            asyncio.run(
+                synthetic_listener.log_lyrics_result(1, None, track, description)
+            )
+        return logs.output[1:]
+
+    def test_found_lyrics_are_logged(self) -> None:
+        output = self.log_for("a\nb\nc", "LRCLIB", "a\nb\nc")
+
+        self.assertEqual(len(output), 1)
+        self.assertIn("found=yes source=LRCLIB lines=3 title=Song", output[0])
+
+    def test_missing_lyrics_are_logged(self) -> None:
+        output = self.log_for(None, None, "미제공")
+
+        self.assertIn("found=no source=- lines=0 title=Song", output[0])
+
+    def test_searching_placeholder_is_not_logged(self) -> None:
+        self.assertEqual(
+            self.log_for(None, None, synthetic_listener.LYRICS_SEARCHING), []
+        )
 
 
 if __name__ == "__main__":
