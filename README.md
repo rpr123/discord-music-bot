@@ -310,6 +310,18 @@ python -m devtools.local_music_bot ./test-tone.wav --bulk-tracks 3
 
 이 프로세스에서는 위 신청 경로에 번호가 붙은 로컬 테스트 트랙이 생성됩니다. 일반 `python bot.py` 실행에는 테스트 코드나 테스트 설정이 적용되지 않습니다.
 
+### Discord 없이 YouTube 재생 부하 재현
+
+`devtools/synthetic_listener.py`는 봇의 재생·자동재생·가사 코드를 Discord 없이 그대로 돌리는 가상 청취자입니다. 지난 재생 기록(`logs/console*.log`)에서 고른 곡을 신청하고 자동재생으로 이어 들으며, 오디오는 FFmpeg로 실제 재생 속도만큼 받습니다. YouTube 요청이 봇과 같은 경로로 나가므로 실제 사용 없이도 차단 조건을 시험할 수 있습니다.
+
+```bash
+python devtools/synthetic_listener.py --hours 10 --requests 2 >> logs/synthetic.log 2>&1
+```
+
+- `logs/console.log`에 최근 10분 안에 실제 봇의 재생 기록이 있으면 곡을 넘길 때마다 기다립니다.
+- YouTube 차단·요청 제한으로 회로차단기가 열리면 세션을 끝내고 종료 코드 2를 돌려줍니다.
+- 자동재생 기록은 `logs/synthetic-autoplay.jsonl`에 따로 남습니다.
+
 ## 참고
 
 - 음악 재생은 `yt-dlp`와 `FFmpeg`를 사용합니다.
