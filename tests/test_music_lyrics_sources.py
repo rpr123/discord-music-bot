@@ -332,6 +332,56 @@ class LyricsLookupTests(unittest.TestCase):
             [("eve", "廻廻奇譚"), ("eve", None), ("廻廻奇譚", "eve")],
         )
 
+    def test_title_alias_in_parentheses_is_searched_separately(self) -> None:
+        cases = [
+            # LRCLIB lists the first under its native title, the second
+            # under its romanized one.
+            ("ファイトソング (Fight Song) - Eve Music Video", "ファイトソング", 0),
+            ("ぼくらの (Bokurano) - Eve Music Video", "Bokurano", 1),
+        ]
+        for title, record_name, alias_index in cases:
+            with self.subTest(title=title):
+                track = make_track(title)
+                track.uploader = "Eve"
+                track.duration = 260
+                record = {
+                    "trackName": record_name,
+                    "artistName": "Eve",
+                    "duration": 258,
+                    "instrumental": False,
+                    "plainLyrics": "歌詞",
+                }
+                name, artist = music_lyrics_sources.get_lyrics_search_terms(track)
+                aliases = music_lyrics_sources.split_title_alias(name)
+                responses = [[], []] + [[]] * alias_index + [[record]]
+
+                with patch.object(
+                    music_lyrics_sources,
+                    "request_lyrics_records",
+                    side_effect=responses,
+                ) as request:
+                    lyrics = music_lyrics_sources.lookup_track_lyrics(track)
+
+                self.assertEqual(lyrics, "歌詞")
+                self.assertEqual(
+                    [call.args for call in request.call_args_list],
+                    [(name, artist), (name, None)]
+                    + [(alias, artist) for alias in aliases[: alias_index + 1]],
+                )
+
+    def test_title_alias_needs_two_scripts(self) -> None:
+        self.assertEqual(
+            music_lyrics_sources.split_title_alias("ファイトソング (fight song)"),
+            ["ファイトソング", "fight song"],
+        )
+        self.assertEqual(
+            music_lyrics_sources.split_title_alias("あびすいんざわーるど(abyss in the world)"),
+            ["あびすいんざわーるど", "abyss in the world"],
+        )
+        for value in ("song (live)", "夜に駆ける (アコースティック)", "plain title"):
+            with self.subTest(value=value):
+                self.assertEqual(music_lyrics_sources.split_title_alias(value), [])
+
     def test_native_title_rejects_foreign_lyrics_without_artist_match(self) -> None:
         record = {
             "trackName": "Eve",

@@ -32,6 +32,9 @@ LYRICS_LOOKUP_TIMEOUT_SECONDS = LYRICS_REQUEST_TIMEOUT_SECONDS * 6
 LRC_TIMESTAMP_RE = re.compile(
     r"\[(?:(?:\d{1,2}):)?\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]"
 )
+# "ファイトソング (Fight Song)": a native title with its romanized or
+# translated name in parentheses. LRCLIB lists the song under one of them.
+TITLE_WITH_ALIAS_RE = re.compile(r"(.+?)\s*[(（]([^()（）]+)[)）]")
 LRC_METADATA_RE = re.compile(
     r"^\[(?:ar|ti|al|by|offset|length|re|ve):.*\]\s*$",
     flags=re.IGNORECASE,
@@ -120,6 +123,21 @@ def get_native_metadata_language(track: Track) -> str | None:
     if any(name.startswith("HANGUL") for name in character_names):
         return "ko"
     return None
+
+
+def split_title_alias(value: str) -> list[str]:
+    match = TITLE_WITH_ALIAS_RE.fullmatch(value.strip())
+    if not match:
+        return []
+    names = [part.strip() for part in match.groups()]
+    native = [
+        non_latin_letter_ratio(name) >= LYRICS_NATIVE_SCRIPT_MIN_RATIO
+        for name in names
+    ]
+    # Same-script parentheses are usually versions, e.g. "(Live)".
+    if not all(names) or native[0] == native[1]:
+        return []
+    return names
 
 
 def lyrics_native_script_ratio(record: dict) -> float:
@@ -345,4 +363,15 @@ def lookup_track_lyrics(track: Track) -> str | None:
                 "LRCLIB swapped title and artist matched lyrics for %s",
                 track.title,
             )
+    for name, artist in search_candidates:
+        for alias in split_title_alias(name):
+            if record is not None:
+                break
+            record = find_record(alias, artist, artist)
+            if record is not None:
+                logger.info(
+                    "LRCLIB title alias %s matched lyrics for %s",
+                    alias,
+                    track.title,
+                )
     return extract_original_lyrics(record) if record else None
