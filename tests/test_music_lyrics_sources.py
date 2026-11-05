@@ -455,6 +455,42 @@ class LyricsLookupTests(unittest.TestCase):
             search.call_count, music_lyrics_sources.LYRICS_SEGMENT_SEARCH_LIMIT
         )
 
+    def native_song_for(self, results: list[dict], duration: int | None = 248):
+        track = make_track("Ano Hana no you ni")
+        track.song_name = "Ano Hana no you ni"
+        track.artist = "noctchill"
+        track.uploader = "ノクチル"
+        track.duration = duration
+        with patch.object(
+            music_lyrics_sources, "request_itunes_songs", return_value=results
+        ) as request:
+            song = music_lyrics_sources.lookup_native_song(track, "ja")
+        return song, request
+
+    def test_itunes_japan_store_gives_the_native_title(self) -> None:
+        song, request = self.native_song_for(
+            [
+                {"trackName": "あの花のように (Off Vocal)", "artistName": "ノクチル", "trackTimeMillis": 247100},
+                {"trackName": "別の曲", "artistName": "ノクチル", "trackTimeMillis": 200000},
+                {"trackName": "あの花のように", "artistName": "ノクチル", "trackTimeMillis": 247600},
+            ]
+        )
+
+        self.assertEqual(song, ("あの花のように", "ノクチル"))
+        params = request.call_args.args[0]
+        self.assertEqual(params["term"], "ano hana no you ni noctchill")
+        self.assertEqual((params["country"], params["lang"]), ("JP", "ja_jp"))
+
+    def test_itunes_result_must_match_the_track_length(self) -> None:
+        song, _ = self.native_song_for(
+            [{"trackName": "あの花のように", "artistName": "ノクチル", "trackTimeMillis": 300000}]
+        )
+        self.assertIsNone(song)
+
+        song, request = self.native_song_for([], duration=None)
+        self.assertIsNone(song)
+        request.assert_not_called()
+
     def test_title_alias_needs_two_scripts(self) -> None:
         self.assertEqual(
             music_lyrics_sources.split_title_alias("ファイトソング (fight song)"),

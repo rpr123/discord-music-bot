@@ -85,7 +85,6 @@ T = TypeVar("T")
 
 youtube_music_client: YTMusic | None = None
 youtube_music_client_lock = threading.Lock()
-localized_youtube_music_clients: dict[str, YTMusic] = {}
 auxiliary_network_semaphore = asyncio.Semaphore(1)
 auxiliary_operation_tasks: set[asyncio.Task] = set()
 auxiliary_worker_tasks: set[asyncio.Task] = set()
@@ -279,15 +278,6 @@ def get_youtube_music_client() -> YTMusic:
         return youtube_music_client
 
 
-def get_localized_youtube_music_client(language: str) -> YTMusic:
-    with youtube_music_client_lock:
-        client = localized_youtube_music_clients.get(language)
-        if client is None:
-            client = create_youtube_music_client(language)
-            localized_youtube_music_clients[language] = client
-        return client
-
-
 def get_youtube_music_cache_key(query: str) -> str:
     return unicodedata.normalize("NFKC", query).casefold().strip()
 
@@ -412,54 +402,6 @@ async def search_youtube_music(query: str) -> list[dict]:
     operation_task = track_auxiliary_operation()
     try:
         return await _search_youtube_music_operation(query)
-    finally:
-        auxiliary_operation_tasks.discard(operation_task)
-
-
-def parse_localized_song(playlist: dict, video_id: str) -> tuple[str, str | None] | None:
-    tracks = playlist.get("tracks") if isinstance(playlist, dict) else None
-    if not tracks or not isinstance(tracks[0], dict):
-        return None
-    track = tracks[0]
-    title = track.get("title")
-    if track.get("videoId") != video_id or not isinstance(title, str) or not title:
-        return None
-    artist = next(
-        (
-            artist["name"]
-            for artist in track.get("artists") or []
-            if isinstance(artist, dict) and isinstance(artist.get("name"), str)
-        ),
-        None,
-    )
-    return title, artist
-
-
-async def lookup_localized_song(
-    video_id: str,
-    language: str,
-) -> tuple[str, str | None] | None:
-    """Return the (song, artist) YouTube Music shows for a video in a language."""
-    if extraction_shutdown_started:
-        raise asyncio.CancelledError
-    if not YOUTUBE_MUSIC_SEARCH_ENABLED:
-        return None
-    operation_task = track_auxiliary_operation()
-    try:
-        ensure_youtube_circuit_closed()
-        logger.info("YouTube Music %s song lookup start: %s", language, video_id)
-
-        def lookup() -> tuple[str, str | None] | None:
-            playlist = get_localized_youtube_music_client(language).get_watch_playlist(
-                videoId=video_id,
-                limit=1,
-            )
-            return parse_localized_song(playlist, video_id)
-
-        return await run_youtube_music_request(
-            f"{language} song lookup for {video_id}",
-            lookup,
-        )
     finally:
         auxiliary_operation_tasks.discard(operation_task)
 

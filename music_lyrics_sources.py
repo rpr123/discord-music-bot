@@ -42,6 +42,15 @@ TITLE_SEGMENT_SPLIT_RE = re.compile(
     r"\s+[-–—|,]\s+|\s*/\s*|[「」『』【】\[\]()（）［］]"
 )
 TITLE_SEGMENT_EDGE_CHARACTERS = " -–—~|:"
+# The iTunes store of the song's language turns a romanized query into the
+# native title, without sending YouTube any extra request.
+ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
+ITUNES_STORES = {"ja": ("JP", "ja_jp"), "ko": ("KR", "ko_kr")}
+ITUNES_DURATION_TOLERANCE_SECONDS = 3
+ITUNES_NON_VOCAL_RE = re.compile(
+    r"off\s*vocal|instrumental|karaoke|\binst\b|オフボーカル|カラオケ|\bmr\b",
+    flags=re.IGNORECASE,
+)
 LYRICS_SEGMENT_SEARCH_LIMIT = 3
 LRC_METADATA_RE = re.compile(
     r"^\[(?:ar|ti|al|by|offset|length|re|ve):.*\]\s*$",
@@ -206,6 +215,66 @@ def select_title_segment_record(records: list[dict], track: Track) -> dict | Non
         return abs(float(duration) - track.duration)
 
     return min(matches, key=duration_difference)
+
+
+def request_itunes_songs(params: dict[str, str]) -> list[dict]:
+    url = f"{ITUNES_SEARCH_URL}?{urllib.parse.urlencode(params)}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": (
+                "discord-music-bot/1.0 "
+                "(https://github.com/rpr123/discord-music-bot)"
+            ),
+        },
+    )
+    try:
+        with urllib.request.urlopen(
+            request, timeout=float(LYRICS_REQUEST_TIMEOUT_SECONDS)
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError) as error:
+        raise LyricsLookupError(str(error)) from error
+    results = payload.get("results") if isinstance(payload, dict) else None
+    return [result for result in results or [] if isinstance(result, dict)]
+
+
+def lookup_native_song(track: Track, language: str) -> tuple[str, str | None] | None:
+    """Return the native (song, artist) the iTunes store lists for a track."""
+    store = ITUNES_STORES.get(language)
+    if store is None or track.duration is None:
+        return None
+    song_name, artist_name = get_lyrics_search_terms(track)
+    term = " ".join(value for value in (song_name, artist_name) if value)
+    if not term:
+        return None
+    country, store_language = store
+    results = request_itunes_songs(
+        {
+            "term": term,
+            "country": country,
+            "lang": store_language,
+            "media": "music",
+            "entity": "song",
+            "limit": "10",
+        }
+    )
+    for result in results:
+        name = result.get("trackName")
+        milliseconds = result.get("trackTimeMillis")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(milliseconds, (int, float)):
+            continue
+        # Same-length karaoke and off-vocal tracks have no lyrics to find.
+        if ITUNES_NON_VOCAL_RE.search(name):
+            continue
+        if abs(milliseconds / 1000 - track.duration) > ITUNES_DURATION_TOLERANCE_SECONDS:
+            continue
+        artist = result.get("artistName")
+        return name.strip(), artist.strip() if isinstance(artist, str) else None
+    return None
 
 
 def lyrics_native_script_ratio(record: dict) -> float:

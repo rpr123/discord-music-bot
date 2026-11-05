@@ -889,51 +889,6 @@ class YouTubeMusicProtectionTests(unittest.IsolatedAsyncioTestCase):
         to_thread.assert_not_awaited()
         self.assertEqual(semaphore._value, 1)
 
-    async def test_localized_song_lookup_reads_the_first_watch_track(self) -> None:
-        client = MagicMock()
-        client.get_watch_playlist.return_value = {
-            "tracks": [
-                {
-                    "videoId": "S38phza2dn8",
-                    "title": "あの花のように",
-                    "artists": [{"name": "ノクチル", "id": "x"}],
-                },
-                {"videoId": "other000000", "title": "Other"},
-            ]
-        }
-
-        with (
-            patch.object(
-                asyncio,
-                "to_thread",
-                new=AsyncMock(side_effect=lambda function: function()),
-            ),
-            patch.object(music_extraction, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
-            patch.object(music_extraction, "YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS", 0.0),
-            patch.object(
-                music_extraction,
-                "get_localized_youtube_music_client",
-                return_value=client,
-            ) as get_client,
-        ):
-            song = await music_extraction.lookup_localized_song("S38phza2dn8", "ja")
-
-        self.assertEqual(song, ("あの花のように", "ノクチル"))
-        get_client.assert_called_once_with("ja")
-        client.get_watch_playlist.assert_called_once_with(
-            videoId="S38phza2dn8",
-            limit=1,
-        )
-
-    def test_localized_song_ignores_a_different_first_video(self) -> None:
-        self.assertIsNone(
-            music_extraction.parse_localized_song(
-                {"tracks": [{"videoId": "other000000", "title": "Other"}]},
-                "S38phza2dn8",
-            )
-        )
-        self.assertIsNone(music_extraction.parse_localized_song({}, "S38phza2dn8"))
-
 
 if __name__ == "__main__":
     unittest.main()

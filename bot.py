@@ -73,7 +73,6 @@ from music_extraction import (
     extract_auto_tracks_from_seed,
     extract_track,
     extract_tracks,
-    lookup_localized_song,
     parse_auto_request,
     resolve_track_stream,
     shutdown_auxiliary_operations,
@@ -83,10 +82,11 @@ from music_lyrics_sources import (
     LYRICS_LOOKUP_TIMEOUT_SECONDS,
     LyricsLookupError,
     get_native_metadata_language,
+    lookup_native_song,
     lookup_track_lyrics,
 )
 from music_request_parsing import parse_music_request
-from music_track_metadata import get_track_identity_keys, get_track_video_id
+from music_track_metadata import get_track_identity_keys
 from music_config import (
     AUDIO_READ_AHEAD,
     AUTOPLAY_BUTTON_CUSTOM_ID,
@@ -1423,16 +1423,18 @@ async def get_native_metadata_lyrics(track: Track) -> str | None:
     if not NATIVE_METADATA_LYRICS:
         return None
     language = get_native_metadata_language(track)
-    video_id = get_track_video_id(track)
-    if language is None or video_id is None:
+    if language is None:
         return None
     try:
-        song = await lookup_localized_song(video_id, language)
+        song = await asyncio.wait_for(
+            run_lyrics_job(lookup_native_song, track, language),
+            timeout=LYRICS_LOOKUP_TIMEOUT_SECONDS + 2,
+        )
     except asyncio.CancelledError:
         raise
     except Exception as error:
         logger.warning(
-            "YouTube Music %s metadata lookup failed for %s: %s",
+            "iTunes %s metadata lookup failed for %s: %s",
             language,
             track.title,
             error,

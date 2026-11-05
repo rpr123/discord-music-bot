@@ -795,7 +795,7 @@ class AutoRequestEnqueueTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
-    async def test_lrclib_miss_retries_with_native_youtube_music_metadata(self) -> None:
+    async def test_lrclib_miss_retries_with_native_itunes_metadata(self) -> None:
         track = bot.Track(
             title="Ano Hana no you ni",
             webpage_url="https://www.youtube.com/watch?v=S38phza2dn8",
@@ -816,16 +816,16 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "lookup_track_lyrics", side_effect=lookup),
             patch.object(
                 bot,
-                "lookup_localized_song",
-                new=AsyncMock(return_value=("あの花のように", "ノクチル")),
-            ) as localized_lookup,
+                "lookup_native_song",
+                return_value=("あの花のように", "ノクチル"),
+            ) as native_lookup,
         ):
             lyrics = await bot.get_track_lyrics(track)
 
         self.assertEqual(lyrics, "native lyrics")
         self.assertEqual(track.lyrics_source, "LRCLIB")
         self.assertEqual(track.song_name, "Ano Hana no you ni")
-        localized_lookup.assert_awaited_once_with("S38phza2dn8", "ja")
+        native_lookup.assert_called_once_with(track, "ja")
         self.assertEqual(
             searched,
             [
@@ -845,14 +845,14 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(bot, "NATIVE_METADATA_LYRICS", False),
             patch.object(bot, "lookup_track_lyrics", return_value=None),
-            patch.object(bot, "lookup_localized_song", new=AsyncMock()) as localized_lookup,
+            patch.object(bot, "lookup_native_song") as native_lookup,
         ):
             lyrics = await bot.get_track_lyrics(track)
 
         self.assertIsNone(lyrics)
-        localized_lookup.assert_not_awaited()
+        native_lookup.assert_not_called()
 
-    async def test_lrclib_failure_skips_native_youtube_music_metadata(self) -> None:
+    async def test_lrclib_failure_skips_native_itunes_metadata(self) -> None:
         track = bot.Track(
             title="Ano Hana no you ni",
             webpage_url="https://www.youtube.com/watch?v=S38phza2dn8",
@@ -866,12 +866,12 @@ class LyricsFallbackTests(unittest.IsolatedAsyncioTestCase):
                 "lookup_track_lyrics",
                 side_effect=bot.LyricsLookupError("HTTP Error 503"),
             ),
-            patch.object(bot, "lookup_localized_song", new=AsyncMock()) as localized_lookup,
+            patch.object(bot, "lookup_native_song") as native_lookup,
         ):
             lyrics = await bot.get_track_lyrics(track)
 
         self.assertIsNone(lyrics)
-        localized_lookup.assert_not_awaited()
+        native_lookup.assert_not_called()
 
     async def test_lrclib_hit_sets_lyrics_source(self) -> None:
         track = make_track("lrclib")
