@@ -369,23 +369,27 @@ class LyricsLookupTests(unittest.TestCase):
                     + [(alias, artist) for alias in aliases[: alias_index + 1]],
                 )
 
-    def test_title_segments_drop_names_labels_and_tried_titles(self) -> None:
+    def test_title_segments_drop_channel_names_and_labels(self) -> None:
         cases = [
-            ("サカナクション / 怪獣　-Music Video-", "sakanaction", set(), ["サカナクション", "怪獣"]),
-            ("暴徒 - Eve MV", "Eve", {"暴徒"}, []),
+            ("サカナクション / 怪獣　-Music Video-", "sakanaction", ["サカナクション", "怪獣"]),
+            ("暴徒 - Eve MV", "Eve", ["暴徒"]),
+            (
+                "神山羊 - YELLOW【Music Video】/ Yoh Kamiyama - YELLOW",
+                "Yoh Kamiyama",
+                ["神山羊", "yellow"],
+            ),
             (
                 "ティーンエイジブルー (Teenage Blue) – Eve 「アオのハコ」SPECIAL MV",
                 "Eve",
-                set(),
                 ["ティーンエイジブルー", "teenage blue", "アオのハコ"],
             ),
         ]
-        for title, uploader, tried, expected in cases:
+        for title, uploader, expected in cases:
             with self.subTest(title=title):
                 track = make_track(title)
                 track.uploader = uploader
                 self.assertEqual(
-                    music_lyrics_sources.get_title_search_segments(track, tried),
+                    music_lyrics_sources.get_title_search_segments(track),
                     expected,
                 )
 

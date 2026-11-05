@@ -148,15 +148,19 @@ def split_title_alias(value: str) -> list[str]:
     return names
 
 
-def get_title_search_segments(track: Track, skip: set[str]) -> list[str]:
-    """Title pieces worth a free-text search, minus names and tried titles."""
+def get_title_search_segments(track: Track) -> list[str]:
+    """Title pieces worth a free-text search, minus the channel's names.
+
+    Titles already tried by name are searched again: a free-text search for
+    "神山羊" lists the artist's songs, which the title search could not find.
+    """
     names = {
         normalize_artist_name(name)
         for value in (track.uploader, track.artist)
         if value
         for name in value.split(",")
     }
-    seen = {normalize_identity_component(value) for value in skip} | names
+    seen = set(names)
     segments: list[str] = []
     for part in TITLE_SEGMENT_SPLIT_RE.split(clean_track_title(track.title)):
         # "怪獣 -Music Video-": drop the dashes so the label suffix comes off.
@@ -439,11 +443,8 @@ def lookup_track_lyrics(track: Track) -> str | None:
                 "LRCLIB swapped title and artist matched lyrics for %s",
                 track.title,
             )
-    tried_names: set[str] = set()
     for name, artist in search_candidates:
-        tried_names.add(name)
         for alias in split_title_alias(name):
-            tried_names.add(alias)
             if record is not None:
                 break
             record = find_record(alias, artist, artist)
@@ -454,7 +455,7 @@ def lookup_track_lyrics(track: Track) -> str | None:
                     track.title,
                 )
     if record is None:
-        for segment in get_title_search_segments(track, tried_names):
+        for segment in get_title_search_segments(track):
             record = select_title_segment_record(
                 search_lyrics_records(segment, deadline=deadline),
                 track,
