@@ -119,7 +119,7 @@ Copy-Item .env.example .env
 | `LYRICS_API_URL` | `https://lrclib.net/api/search` | LRCLIB 검색 주소 |
 | `LYRICS_REQUEST_TIMEOUT_SECONDS` | `10` | LRCLIB 요청 하나의 제한 시간. 재시도를 포함한 한 곡 조회는 이 값의 6배 안에서 끝남 |
 | `LYRICS_START_DELAY_SECONDS` | `3` | 곡 시작 뒤 가사 조회를 시작하기까지의 지연 |
-| `NATIVE_METADATA_LYRICS` | `true` | 로마자 곡명을 iTunes 일본·한국 스토어의 원어 곡명으로 다시 찾기 |
+| `NATIVE_METADATA_LYRICS` | `true` | 로마자 곡명을 iTunes 일본 스토어의 원어 곡명으로 다시 찾기 |
 
 ### 로그와 기타
 
@@ -250,7 +250,7 @@ https://www.youtube.com/playlist?list=...
 ### 가사
 
 - 곡이 재생되고 `LYRICS_START_DELAY_SECONDS` 뒤 LRCLIB에서 현재 곡을 찾아 전용 채널에 원문 가사 메시지를 보냅니다. 곡이 바뀌면 같은 메시지를 수정하고, 재생목록이 끝나거나 정지·퇴장하면 삭제합니다.
-- 곡명이 로마자인데 채널·아티스트 이름에 가나(또는 한글)가 있으면, LRCLIB에서 못 찾았을 때 iTunes 일본(또는 한국) 스토어 검색으로 원어 곡명·아티스트를 한 번 물어 LRCLIB를 다시 찾습니다. 곡 길이가 3초 안으로 맞고 오프보컬·노래방 버전이 아닌 결과만 씁니다. YouTube에는 요청을 보내지 않습니다. 영어 메타데이터가 `Ano Hana no you ni / noctchill`처럼 로마자로 오지만 LRCLIB에는 `あの花のように / ノクチル`로 올라가 있기 때문입니다. LRCLIB 조회가 실패(503 등)한 경우에는 하지 않습니다. `NATIVE_METADATA_LYRICS=false`로 끌 수 있습니다.
+- 곡명이 로마자인데 채널·아티스트 이름에 가나가 있으면, LRCLIB에서 못 찾았을 때 iTunes 일본 스토어 검색으로 원어 곡명·아티스트를 한 번 물어 LRCLIB를 다시 찾습니다. 곡 길이가 3초 안으로 맞고 오프보컬·노래방 버전이 아닌 결과만 씁니다. YouTube에는 요청을 보내지 않습니다. iTunes 검색 API는 한국 스토어 결과를 주지 않아 한국어 곡에는 적용되지 않습니다. 영어 메타데이터가 `Ano Hana no you ni / noctchill`처럼 로마자로 오지만 LRCLIB에는 `あの花のように / ノクチル`로 올라가 있기 때문입니다. LRCLIB 조회가 실패(503 등)한 경우에는 하지 않습니다. `NATIVE_METADATA_LYRICS=false`로 끌 수 있습니다.
 - 제목이 `ファイトソング (Fight Song)`처럼 원어와 로마자·영어 이름을 괄호로 함께 쓰면 괄호 앞뒤를 따로 찾습니다. 그래도 없으면 제목을 `-`, `/`, 괄호 등으로 나눈 조각을 최대 3개까지 LRCLIB 자유 검색하고, 곡명과 아티스트가 둘 다 영상 제목이나 채널명에 들어 있는 결과만 씁니다.
 - LRCLIB에서 찾지 못하면 `미제공`으로 표시합니다. YouTube 자막은 가사로 쓰지 않습니다.
 - 제목이 `곡명 - 아티스트` 순서여도 채널명이나 YouTube 아티스트 정보와 맞는 쪽을 아티스트로 봅니다. 판단할 수 없으면 곡명만으로 찾은 뒤 반대 순서로 한 번 더 찾습니다. `/` 구분자도 인식하고, 아티스트가 여러 명이면 첫 아티스트로 검색합니다.

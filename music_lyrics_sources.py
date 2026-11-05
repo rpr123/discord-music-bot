@@ -42,10 +42,11 @@ TITLE_SEGMENT_SPLIT_RE = re.compile(
     r"\s+[-–—|,]\s+|\s*/\s*|[「」『』【】\[\]()（）［］]"
 )
 TITLE_SEGMENT_EDGE_CHARACTERS = " -–—~|:"
-# The iTunes store of the song's language turns a romanized query into the
-# native title, without sending YouTube any extra request.
+# The Japanese iTunes store turns a romanized query into the native title,
+# without sending YouTube any extra request. The search API returns nothing
+# for the Korean store, so Korean songs have no such lookup.
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
-ITUNES_STORES = {"ja": ("JP", "ja_jp"), "ko": ("KR", "ko_kr")}
+ITUNES_STORES = {"ja": ("JP", "ja_jp")}
 ITUNES_DURATION_TOLERANCE_SECONDS = 3
 ITUNES_NON_VOCAL_RE = re.compile(
     r"off\s*vocal|instrumental|karaoke|\binst\b|オフボーカル|カラオケ|\bmr\b",

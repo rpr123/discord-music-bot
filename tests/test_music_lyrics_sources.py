@@ -491,6 +491,13 @@ class LyricsLookupTests(unittest.TestCase):
         self.assertIsNone(song)
         request.assert_not_called()
 
+    def test_korean_songs_skip_itunes(self) -> None:
+        track = make_track("Bam Pyeonji")
+        track.duration = 253
+        with patch.object(music_lyrics_sources, "request_itunes_songs") as request:
+            self.assertIsNone(music_lyrics_sources.lookup_native_song(track, "ko"))
+        request.assert_not_called()
+
     def test_title_alias_needs_two_scripts(self) -> None:
         self.assertEqual(
             music_lyrics_sources.split_title_alias("ファイトソング (fight song)"),
