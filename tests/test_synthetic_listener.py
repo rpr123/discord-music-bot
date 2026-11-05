@@ -45,6 +45,19 @@ class FakeVoiceTests(unittest.TestCase):
         self.assertEqual(self.play(source), [error])
         self.assertTrue(source.cleaned_up)
 
+    def test_player_reports_stopped_when_after_runs(self) -> None:
+        voice = synthetic_listener.FakeVoice()
+        finished = threading.Event()
+        playing_in_after: list[bool] = []
+
+        def after(error: Exception | None) -> None:
+            playing_in_after.append(voice.is_playing())
+            finished.set()
+
+        voice.play(FakeSource(frames=1), after=after)
+        self.assertTrue(finished.wait(2))
+        self.assertEqual(playing_in_after, [False])
+
     def test_finished_source_reports_no_error(self) -> None:
         source = FakeSource(frames=3)
 

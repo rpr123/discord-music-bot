@@ -32,6 +32,7 @@ from music_config import logger  # noqa: E402
 GUILD_ID = 1
 FRAME_SECONDS = 0.02
 CONSOLE_LOG = PROJECT_DIR / "logs" / "console.log"
+LOCK_FILE = PROJECT_DIR / "logs" / "synthetic-listener.lock"
 REAL_BOT_IDLE_SECONDS = 10 * 60
 PLAYBACK_TITLE_RE = re.compile(r"Playback start: title=(.+?) codec=")
 LOG_TIME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
@@ -43,18 +44,20 @@ class FakeVoice:
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._playing = threading.Event()
 
     def is_connected(self) -> bool:
         return True
 
     def is_playing(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return self._playing.is_set()
 
     def is_paused(self) -> bool:
         return False
 
     def play(self, source, *, after) -> None:
         self._stop.clear()
+        self._playing.set()
         self._thread = threading.Thread(
             target=self._run,
             args=(source, after),
@@ -80,6 +83,9 @@ class FakeVoice:
         except Exception as exc:
             error = exc
         finally:
+            # discord.py marks the player stopped before `after` runs, so the
+            # bot can start the next track from its callback right away.
+            self._playing.clear()
             after(error)
             source.cleanup()
 
@@ -243,9 +249,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def hold_single_instance_lock():
+    # Two listeners would double the load on the shared IP.
+    import fcntl
+
+    lock = LOCK_FILE.open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit("Another synthetic listener is already running.")
+    return lock
+
+
 def main() -> None:
     args = parse_args()
-    sys.exit(asyncio.run(run(args.hours, args.requests)))
+    lock = hold_single_instance_lock()
+    try:
+        sys.exit(asyncio.run(run(args.hours, args.requests)))
+    finally:
+        lock.close()
 
 
 if __name__ == "__main__":
