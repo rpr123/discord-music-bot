@@ -369,6 +369,88 @@ class LyricsLookupTests(unittest.TestCase):
                     + [(alias, artist) for alias in aliases[: alias_index + 1]],
                 )
 
+    def test_title_segments_drop_names_labels_and_tried_titles(self) -> None:
+        cases = [
+            ("サカナクション / 怪獣　-Music Video-", "sakanaction", set(), ["サカナクション", "怪獣"]),
+            ("暴徒 - Eve MV", "Eve", {"暴徒"}, []),
+            (
+                "ティーンエイジブルー (Teenage Blue) – Eve 「アオのハコ」SPECIAL MV",
+                "Eve",
+                set(),
+                ["ティーンエイジブルー", "teenage blue", "アオのハコ"],
+            ),
+        ]
+        for title, uploader, tried, expected in cases:
+            with self.subTest(title=title):
+                track = make_track(title)
+                track.uploader = uploader
+                self.assertEqual(
+                    music_lyrics_sources.get_title_search_segments(track, tried),
+                    expected,
+                )
+
+    def test_title_segment_search_keeps_records_named_in_the_title(self) -> None:
+        track = make_track("米津玄師 - ピースサイン , Kenshi Yonezu - Peace Sign")
+        track.uploader = "米津玄師"
+        track.duration = 240
+        other_artist = {
+            "trackName": "ピースサイン",
+            "artistName": "Cover Singer",
+            "duration": 240,
+            "instrumental": False,
+            "plainLyrics": "cover",
+        }
+        original = {
+            "trackName": "ピースサイン",
+            "artistName": "Kenshi Yonezu",
+            "duration": 239,
+            "instrumental": False,
+            "plainLyrics": "original",
+        }
+
+        with (
+            patch.object(
+                music_lyrics_sources, "request_lyrics_records", return_value=[]
+            ),
+            patch.object(
+                music_lyrics_sources,
+                "search_lyrics_records",
+                return_value=[other_artist, original],
+            ) as search,
+        ):
+            lyrics = music_lyrics_sources.lookup_track_lyrics(track)
+
+        self.assertEqual(lyrics, "original")
+        search.assert_called_once()
+
+    def test_title_segment_search_gives_up_after_the_limit(self) -> None:
+        track = make_track("A one / B two / C three / D four / E five")
+        track.uploader = "Nobody"
+        unrelated = {
+            "trackName": "Elsewhere",
+            "artistName": "Someone",
+            "duration": 200,
+            "instrumental": False,
+            "plainLyrics": "words",
+        }
+
+        with (
+            patch.object(
+                music_lyrics_sources, "request_lyrics_records", return_value=[]
+            ),
+            patch.object(
+                music_lyrics_sources,
+                "search_lyrics_records",
+                return_value=[unrelated],
+            ) as search,
+        ):
+            lyrics = music_lyrics_sources.lookup_track_lyrics(track)
+
+        self.assertIsNone(lyrics)
+        self.assertEqual(
+            search.call_count, music_lyrics_sources.LYRICS_SEGMENT_SEARCH_LIMIT
+        )
+
     def test_title_alias_needs_two_scripts(self) -> None:
         self.assertEqual(
             music_lyrics_sources.split_title_alias("ファイトソング (fight song)"),

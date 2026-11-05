@@ -35,6 +35,14 @@ LRC_TIMESTAMP_RE = re.compile(
 # "ファイトソング (Fight Song)": a native title with its romanized or
 # translated name in parentheses. LRCLIB lists the song under one of them.
 TITLE_WITH_ALIAS_RE = re.compile(r"(.+?)\s*[(（]([^()（）]+)[)）]")
+# Last resort for titles the song/artist parser cannot read, e.g.
+# "米津玄師 - ピースサイン , Kenshi Yonezu - Peace Sign": search each piece
+# and keep a record only if its song and artist both appear in the title.
+TITLE_SEGMENT_SPLIT_RE = re.compile(
+    r"\s+[-–—|,]\s+|\s*/\s*|[「」『』【】\[\]()（）［］]"
+)
+TITLE_SEGMENT_EDGE_CHARACTERS = " -–—~|:"
+LYRICS_SEGMENT_SEARCH_LIMIT = 3
 LRC_METADATA_RE = re.compile(
     r"^\[(?:ar|ti|al|by|offset|length|re|ve):.*\]\s*$",
     flags=re.IGNORECASE,
@@ -138,6 +146,62 @@ def split_title_alias(value: str) -> list[str]:
     if not all(names) or native[0] == native[1]:
         return []
     return names
+
+
+def get_title_search_segments(track: Track, skip: set[str]) -> list[str]:
+    """Title pieces worth a free-text search, minus names and tried titles."""
+    names = {
+        normalize_artist_name(name)
+        for value in (track.uploader, track.artist)
+        if value
+        for name in value.split(",")
+    }
+    seen = {normalize_identity_component(value) for value in skip} | names
+    segments: list[str] = []
+    for part in TITLE_SEGMENT_SPLIT_RE.split(clean_track_title(track.title)):
+        # "怪獣 -Music Video-": drop the dashes so the label suffix comes off.
+        part = part.strip(TITLE_SEGMENT_EDGE_CHARACTERS)
+        part = clean_track_title(part).strip(TITLE_SEGMENT_EDGE_CHARACTERS)
+        key = normalize_identity_component(part)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        segments.append(part)
+    return segments[:LYRICS_SEGMENT_SEARCH_LIMIT]
+
+
+def contains_words(text: str, words: str) -> bool:
+    return bool(words) and f" {words} " in f" {text} "
+
+
+def record_is_named_in_title(record: dict, track: Track) -> bool:
+    title_text = normalize_identity_component(
+        " ".join(
+            value for value in (track.title, track.uploader, track.artist) if value
+        )
+    )
+    song = normalize_identity_component(str(record.get("trackName") or ""))
+    artist = normalize_artist_name(str(record.get("artistName") or ""))
+    return contains_words(title_text, song) and contains_words(title_text, artist)
+
+
+def select_title_segment_record(records: list[dict], track: Track) -> dict | None:
+    matches = [
+        record
+        for record in records
+        if extract_original_lyrics(record) is not None
+        and record_is_named_in_title(record, track)
+    ]
+    if not matches:
+        return None
+
+    def duration_difference(record: dict) -> float:
+        duration = record.get("duration")
+        if track.duration is None or not isinstance(duration, (int, float)):
+            return float("inf")
+        return abs(float(duration) - track.duration)
+
+    return min(matches, key=duration_difference)
 
 
 def lyrics_native_script_ratio(record: dict) -> float:
@@ -276,6 +340,18 @@ def request_lyrics_records(
     params = {"track_name": track_name}
     if artist_name:
         params["artist_name"] = artist_name
+    return request_lyrics_search(params, deadline=deadline)
+
+
+def search_lyrics_records(query: str, *, deadline: float | None = None) -> list[dict]:
+    return request_lyrics_search({"q": query}, deadline=deadline)
+
+
+def request_lyrics_search(
+    params: dict[str, str],
+    *,
+    deadline: float | None = None,
+) -> list[dict]:
     separator = "&" if "?" in LYRICS_API_URL else "?"
     url = f"{LYRICS_API_URL}{separator}{urllib.parse.urlencode(params)}"
     request = urllib.request.Request(
@@ -363,8 +439,11 @@ def lookup_track_lyrics(track: Track) -> str | None:
                 "LRCLIB swapped title and artist matched lyrics for %s",
                 track.title,
             )
+    tried_names: set[str] = set()
     for name, artist in search_candidates:
+        tried_names.add(name)
         for alias in split_title_alias(name):
+            tried_names.add(alias)
             if record is not None:
                 break
             record = find_record(alias, artist, artist)
@@ -374,4 +453,17 @@ def lookup_track_lyrics(track: Track) -> str | None:
                     alias,
                     track.title,
                 )
+    if record is None:
+        for segment in get_title_search_segments(track, tried_names):
+            record = select_title_segment_record(
+                search_lyrics_records(segment, deadline=deadline),
+                track,
+            )
+            if record is not None:
+                logger.info(
+                    "LRCLIB title segment %s matched lyrics for %s",
+                    segment,
+                    track.title,
+                )
+                break
     return extract_original_lyrics(record) if record else None
