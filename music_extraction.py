@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import functools
+import re
 import threading
 import time
 import unicodedata
@@ -369,13 +370,17 @@ async def run_youtube_music_request(label: str, request: Callable[[], T]) -> T:
         raise
 
 
-async def _search_youtube_music_operation(query: str) -> list[dict]:
+async def _search_youtube_music_operation(
+    query: str,
+    search_filter: str | None = None,
+) -> list[dict]:
     if extraction_shutdown_started:
         raise asyncio.CancelledError
     if not YOUTUBE_MUSIC_SEARCH_ENABLED:
         return []
 
-    cached = await get_cached_youtube_music_results(query)
+    cache_query = query if search_filter is None else f"{search_filter}\0{query}"
+    cached = await get_cached_youtube_music_results(cache_query)
     if cached is not None:
         logger.info("YouTube Music cache hit: %s", query)
         return cached
@@ -384,26 +389,261 @@ async def _search_youtube_music_operation(query: str) -> list[dict]:
     logger.info("YouTube Music search start: %s", query)
 
     def search() -> list[dict]:
-        results = get_youtube_music_client().search(
-            query,
-            limit=YOUTUBE_SEARCH_CANDIDATES,
-        )
+        options: dict[str, object] = {"limit": YOUTUBE_SEARCH_CANDIDATES}
+        if search_filter is not None:
+            options["filter"] = search_filter
+        results = get_youtube_music_client().search(query, **options)
         return [result for result in results if isinstance(result, dict)]
 
     results = await run_youtube_music_request(f"search for {query!r}", search)
-    await cache_youtube_music_results(query, results)
+    await cache_youtube_music_results(cache_query, results)
     logger.info("YouTube Music search done: %s result(s)", len(results))
     return results
 
 
-async def search_youtube_music(query: str) -> list[dict]:
+async def search_youtube_music(
+    query: str,
+    search_filter: str | None = None,
+) -> list[dict]:
     if extraction_shutdown_started:
         raise asyncio.CancelledError
     operation_task = track_auxiliary_operation()
     try:
-        return await _search_youtube_music_operation(query)
+        return await _search_youtube_music_operation(query, search_filter)
     finally:
         auxiliary_operation_tasks.discard(operation_task)
+
+
+async def _get_youtube_music_page(label: str, request: Callable[[], object]) -> dict:
+    if extraction_shutdown_started:
+        raise asyncio.CancelledError
+    operation_task = track_auxiliary_operation()
+    try:
+        ensure_youtube_circuit_closed()
+        page = await run_youtube_music_request(label, request)
+        return page if isinstance(page, dict) else {}
+    finally:
+        auxiliary_operation_tasks.discard(operation_task)
+
+
+async def get_youtube_music_album(browse_id: str) -> dict:
+    return await _get_youtube_music_page(
+        f"album {browse_id!r}",
+        lambda: get_youtube_music_client().get_album(browse_id),
+    )
+
+
+async def get_youtube_music_artist(channel_id: str) -> dict:
+    return await _get_youtube_music_page(
+        f"artist {channel_id!r}",
+        lambda: get_youtube_music_client().get_artist(channel_id),
+    )
+
+
+def normalize_album_match_text(text: object) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def get_album_artist_keys(album: dict) -> set[str]:
+    return {
+        key
+        for artist in album.get("artists") or []
+        if isinstance(artist, dict)
+        and len(key := normalize_album_match_text(artist.get("name"))) >= 2
+    }
+
+
+def is_single_album(album: dict) -> bool:
+    return str(album.get("type") or "").casefold() == "single"
+
+
+ALBUM_CONTAINER_CHECK_LIMIT = 2
+NON_ORIGINAL_ALBUM_PATTERN = re.compile(
+    r"karaoke|カラオケ|cover|instrumental|off\s*vocal|originally\s+performed"
+    r"|music\s*box|musical\s*box|オルゴール|lofi|lo-fi|tribute|relaxing"
+    r"|piano\s+(?:collection|cover|ver)",
+    re.IGNORECASE,
+)
+LIVE_ALBUM_PATTERN = re.compile(r"\blive\b|\btour\b|@|ライブ|라이브", re.IGNORECASE)
+NON_STUDIO_ALBUM_PATTERN = re.compile(
+    r"\blive\b|\btour\b|@|instrumental|karaoke|remix",
+    re.IGNORECASE,
+)
+VERSION_SUFFIX_PATTERN = re.compile(
+    r"[(\[]\s*[^()\[\]]*\bver(?:\.|sion)?\s*[)\]]",
+    re.IGNORECASE,
+)
+
+
+def is_original_album(album: dict) -> bool:
+    names = [str(album.get("title") or "")]
+    names.extend(
+        str(artist.get("name") or "")
+        for artist in album.get("artists") or []
+        if isinstance(artist, dict)
+    )
+    return not any(NON_ORIGINAL_ALBUM_PATTERN.search(name) for name in names)
+
+
+def get_repeated_artist_keys(albums: list[dict]) -> set[str]:
+    counts: dict[str, int] = {}
+    for album in albums:
+        for key in get_album_artist_keys(album):
+            counts[key] = counts.get(key, 0) + 1
+    top_count = max(counts.values(), default=0)
+    if top_count < 2:
+        return set()
+    return {key for key, count in counts.items() if count == top_count}
+
+
+def choose_youtube_music_album(query: str, results: list[dict]) -> dict | None:
+    albums = [
+        result
+        for result in results
+        if result.get("browseId") and is_original_album(result)
+    ]
+    if not LIVE_ALBUM_PATTERN.search(query):
+        albums = [
+            album
+            for album in albums
+            if not LIVE_ALBUM_PATTERN.search(str(album.get("title") or ""))
+        ]
+    if not albums:
+        return None
+
+    query_key = normalize_album_match_text(query)
+    artist_matches = [
+        album
+        for album in albums
+        if any(key in query_key for key in get_album_artist_keys(album))
+    ]
+    if not artist_matches:
+        # The query may spell the artist in another script (髭男 vs HIGE DAN).
+        # An artist who fills several results is most likely the one meant.
+        repeated_artists = get_repeated_artist_keys(albums)
+        artist_matches = [
+            album
+            for album in albums
+            if get_album_artist_keys(album) & repeated_artists
+        ]
+    if artist_matches:
+        return artist_matches[0]
+
+    # Without any sign of the artist, only trust an album named in the query.
+    return next(
+        (
+            album
+            for album in albums
+            if any(
+                key in query_key or query_key in key
+                for key in get_song_title_keys(album.get("title"))
+            )
+        ),
+        None,
+    )
+
+
+def get_album_year(album: dict) -> int | None:
+    try:
+        return int(str(album.get("year") or "").strip())
+    except ValueError:
+        return None
+
+
+def get_album_artist_channel_id(album: dict) -> str | None:
+    for artist in album.get("artists") or []:
+        if isinstance(artist, dict) and artist.get("id"):
+            return str(artist["id"])
+    return None
+
+
+def choose_album_containers(single: dict, artist_page: dict) -> list[dict]:
+    """Return the artist's studio albums released since the single, oldest first."""
+    single_year = get_album_year(single)
+    albums = [
+        album
+        for album in (artist_page.get("albums") or {}).get("results") or []
+        if isinstance(album, dict)
+        and album.get("browseId")
+        and album.get("browseId") != single.get("browseId")
+        and not NON_STUDIO_ALBUM_PATTERN.search(str(album.get("title") or ""))
+    ]
+    if single_year is not None:
+        albums = [
+            album
+            for album in albums
+            if (get_album_year(album) or single_year) >= single_year
+        ]
+    albums.sort(key=lambda album: get_album_year(album) or 9999)
+    return albums[:ALBUM_CONTAINER_CHECK_LIMIT]
+
+
+def get_song_title_keys(title: object) -> set[str]:
+    """Return match keys for a track title and its "native - romanized" halves."""
+    text = VERSION_SUFFIX_PATTERN.sub("", str(title or ""))
+    parts = [text, *text.split(" - ")]
+    return {
+        key
+        for part in parts
+        if len(key := normalize_album_match_text(part)) >= 2
+    }
+
+
+def get_album_track_keys(album_details: dict) -> set[str]:
+    return {
+        key
+        for track in album_details.get("tracks") or []
+        if isinstance(track, dict)
+        for key in get_song_title_keys(track.get("title"))
+    }
+
+
+def get_requested_song_keys(query: str, single_details: dict) -> set[str]:
+    track_keys = get_album_track_keys(single_details)
+    query_key = normalize_album_match_text(query)
+    named_keys = {key for key in track_keys if key in query_key}
+    return named_keys or track_keys
+
+
+async def find_youtube_music_album_url(query: str) -> str | None:
+    if not YOUTUBE_MUSIC_SEARCH_ENABLED:
+        return None
+    try:
+        results = await search_youtube_music(query, "albums")
+        album = choose_youtube_music_album(query, results)
+        if album is None:
+            return None
+        details = await get_youtube_music_album(str(album["browseId"]))
+        channel_id = get_album_artist_channel_id(album)
+        if is_single_album(album) and channel_id is not None:
+            # A song released as a single ranks its own single first. Switch
+            # to the artist's later studio album only when it lists the song.
+            song_keys = get_requested_song_keys(query, details)
+            artist_page = await get_youtube_music_artist(channel_id)
+            for container in choose_album_containers(album, artist_page):
+                container_details = await get_youtube_music_album(
+                    str(container["browseId"])
+                )
+                if song_keys & get_album_track_keys(container_details):
+                    album, details = container, container_details
+                    break
+    except (asyncio.CancelledError, YouTubeCircuitOpenError):
+        raise
+    except Exception as error:
+        logger.warning("YouTube Music album lookup failed for %s: %s", query, error)
+        return None
+
+    playlist_id = details.get("audioPlaylistId")
+    if not playlist_id:
+        return None
+    logger.info(
+        "YouTube Music album for %s: %s (%s)",
+        query,
+        album.get("title"),
+        album.get("type") or "Album",
+    )
+    return f"https://www.youtube.com/playlist?list={playlist_id}"
 
 
 async def extract_first_info(
@@ -570,6 +810,10 @@ async def extract_tracks(
     requester_id: int | None = None,
 ) -> list[Track]:
     resolved_query = resolve_query(query, search_kind)
+    if search_kind == "album" and is_playlist_search_url(resolved_query):
+        album_url = await find_youtube_music_album_url(query.strip())
+        if album_url is not None:
+            resolved_query = album_url
     info = await extract_ytdl_info(
         YTDL_PLAYLIST_OPTIONS,
         resolved_query,

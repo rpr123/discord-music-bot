@@ -50,6 +50,7 @@ class MusicExtractionModuleTests(unittest.TestCase):
                 "music_search_scoring",
                 "music_track_metadata",
                 "music_ytdl",
+                "re",
                 "requests",
                 "threading",
                 "time",
@@ -775,6 +776,298 @@ class SearchExtractionTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+def make_album_result(
+    title: str,
+    artist: str,
+    album_type: str,
+    browse_id: str,
+    year: str = "2020",
+    channel_id: str | None = None,
+) -> dict:
+    return {
+        "resultType": "album",
+        "title": title,
+        "type": album_type,
+        "year": year,
+        "artists": [{"name": artist, "id": channel_id}],
+        "browseId": browse_id,
+    }
+
+
+def make_album_details(playlist_id: str, *titles: str) -> dict:
+    return {
+        "audioPlaylistId": playlist_id,
+        "tracks": [{"title": title} for title in titles],
+    }
+
+
+def make_artist_page(*albums: dict) -> dict:
+    return {"albums": {"results": list(albums)}}
+
+
+class YouTubeMusicAlbumTests(unittest.IsolatedAsyncioTestCase):
+    def test_artist_named_in_query_beats_higher_ranked_cover(self) -> None:
+        cover = make_album_result("OMG & Ditto", "The Dreamer Piano", "Single", "MPREb_cover")
+        official = make_album_result("Ditto", "NewJeans", "Single", "MPREb_ditto")
+
+        chosen = music_extraction.choose_youtube_music_album(
+            "NewJeans Ditto",
+            [cover, official],
+        )
+
+        self.assertIs(chosen, official)
+
+    def test_karaoke_cover_and_unrequested_live_albums_are_skipped(self) -> None:
+        karaoke = make_album_result("Song KARAOKE Original by Band", "歌っちゃ王", "Single", "MPREb_k")
+        manekineko = make_album_result("Song (Karaoke) [Band]", "Karaoke Manekineko", "Album", "MPREb_m")
+        piano = make_album_result("Band Piano Collection", "Band", "Album", "MPREb_p")
+        live = make_album_result("Band One-Man Tour 2019@Budokan", "Band", "Album", "MPREb_l")
+        studio = make_album_result("Traveler", "Band", "Album", "MPREb_s")
+
+        chosen = music_extraction.choose_youtube_music_album(
+            "Band Song",
+            [karaoke, manekineko, piano, live, studio],
+        )
+        live_chosen = music_extraction.choose_youtube_music_album(
+            "Band Budokan live",
+            [live, studio],
+        )
+
+        self.assertIs(chosen, studio)
+        self.assertIs(live_chosen, live)
+
+    def test_artist_in_other_script_is_found_by_repetition(self) -> None:
+        soundtrack = make_album_result("Yesterday (Soundtrack)", "Various", "Album", "MPREb_ost")
+        traveler = make_album_result("Traveler", "Official HIGE DANdism", "Album", "MPREb_t")
+        single = make_album_result("Pretender", "Official Hige Dandism", "Single", "MPREb_p")
+
+        chosen = music_extraction.choose_youtube_music_album(
+            "Official髭男dism イエスタデイ",
+            [soundtrack, traveler, single],
+        )
+
+        self.assertIs(chosen, traveler)
+
+    def test_unrelated_album_without_artist_evidence_is_rejected(self) -> None:
+        unrelated = make_album_result("Elderflower", "Someone", "Single", "MPREb_e")
+        named = make_album_result("Get Up", "Someone Else", "Single", "MPREb_g")
+
+        self.assertIsNone(
+            music_extraction.choose_youtube_music_album("髭男 115万キロのフィルム", [unrelated])
+        )
+        self.assertIs(
+            music_extraction.choose_youtube_music_album("Get Up", [unrelated, named]),
+            named,
+        )
+
+    def test_containers_are_later_studio_albums_oldest_first(self) -> None:
+        single = make_album_result("Pretender", "Band", "Single", "MPREb_single", "2019")
+        artist_page = make_artist_page(
+            {"title": "LIVE at STADIUM 2025", "year": "2026", "browseId": "MPREb_live"},
+            {"title": "Rejoice", "year": "2024", "browseId": "MPREb_rejoice"},
+            {"title": "Editorial (Instrumental)", "year": "2022", "browseId": "MPREb_inst"},
+            {"title": "Editorial", "year": "2021", "browseId": "MPREb_editorial"},
+            {"title": "Traveler", "year": "2019", "browseId": "MPREb_traveler"},
+            {"title": "ESCAPARADE", "year": "2018", "browseId": "MPREb_old"},
+        )
+
+        containers = music_extraction.choose_album_containers(single, artist_page)
+
+        self.assertEqual(
+            [album["title"] for album in containers],
+            ["Traveler", "Editorial"],
+        )
+
+    def test_song_keys_ignore_version_suffix_but_not_remix(self) -> None:
+        self.assertIn(
+            "anarchy",
+            music_extraction.get_song_title_keys("Anarchy (Rejoice ver.)"),
+        )
+        self.assertNotIn(
+            "omg",
+            music_extraction.get_song_title_keys("OMG (FRNK Remix)"),
+        )
+        self.assertEqual(
+            music_extraction.get_song_title_keys("ノーダウト - No Doubt"),
+            {"ノーダウトnodoubt", "ノーダウト", "nodoubt"},
+        )
+
+    async def _find(
+        self,
+        query: str,
+        results: list[dict],
+        albums: dict[str, dict],
+        artist_page: dict | None = None,
+    ) -> tuple[str | None, AsyncMock, AsyncMock]:
+        get_album = AsyncMock(side_effect=lambda browse_id: albums[browse_id])
+        get_artist = AsyncMock(return_value=artist_page or {})
+        with (
+            patch.object(music_extraction, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
+            patch.object(
+                music_extraction,
+                "search_youtube_music",
+                new=AsyncMock(return_value=results),
+            ) as search,
+            patch.object(music_extraction, "get_youtube_music_album", get_album),
+            patch.object(music_extraction, "get_youtube_music_artist", get_artist),
+        ):
+            url = await music_extraction.find_youtube_music_album_url(query)
+        search.assert_awaited_once_with(query, "albums")
+        return url, get_album, get_artist
+
+    async def test_single_switches_to_artist_album_that_lists_the_song(self) -> None:
+        url, get_album, get_artist = await self._find(
+            "Band Anarchy",
+            [make_album_result("Anarchy", "Band", "Single", "MPREb_single", "2022", "UCband")],
+            {
+                "MPREb_single": make_album_details("OLAK_single", "Anarchy"),
+                "MPREb_mixed": make_album_details("OLAK_mixed", "Mixed Nuts"),
+                "MPREb_rejoice": make_album_details(
+                    "OLAK_rejoice",
+                    "Subtitle",
+                    "Anarchy (Rejoice ver.)",
+                ),
+            },
+            make_artist_page(
+                {"title": "Rejoice", "year": "2024", "browseId": "MPREb_rejoice"},
+                {"title": "Mixed Nuts", "year": "2022", "browseId": "MPREb_mixed"},
+            ),
+        )
+
+        self.assertEqual(url, "https://www.youtube.com/playlist?list=OLAK_rejoice")
+        get_artist.assert_awaited_once_with("UCband")
+        self.assertEqual(get_album.await_count, 3)
+
+    async def test_single_stays_when_albums_only_hold_other_versions(self) -> None:
+        url, get_album, _ = await self._find(
+            "NewJeans OMG",
+            [make_album_result("NewJeans 'OMG'", "NewJeans", "Single", "MPREb_omg", "2023", "UCnj")],
+            {
+                "MPREb_omg": make_album_details("OLAK_omg", "OMG", "Ditto"),
+                "MPREb_njwmx": make_album_details("OLAK_njwmx", "OMG (FRNK Remix)", "Ditto"),
+                "MPREb_best": make_album_details("OLAK_best", "Attention"),
+            },
+            make_artist_page(
+                {"title": "NJWMX", "year": "2023", "browseId": "MPREb_njwmx"},
+                {"title": "Best", "year": "2024", "browseId": "MPREb_best"},
+                {"title": "Third", "year": "2025", "browseId": "MPREb_third"},
+            ),
+        )
+
+        # The query names OMG, so a remix album holding the other single track
+        # (Ditto) does not count, and only two albums are checked.
+        self.assertEqual(url, "https://www.youtube.com/playlist?list=OLAK_omg")
+        self.assertEqual(get_album.await_count, 3)
+
+    async def test_album_result_needs_no_artist_lookup(self) -> None:
+        url, get_album, get_artist = await self._find(
+            "Band Traveler",
+            [make_album_result("Traveler", "Band", "Album", "MPREb_t", "2019", "UCband")],
+            {"MPREb_t": make_album_details("OLAK_t", "Pretender")},
+        )
+
+        self.assertEqual(url, "https://www.youtube.com/playlist?list=OLAK_t")
+        get_album.assert_awaited_once_with("MPREb_t")
+        get_artist.assert_not_awaited()
+
+    async def test_lookup_failure_falls_back_to_playlist_search(self) -> None:
+        with (
+            patch.object(music_extraction, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
+            patch.object(
+                music_extraction,
+                "search_youtube_music",
+                new=AsyncMock(side_effect=RuntimeError("bad response")),
+            ),
+        ):
+            url = await music_extraction.find_youtube_music_album_url("anything")
+
+        self.assertIsNone(url)
+
+    async def test_open_youtube_circuit_is_not_hidden(self) -> None:
+        with (
+            patch.object(music_extraction, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
+            patch.object(
+                music_extraction,
+                "search_youtube_music",
+                new=AsyncMock(side_effect=music_ytdl.YouTubeCircuitOpenError(60, "blocked")),
+            ),
+            self.assertRaises(music_ytdl.YouTubeCircuitOpenError),
+        ):
+            await music_extraction.find_youtube_music_album_url("anything")
+
+    async def test_album_request_extracts_the_youtube_music_album(self) -> None:
+        album_url = "https://www.youtube.com/playlist?list=OLAK_palette"
+        extract = AsyncMock(
+            return_value={"entries": [{"id": "abcdefghijk", "title": "Palette"}]}
+        )
+
+        with (
+            patch.object(
+                music_extraction,
+                "find_youtube_music_album_url",
+                new=AsyncMock(return_value=album_url),
+            ) as find_album,
+            patch.object(music_extraction, "extract_ytdl_info", extract),
+        ):
+            tracks = await music_extraction.extract_tracks(" 아이유 밤편지 ", "tester", "album")
+
+        find_album.assert_awaited_once_with("아이유 밤편지")
+        extract.assert_awaited_once_with(
+            music_extraction.YTDL_PLAYLIST_OPTIONS,
+            album_url,
+            "playlist or album search",
+            job_kind=YtdlJobKind.PLAYLIST_ALBUM,
+        )
+        self.assertEqual([track.title for track in tracks], ["Palette"])
+
+    async def test_album_request_without_music_album_keeps_playlist_search(self) -> None:
+        extract = AsyncMock(
+            side_effect=[
+                {"entries": [{"url": "https://www.youtube.com/playlist?list=PLfallback"}]},
+                {"entries": [{"id": "abcdefghijk", "title": "Fallback"}]},
+            ]
+        )
+
+        with (
+            patch.object(
+                music_extraction,
+                "find_youtube_music_album_url",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(music_extraction, "extract_ytdl_info", extract),
+        ):
+            tracks = await music_extraction.extract_tracks("Get Up", "tester", "album")
+
+        self.assertTrue(
+            music_extraction.is_playlist_search_url(extract.await_args_list[0].args[1])
+        )
+        self.assertEqual(
+            extract.await_args_list[1].args[1],
+            "https://www.youtube.com/playlist?list=PLfallback",
+        )
+        self.assertEqual([track.title for track in tracks], ["Fallback"])
+
+    async def test_playlist_request_does_not_look_up_albums(self) -> None:
+        extract = AsyncMock(
+            side_effect=[
+                {"entries": [{"url": "https://www.youtube.com/playlist?list=PLlofi"}]},
+                {"entries": [{"id": "abcdefghijk", "title": "Lofi"}]},
+            ]
+        )
+
+        with (
+            patch.object(
+                music_extraction,
+                "find_youtube_music_album_url",
+                new=AsyncMock(),
+            ) as find_album,
+            patch.object(music_extraction, "extract_ytdl_info", extract),
+        ):
+            await music_extraction.extract_tracks("lofi beats", "tester", "playlist")
+
+        find_album.assert_not_awaited()
+
+
 class YouTubeMusicProtectionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         music_extraction.youtube_music_cache.clear()
@@ -814,6 +1107,38 @@ class YouTubeMusicProtectionTests(unittest.IsolatedAsyncioTestCase):
 
         to_thread.assert_awaited_once()
         self.assertEqual(second[0]["title"], "泥濘鳴鳴")
+
+    async def test_filtered_music_search_passes_filter_and_caches_separately(
+        self,
+    ) -> None:
+        client = MagicMock()
+        client.search.side_effect = [[{"title": "album"}], [{"title": "general"}]]
+
+        async def run_inline(function):
+            return function()
+
+        with (
+            patch.object(asyncio, "to_thread", new=run_inline),
+            patch.object(music_extraction, "get_youtube_music_client", return_value=client),
+            patch.object(music_extraction, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
+            patch.object(music_extraction, "YOUTUBE_MUSIC_MIN_INTERVAL_SECONDS", 0.0),
+            patch.object(music_extraction, "YTDL_CACHE_TTL_SECONDS", 600),
+        ):
+            albums = await music_extraction.search_youtube_music("IU", "albums")
+            general = await music_extraction.search_youtube_music("IU")
+            cached_albums = await music_extraction.search_youtube_music("IU", "albums")
+
+        self.assertEqual(albums, [{"title": "album"}])
+        self.assertEqual(general, [{"title": "general"}])
+        self.assertEqual(cached_albums, albums)
+        self.assertEqual(
+            client.search.call_args_list[0].kwargs,
+            {"limit": music_extraction.YOUTUBE_SEARCH_CANDIDATES, "filter": "albums"},
+        )
+        self.assertEqual(
+            client.search.call_args_list[1].kwargs,
+            {"limit": music_extraction.YOUTUBE_SEARCH_CANDIDATES},
+        )
 
     async def test_empty_music_results_are_cached(self) -> None:
         to_thread = AsyncMock(return_value=[])
