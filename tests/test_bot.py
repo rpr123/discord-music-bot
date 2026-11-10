@@ -1021,8 +1021,148 @@ class CommandSurfaceTests(unittest.TestCase):
             command_names,
             {
                 "setupmusic",
+                "자동",
+                "auto",
+                "앨범",
+                "album",
+                "재생목록",
+                "playlist",
             },
         )
+
+    def test_request_commands_pair_korean_and_english_names(self) -> None:
+        expected = {
+            "auto": (("자동", "auto"), [("곡명", True), ("곡수", False)]),
+            "album": (("앨범", "album"), [("곡명", True)]),
+            "playlist": (("재생목록", "playlist"), [("곡명", True)]),
+        }
+        for kind, (names, options) in expected.items():
+            with self.subTest(kind=kind):
+                commands = bot.MUSIC_REQUEST_COMMANDS[kind]
+                self.assertEqual(tuple(command.name for command in commands), names)
+                payloads = [command.to_dict(bot.bot.tree) for command in commands]
+                for command, payload in zip(commands, payloads):
+                    self.assertIs(bot.bot.tree.get_command(command.name), command)
+                    self.assertEqual(payload["contexts"], [0])
+                    self.assertEqual(
+                        [(option["name"], option["required"]) for option in payload["options"]],
+                        options,
+                    )
+                self.assertIs(commands[0].callback, commands[1].callback)
+
+        count_option = bot.MUSIC_REQUEST_COMMANDS["auto"][0].to_dict(bot.bot.tree)[
+            "options"
+        ][1]
+        self.assertEqual(count_option["min_value"], 1)
+        self.assertEqual(count_option["max_value"], bot.MAX_AUTO_TRACKS)
+
+
+class RequestCommandTests(unittest.IsolatedAsyncioTestCase):
+    def _make_interaction(self, guild_id: int) -> MagicMock:
+        channel = MagicMock(id=8800)
+        member = MagicMock(display_name="tester", id=123)
+        interaction = MagicMock(guild_id=guild_id, user=member)
+        interaction.guild.get_channel.return_value = channel
+        interaction.response.defer = AsyncMock()
+        interaction.response.send_message = AsyncMock()
+        interaction.followup.send = AsyncMock(return_value=MagicMock())
+        return interaction
+
+    async def _run(
+        self,
+        interaction: MagicMock,
+        kind: str,
+        *args: object,
+        voice_result: tuple[bool, str | None] = (True, None),
+    ) -> tuple[AsyncMock, AsyncMock]:
+        self.addCleanup(bot.music_states.pop, interaction.guild_id, None)
+        command = bot.MUSIC_REQUEST_COMMANDS[kind][1]
+        with (
+            patch.object(bot, "get_music_channel_id", return_value=8800),
+            patch.object(
+                bot,
+                "ensure_voice_for_member",
+                new=AsyncMock(return_value=voice_result),
+            ) as ensure_voice,
+            patch.object(bot, "enqueue_tracks", new=AsyncMock()) as enqueue,
+            patch.object(
+                bot,
+                "create_housekeeping_task",
+                side_effect=lambda coroutine: coroutine.close(),
+            ),
+        ):
+            await command.callback(interaction, *args)
+        return ensure_voice, enqueue
+
+    async def test_auto_command_passes_count(self) -> None:
+        interaction = self._make_interaction(6601)
+
+        _, enqueue = await self._run(interaction, "auto", " back number ", 5)
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        enqueue.assert_awaited_once()
+        self.assertIs(
+            enqueue.await_args.args[1],
+            interaction.guild.get_channel.return_value,
+        )
+        self.assertEqual(enqueue.await_args.args[2:4], (interaction.user, "back number"))
+        self.assertEqual(enqueue.await_args.kwargs["auto_count"], 5)
+        self.assertNotIn("search_kind", enqueue.await_args.kwargs)
+
+    async def test_auto_command_without_count_uses_default_count(self) -> None:
+        interaction = self._make_interaction(6602)
+
+        _, enqueue = await self._run(interaction, "auto", "lofi", None)
+
+        self.assertEqual(
+            enqueue.await_args.kwargs["auto_count"],
+            bot.DEFAULT_AUTO_TRACKS,
+        )
+
+    async def test_album_and_playlist_commands_request_bulk_search(self) -> None:
+        for guild_id, kind in ((6603, "album"), (6604, "playlist")):
+            with self.subTest(kind=kind):
+                interaction = self._make_interaction(guild_id)
+
+                _, enqueue = await self._run(interaction, kind, "NewJeans Get Up")
+
+                self.assertEqual(enqueue.await_args.kwargs["search_kind"], kind)
+                self.assertTrue(enqueue.await_args.kwargs["bulk"])
+                self.assertNotIn("auto_count", enqueue.await_args.kwargs)
+                self.assertIs(
+                    enqueue.await_args.kwargs["initial_response"],
+                    interaction.followup.send.return_value,
+                )
+
+    async def test_blank_song_is_rejected_before_defer(self) -> None:
+        interaction = self._make_interaction(6606)
+
+        ensure_voice, enqueue = await self._run(interaction, "album", "   ")
+
+        interaction.response.send_message.assert_awaited_once_with(
+            "곡명을 입력해 주세요.",
+            ephemeral=True,
+        )
+        interaction.response.defer.assert_not_awaited()
+        ensure_voice.assert_not_awaited()
+        enqueue.assert_not_awaited()
+
+    async def test_member_outside_voice_gets_error_without_search(self) -> None:
+        interaction = self._make_interaction(6607)
+
+        _, enqueue = await self._run(
+            interaction,
+            "playlist",
+            "lofi beats",
+            voice_result=(False, "먼저 음성 채널에 들어가 주세요."),
+        )
+
+        interaction.followup.send.assert_awaited_once_with(
+            "먼저 음성 채널에 들어가 주세요.",
+            ephemeral=True,
+            wait=True,
+        )
+        enqueue.assert_not_awaited()
 
 
 class EphemeralResponseTests(unittest.IsolatedAsyncioTestCase):

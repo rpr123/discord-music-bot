@@ -9,7 +9,7 @@ import shutil
 import time
 from collections import deque
 from pathlib import Path
-from typing import Callable, Coroutine, TypeVar
+from typing import Awaitable, Callable, Coroutine, TypeVar
 
 import discord
 from discord import app_commands
@@ -93,6 +93,7 @@ from music_config import (
     AUTOPLAY_REFILL_CANDIDATES,
     AUTOPLAY_START_DELAY_SECONDS,
     CONTROL_PANEL_HISTORY_LIMIT,
+    DEFAULT_AUTO_TRACKS,
     DEV_GUILD_ID,
     DISCORD_TOKEN,
     EMPTY_CHANNEL_DISCONNECT_DELAY_SECONDS,
@@ -101,6 +102,7 @@ from music_config import (
     FFMPEG_OPTIONS,
     IDLE_VOICE_DISCONNECT_DELAY_SECONDS,
     LYRICS_START_DELAY_SECONDS,
+    MAX_AUTO_TRACKS,
     MUSIC_CHANNEL_NAME,
     MUSIC_FEEDBACK_DELETE_SECONDS,
     NATIVE_METADATA_LYRICS,
@@ -3739,6 +3741,139 @@ async def on_voice_state_update(
         return
 
     update_empty_channel_disconnect(state, member.guild.id)
+
+
+SONG_OPTION_DESCRIPTION = "곡명, 아티스트 또는 YouTube 주소"
+AUTO_COUNT_OPTION_DESCRIPTION = (
+    f"신청곡을 포함한 곡 수(1-{MAX_AUTO_TRACKS}, 기본 {DEFAULT_AUTO_TRACKS})"
+)
+
+
+async def run_music_request_command(
+    interaction: discord.Interaction,
+    query: str,
+    *,
+    auto_count: int | None = None,
+    search_kind: str | None = None,
+) -> None:
+    query = query.strip()
+    if not query:
+        await send_ephemeral_response(interaction, "곡명을 입력해 주세요.")
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    if interaction.guild is None or interaction.guild_id is None:
+        await send_ephemeral_followup(interaction, guild_only_error())
+        return
+
+    guild_id = interaction.guild_id
+    music_channel_id = get_music_channel_id(guild_id)
+    music_channel = (
+        interaction.guild.get_channel(music_channel_id)
+        if music_channel_id is not None
+        else None
+    )
+    if music_channel is None or not hasattr(music_channel, "send"):
+        await send_ephemeral_followup(
+            interaction,
+            "먼저 `/setupmusic`으로 음악 신청 채널을 설정해 주세요.",
+        )
+        return
+
+    state = get_state(guild_id)
+    ok, error = await ensure_voice_for_member(interaction.user, state)
+    if not ok:
+        await send_ephemeral_followup(interaction, error)
+        return
+
+    request_generation = state.playback_generation
+    loading_message = await send_ephemeral_followup(
+        interaction,
+        "곡을 찾고 있어요...",
+        delete_after=None,
+    )
+    options: dict[str, object] = {}
+    if auto_count is not None:
+        options["auto_count"] = auto_count
+    if search_kind is not None:
+        options["search_kind"] = search_kind
+        options["bulk"] = True
+    await enqueue_tracks(
+        guild_id,
+        music_channel,
+        interaction.user,
+        query,
+        initial_response=loading_message,
+        request_generation=request_generation,
+        **options,
+    )
+
+
+def register_music_request_commands(
+    names: tuple[str, str],
+    description: str,
+    callback: Callable[..., Awaitable[None]],
+) -> list[app_commands.Command]:
+    commands = []
+    for name in names:
+        command = app_commands.guild_only()(
+            app_commands.Command(
+                name=name,
+                description=description,
+                callback=callback,
+            )
+        )
+        bot.tree.add_command(command)
+        commands.append(command)
+    return commands
+
+
+@app_commands.rename(query="곡명", count="곡수")
+@app_commands.describe(
+    query=SONG_OPTION_DESCRIPTION,
+    count=AUTO_COUNT_OPTION_DESCRIPTION,
+)
+async def request_auto_tracks(
+    interaction: discord.Interaction,
+    query: str,
+    count: app_commands.Range[int, 1, MAX_AUTO_TRACKS] | None = None,
+) -> None:
+    await run_music_request_command(
+        interaction,
+        query,
+        auto_count=count or DEFAULT_AUTO_TRACKS,
+    )
+
+
+@app_commands.rename(query="곡명")
+@app_commands.describe(query="앨범명 또는 아티스트와 앨범명")
+async def request_album(interaction: discord.Interaction, query: str) -> None:
+    await run_music_request_command(interaction, query, search_kind="album")
+
+
+@app_commands.rename(query="곡명")
+@app_commands.describe(query="재생목록 검색어 또는 YouTube 재생목록 주소")
+async def request_playlist(interaction: discord.Interaction, query: str) -> None:
+    await run_music_request_command(interaction, query, search_kind="playlist")
+
+
+MUSIC_REQUEST_COMMANDS = {
+    "auto": register_music_request_commands(
+        ("자동", "auto"),
+        "곡과 비슷한 곡들을 대기열에 추가해요.",
+        request_auto_tracks,
+    ),
+    "album": register_music_request_commands(
+        ("앨범", "album"),
+        "앨범 전체를 대기열에 추가해요.",
+        request_album,
+    ),
+    "playlist": register_music_request_commands(
+        ("재생목록", "playlist"),
+        "재생목록을 대기열에 추가해요.",
+        request_playlist,
+    ),
+}
 
 
 @bot.tree.command(
