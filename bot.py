@@ -857,6 +857,17 @@ class QueueRangeDeleteView(discord.ui.View):
             await send_ephemeral_followup(interaction, authorization_error)
 
 
+def find_skip_to_last_target(state: GuildMusicState) -> Track | None:
+    return next(
+        (
+            track
+            for track in reversed(state.queue)
+            if track.requester_id is not None
+        ),
+        state.queue[-1] if state.queue else None,
+    )
+
+
 class MusicControlView(discord.ui.View):
     def __init__(
         self,
@@ -1080,14 +1091,7 @@ class MusicControlView(discord.ui.View):
             await send_ephemeral_response(interaction, "스킵할 곡이 없어요.")
             return
 
-        target_track = next(
-            (
-                track
-                for track in reversed(state.queue)
-                if track.requester_id is not None
-            ),
-            state.queue[-1] if state.queue else None,
-        )
+        target_track = find_skip_to_last_target(state)
         if target_track is None:
             await send_ephemeral_response(interaction, "넘어갈 대기 곡이 없어요.")
             return
@@ -1143,6 +1147,83 @@ class MusicControlView(discord.ui.View):
             interaction,
             f"마지막 곡으로 바로 넘어갈게요. {skipped_count}곡을 건너뛰었어요.",
         )
+
+    @discord.ui.button(
+        label="대기열 마지막 곡으로",
+        emoji="⏬",
+        style=discord.ButtonStyle.primary,
+        custom_id="music:skip_queue_to_last",
+        row=0,
+    )
+    async def skip_queue_to_last(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        state = self.get_state()
+        voice = state.voice
+        if voice is None:
+            await send_ephemeral_response(interaction, "봇이 음성 채널에 없어요.")
+            return
+
+        target_track = find_skip_to_last_target(state)
+        if target_track is None:
+            await send_ephemeral_response(interaction, "넘어갈 대기 곡이 없어요.")
+            return
+        if state.queue[0] is target_track:
+            await send_ephemeral_response(
+                interaction,
+                "이미 마지막 곡이 다음 곡이에요.",
+            )
+            return
+
+        await interaction.response.defer()
+        error_message: str | None = None
+        removed_tracks: list[Track] | None = None
+        async with state.lock:
+            member_channel = getattr(
+                getattr(interaction.user, "voice", None),
+                "channel",
+                None,
+            )
+            if state.voice is not voice:
+                error_message = (
+                    "재생 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요."
+                )
+            elif not voice.is_connected() or member_channel != voice.channel:
+                error_message = "봇과 같은 음성 채널에 들어와야 조작할 수 있어요."
+            else:
+                removed_tracks = remove_queued_tracks_before_id(
+                    state,
+                    target_track.track_id,
+                )
+                if removed_tracks is None:
+                    error_message = (
+                        "대기열 상태가 변경되어 조작을 취소했어요. "
+                        "다시 시도해 주세요."
+                    )
+                else:
+                    for removed_track in removed_tracks:
+                        if removed_track.requester_id is None:
+                            remember_autoplay_track(state, removed_track)
+
+        if error_message is not None or not removed_tracks:
+            await send_ephemeral_followup(
+                interaction,
+                error_message or "이미 마지막 곡이 다음 곡이에요.",
+            )
+            return
+
+        schedule_autoplay_refill(self.guild_id)
+        try:
+            await send_ephemeral_followup(
+                interaction,
+                f"현재 곡은 그대로 두고 대기열 {len(removed_tracks)}곡을 건너뛰었어요. "
+                f"다음 곡: `{target_track.title}`",
+            )
+        finally:
+            if state.current is not None:
+                await update_control_panel(self.guild_id, state)
 
     @discord.ui.button(
         label="정지",

@@ -1204,6 +1204,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             "music:pause_resume",
             "music:skip",
             "music:skip_to_last",
+            "music:skip_queue_to_last",
             "music:stop",
             "music:repeat",
             "music:shuffle",
@@ -1221,7 +1222,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         try:
             for view in views:
                 custom_ids = [item.custom_id for item in view.children]
-                self.assertEqual(len(custom_ids), 10)
+                self.assertEqual(len(custom_ids), 11)
                 self.assertEqual(set(custom_ids), expected_custom_ids)
                 self.assertIsNone(view.timeout)
                 self.assertTrue(view.is_persistent())
@@ -1253,7 +1254,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                     view_store.add_view(view, message_id)
                     counts.append(len(view_store._views[message_id]))
 
-                self.assertEqual(counts, [10, 10, 10, 10])
+                self.assertEqual(counts, [11, 11, 11, 11])
                 for message_id, view in latest_views.items():
                     dispatch_items = view_store._views[message_id]
                     self.assertIs(view_store._synced_message_views[message_id], view)
@@ -1301,7 +1302,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 first_owner = state.control_view
                 self.assertIsNot(first_owner, previous_view)
                 self.assertTrue(previous_view.is_finished())
-                self.assertEqual(len(view_store._views[message_id]), 10)
+                self.assertEqual(len(view_store._views[message_id]), 11)
                 self.assertIs(view_store._synced_message_views[message_id], first_owner)
                 self.assertTrue(
                     all(
@@ -1315,7 +1316,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 second_owner = state.control_view
                 self.assertIsNot(second_owner, first_owner)
                 self.assertTrue(first_owner.is_finished())
-                self.assertEqual(len(view_store._views[message_id]), 10)
+                self.assertEqual(len(view_store._views[message_id]), 11)
                 self.assertIs(view_store._synced_message_views[message_id], second_owner)
                 self.assertTrue(
                     all(
@@ -1452,7 +1453,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                     }
                 )
             )
-            self.assertEqual(len(view_store._views[message_id]), 10)
+            self.assertEqual(len(view_store._views[message_id]), 11)
             self.assertTrue(
                 all(
                     item.view is final_view
@@ -1601,7 +1602,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(mismatch_owner.is_finished())
             self.assertNotIn(mismatch_old.id, view_store._views)
             self.assertIs(mismatch_state.control_message, mismatch_new)
-            self.assertEqual(len(view_store._views[mismatch_new.id]), 10)
+            self.assertEqual(len(view_store._views[mismatch_new.id]), 11)
             self.assertTrue(
                 all(
                     item.view is mismatch_state.control_view
@@ -1613,7 +1614,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(missing_owner.is_finished())
             self.assertNotIn(missing_old.id, view_store._views)
             self.assertIs(missing_state.control_message, missing_new)
-            self.assertEqual(len(view_store._views[missing_new.id]), 10)
+            self.assertEqual(len(view_store._views[missing_new.id]), 11)
             self.assertTrue(
                 all(
                     item.view is missing_state.control_view
@@ -1626,7 +1627,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(failure_state.control_view, prior_failure_owner)
             self.assertFalse(prior_failure_owner.is_finished())
             channel_d.send.assert_not_awaited()
-            self.assertEqual(len(view_store._views[failure_old.id]), 10)
+            self.assertEqual(len(view_store._views[failure_old.id]), 11)
             self.assertTrue(
                 all(
                     item.view is prior_failure_owner
@@ -1639,7 +1640,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(cancelled_owner.is_finished())
             self.assertFalse(cancelled_state.control_panel_lock.locked())
             channel_e.send.assert_not_awaited()
-            self.assertEqual(len(view_store._views[cancelled_old.id]), 10)
+            self.assertEqual(len(view_store._views[cancelled_old.id]), 11)
             self.assertTrue(
                 all(
                     item.view is cancelled_owner
@@ -1723,7 +1724,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(state.control_message, message)
             self.assertIs(state.control_view, owner)
             self.assertFalse(owner.is_finished())
-            self.assertEqual(len(view_store._views[message_id]), 10)
+            self.assertEqual(len(view_store._views[message_id]), 11)
         finally:
             bot.discord.ui.View.stop(owner)
             bot.music_states.pop(guild_id, None)
@@ -1784,7 +1785,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(new_owner.is_finished())
             self.assertTrue(old_owner.is_finished())
             self.assertNotIn(old_message_id, view_store._views)
-            self.assertEqual(len(view_store._views[new_message_id]), 10)
+            self.assertEqual(len(view_store._views[new_message_id]), 11)
             self.assertTrue(
                 all(
                     item.view is new_owner
@@ -2011,7 +2012,7 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(view.is_finished())
                 self.assertFalse(state.control_panel_lock.locked())
                 clear_id.assert_not_called()
-                self.assertEqual(len(view_store._views[message_id]), 10)
+                self.assertEqual(len(view_store._views[message_id]), 11)
                 self.assertTrue(
                     all(
                         item.view is view
@@ -2463,6 +2464,94 @@ class MusicControlPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(case.state.skip_requested)
         self.assertFalse(case.state.recent_track_keys)
         case.voice.stop.assert_not_called()
+        case.interaction.followup.send.assert_awaited_once_with(
+            "대기열 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
+            ephemeral=True,
+            wait=True,
+        )
+        bot.music_states.pop(case.interaction.guild_id, None)
+
+    async def test_skip_queue_to_last_keeps_current_track_playing(self) -> None:
+        case = self._make_skip_case(367)
+        first_auto = make_track("first-auto")
+        requested_before = make_track("requested-before")
+        requested_before.requester_id = 41
+        requested = make_track("requested")
+        requested.requester_id = 42
+        later_auto = make_track("later-auto")
+        pooled = make_track("pooled-auto")
+        case.state.queue.extend([first_auto, requested_before, requested, later_auto])
+        case.state.autoplay_candidate_pool.append(pooled)
+
+        with (
+            patch.object(bot, "schedule_autoplay_refill") as refill,
+            patch.object(bot, "update_control_panel", AsyncMock()) as update_panel,
+        ):
+            await case.view.skip_queue_to_last.callback(case.interaction)
+
+        self.assertIs(case.state.current, case.track)
+        self.assertEqual(list(case.state.queue), [requested, later_auto])
+        self.assertEqual(list(case.state.autoplay_candidate_pool), [pooled])
+        self.assertFalse(case.state.skip_requested)
+        case.voice.stop.assert_not_called()
+        self.assertEqual(
+            {entry.value for entry in case.state.recent_track_keys},
+            {music_track_metadata.normalize_track_key(first_auto)},
+        )
+        refill.assert_called_once_with(367)
+        update_panel.assert_awaited_once_with(367, case.state)
+        case.interaction.followup.send.assert_awaited_once_with(
+            "현재 곡은 그대로 두고 대기열 2곡을 건너뛰었어요. "
+            f"다음 곡: `{requested.title}`",
+            ephemeral=True,
+            wait=True,
+        )
+        bot.music_states.pop(case.interaction.guild_id, None)
+
+    async def test_skip_queue_to_last_reports_when_target_is_already_next(
+        self,
+    ) -> None:
+        case = self._make_skip_case(368)
+        target = make_track("target-auto")
+        case.state.queue.append(target)
+
+        with patch.object(
+            bot,
+            "create_housekeeping_task",
+            side_effect=lambda coroutine: coroutine.close(),
+        ):
+            await case.view.skip_queue_to_last.callback(case.interaction)
+
+        case.interaction.response.send_message.assert_awaited_once_with(
+            "이미 마지막 곡이 다음 곡이에요.",
+            ephemeral=True,
+        )
+        case.interaction.response.defer.assert_not_awaited()
+        self.assertEqual(list(case.state.queue), [target])
+        case.voice.stop.assert_not_called()
+        bot.music_states.pop(case.interaction.guild_id, None)
+
+    async def test_skip_queue_to_last_keeps_queue_when_target_disappears(
+        self,
+    ) -> None:
+        case = self._make_skip_case(369)
+        queued = make_track("queued-auto")
+        target = make_track("target-auto")
+        case.state.queue.extend([queued, target])
+
+        async def defer_and_remove_target() -> None:
+            case.acknowledged["done"] = True
+            case.state.queue.remove(target)
+
+        case.interaction.response.defer.side_effect = defer_and_remove_target
+
+        with patch.object(bot, "update_control_panel", AsyncMock()) as update_panel:
+            await case.view.skip_queue_to_last.callback(case.interaction)
+
+        self.assertEqual(list(case.state.queue), [queued])
+        self.assertFalse(case.state.recent_track_keys)
+        case.voice.stop.assert_not_called()
+        update_panel.assert_not_awaited()
         case.interaction.followup.send.assert_awaited_once_with(
             "대기열 상태가 변경되어 조작을 취소했어요. 다시 시도해 주세요.",
             ephemeral=True,
