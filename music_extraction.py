@@ -599,6 +599,75 @@ def get_album_track_keys(album_details: dict) -> set[str]:
     }
 
 
+def get_top_search_artist(results: list[dict]) -> dict | None:
+    """Return the artist credited on the most search results, if one repeats."""
+    counts: dict[str, int] = {}
+    names: dict[str, object] = {}
+    for result in results:
+        result_artists: dict[str, object] = {}
+        for artist in result.get("artists") or []:
+            if isinstance(artist, dict) and artist.get("id"):
+                result_artists.setdefault(str(artist["id"]), artist.get("name"))
+        for artist_id, name in result_artists.items():
+            counts[artist_id] = counts.get(artist_id, 0) + 1
+            names.setdefault(artist_id, name)
+    if not counts:
+        return None
+    artist_id = max(counts, key=lambda key: counts[key])
+    if counts[artist_id] < 2:
+        return None
+    return {"name": names.get(artist_id), "id": artist_id}
+
+
+def choose_artist_page_album(query: str, artist_page: dict) -> dict | None:
+    """Return the artist's album or single whose title appears in the query."""
+    query_key = normalize_album_match_text(query)
+    allow_live = bool(LIVE_ALBUM_PATTERN.search(query))
+    chosen: dict | None = None
+    chosen_length = 0
+    for section in ("albums", "singles"):
+        for album in (artist_page.get(section) or {}).get("results") or []:
+            if not (
+                isinstance(album, dict)
+                and album.get("browseId")
+                and is_original_album(album)
+            ):
+                continue
+            if not allow_live and LIVE_ALBUM_PATTERN.search(
+                str(album.get("title") or "")
+            ):
+                continue
+            length = max(
+                (
+                    len(key)
+                    for key in get_song_title_keys(album.get("title"))
+                    if key in query_key
+                ),
+                default=0,
+            )
+            if length > chosen_length:
+                chosen, chosen_length = album, length
+    return chosen
+
+
+async def find_album_of_top_search_artist(
+    query: str,
+) -> tuple[dict | None, dict | None]:
+    """Find an album through the artist YouTube Music recognizes in the query.
+
+    The album filter misses nicknames (higedan) that the general search still
+    resolves to the artist, so look the album up on that artist's page.
+    """
+    artist = get_top_search_artist(await search_youtube_music(query))
+    if artist is None:
+        return None, None
+    artist_page = await get_youtube_music_artist(artist["id"])
+    album = choose_artist_page_album(query, artist_page)
+    if album is None:
+        return None, artist_page
+    return {**album, "artists": [artist]}, artist_page
+
+
 def get_requested_song_keys(query: str, single_details: dict) -> set[str]:
     track_keys = get_album_track_keys(single_details)
     query_key = normalize_album_match_text(query)
@@ -612,15 +681,19 @@ async def find_youtube_music_album_url(query: str) -> str | None:
     try:
         results = await search_youtube_music(query, "albums")
         album = choose_youtube_music_album(query, results)
+        artist_page: dict | None = None
         if album is None:
-            return None
+            album, artist_page = await find_album_of_top_search_artist(query)
+            if album is None:
+                return None
         details = await get_youtube_music_album(str(album["browseId"]))
         channel_id = get_album_artist_channel_id(album)
         if is_single_album(album) and channel_id is not None:
             # A song released as a single ranks its own single first. Switch
             # to the artist's later studio album only when it lists the song.
             song_keys = get_requested_song_keys(query, details)
-            artist_page = await get_youtube_music_artist(channel_id)
+            if artist_page is None:
+                artist_page = await get_youtube_music_artist(channel_id)
             for container in choose_album_containers(album, artist_page):
                 container_details = await get_youtube_music_album(
                     str(container["browseId"])

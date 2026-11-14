@@ -970,6 +970,125 @@ class YouTubeMusicAlbumTests(unittest.IsolatedAsyncioTestCase):
         get_album.assert_awaited_once_with("MPREb_t")
         get_artist.assert_not_awaited()
 
+    async def _find_through_artist(
+        self,
+        query: str,
+        search_results: list[dict],
+        albums: dict[str, dict],
+        artist_page: dict,
+    ) -> tuple[str | None, AsyncMock]:
+        async def search(search_query: str, search_filter: str | None = None) -> list[dict]:
+            self.assertEqual(search_query, query)
+            return [] if search_filter == "albums" else search_results
+
+        get_artist = AsyncMock(return_value=artist_page)
+        with (
+            patch.object(music_extraction, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
+            patch.object(music_extraction, "search_youtube_music", new=search),
+            patch.object(
+                music_extraction,
+                "get_youtube_music_album",
+                AsyncMock(side_effect=lambda browse_id: albums[browse_id]),
+            ),
+            patch.object(music_extraction, "get_youtube_music_artist", get_artist),
+        ):
+            url = await music_extraction.find_youtube_music_album_url(query)
+        return url, get_artist
+
+    @staticmethod
+    def make_song_result(title: str, channel_id: str) -> dict:
+        return {
+            "resultType": "song",
+            "title": title,
+            "artists": [{"name": "Band", "id": channel_id}],
+        }
+
+    async def test_nickname_finds_album_on_top_search_artist_page(self) -> None:
+        url, get_artist = await self._find_through_artist(
+            "report higedan",
+            [
+                self.make_song_result("Trailer", "UChige"),
+                self.make_song_result("Other", "UCother"),
+                self.make_song_result("Rolling", "UChige"),
+            ],
+            {"MPREb_report": make_album_details("OLAK_report", "Trailer")},
+            {
+                "albums": {
+                    "results": [
+                        {"title": "Editorial", "year": "2021", "browseId": "MPREb_ed"},
+                        {"title": "Report (Instrumental)", "browseId": "MPREb_inst"},
+                        {"title": "Report", "year": "2017", "browseId": "MPREb_report"},
+                    ]
+                },
+                "singles": {
+                    "results": [
+                        {"title": "Rashisa", "type": "Single", "browseId": "MPREb_r"},
+                    ]
+                },
+            },
+        )
+
+        self.assertEqual(url, "https://www.youtube.com/playlist?list=OLAK_report")
+        get_artist.assert_awaited_once_with("UChige")
+
+    async def test_single_on_artist_page_reuses_that_page_for_album_switch(self) -> None:
+        url, get_artist = await self._find_through_artist(
+            "pretender higedan",
+            [
+                self.make_song_result("Pretender", "UChige"),
+                self.make_song_result("Laughter", "UChige"),
+            ],
+            {
+                "MPREb_pretender": make_album_details("OLAK_pretender", "Pretender"),
+                "MPREb_traveler": make_album_details("OLAK_traveler", "Pretender"),
+            },
+            {
+                "albums": {
+                    "results": [
+                        {"title": "Traveler", "year": "2019", "browseId": "MPREb_traveler"},
+                    ]
+                },
+                "singles": {
+                    "results": [
+                        {
+                            "title": "Pretender",
+                            "type": "Single",
+                            "year": "2019",
+                            "browseId": "MPREb_pretender",
+                        },
+                    ]
+                },
+            },
+        )
+
+        self.assertEqual(url, "https://www.youtube.com/playlist?list=OLAK_traveler")
+        get_artist.assert_awaited_once_with("UChige")
+
+    async def test_artist_lookup_needs_a_repeated_artist_and_a_named_title(self) -> None:
+        url, get_artist = await self._find_through_artist(
+            "report higedan",
+            [
+                self.make_song_result("Trailer", "UChige"),
+                self.make_song_result("Other", "UCother"),
+            ],
+            {},
+            {},
+        )
+        self.assertIsNone(url)
+        get_artist.assert_not_awaited()
+
+        url, get_artist = await self._find_through_artist(
+            "report higedan",
+            [
+                self.make_song_result("Trailer", "UChige"),
+                self.make_song_result("Rolling", "UChige"),
+            ],
+            {},
+            make_artist_page({"title": "Editorial", "browseId": "MPREb_ed"}),
+        )
+        self.assertIsNone(url)
+        get_artist.assert_awaited_once_with("UChige")
+
     async def test_lookup_failure_falls_back_to_playlist_search(self) -> None:
         with (
             patch.object(music_extraction, "YOUTUBE_MUSIC_SEARCH_ENABLED", True),
